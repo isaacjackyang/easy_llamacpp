@@ -9,16 +9,23 @@ This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd` and `stop.cmd
 Use the following layout so your own scripts stay separate from the `llama.cpp` binaries:
 
 ```text
-Start_LCPP.ps1
 Start.cmd
-stop.ps1
 stop.cmd
-Install_LCPP_Autostart.ps1
-Remove_LCPP_Autostart.ps1
 README.md
-llama-server.pid
-llama-server.stdout.log
-llama-server.stderr.log
+PS1\
+  Start_LCPP.ps1
+  stop.ps1
+  scan_model.ps1
+  Install_LCPP_Autostart.ps1
+  Remove_LCPP_Autostart.ps1
+json\
+  model-index.json
+  model-tuning.json
+  model-switch-times.json
+logs\
+  llama-server.pid
+  llama-server.stdout.log
+  llama-server.stderr.log
 bin\
   llama-server.exe
   llama-cli.exe
@@ -41,9 +48,9 @@ If `bin\` does not exist but a legacy `llama-server.exe` is still beside the scr
 You can view the built-in PowerShell help directly:
 
 ```powershell
-Get-Help .\Start_LCPP.ps1 -Detailed
-Get-Help .\Start_LCPP.ps1 -Examples
-Get-Help .\Start_LCPP.ps1 -Full
+Get-Help .\PS1\Start_LCPP.ps1 -Detailed
+Get-Help .\PS1\Start_LCPP.ps1 -Examples
+Get-Help .\PS1\Start_LCPP.ps1 -Full
 ```
 
 ## 互動式啟動器 / Interactive Launcher
@@ -52,7 +59,7 @@ Get-Help .\Start_LCPP.ps1 -Full
 Running the command below now opens an interactive launcher menu first instead of immediately starting the server:
 
 ```powershell
-.\Start_LCPP.ps1
+.\PS1\Start_LCPP.ps1
 ```
 
 也可以直接用 `Start.cmd`，效果相同，對雙擊啟動比較方便：  
@@ -86,11 +93,11 @@ The first screen provides these main entry points:
 
 ## 模型索引檔 / Model Index File
 
-互動式選單會讀取 [`model-index.json`](C:/Users/USER/llama%20win%20cuda%2013/model-index.json)。  
-The interactive launcher reads [`model-index.json`](C:/Users/USER/llama%20win%20cuda%2013/model-index.json).
+互動式選單會讀取 [`json/model-index.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-index.json)。  
+The interactive launcher reads [`json/model-index.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-index.json).
 
-現在 `Start_LCPP.ps1` 每次進入互動式選單前，都會先依腳本裡的 `$ConfiguredModelScanPath` 重掃 `*.gguf` 並刷新 `model-index.json`。如果那一行留空，腳本會退回到既有索引推測出的模型資料夾。  
-`Start_LCPP.ps1` now rescans `*.gguf` and refreshes `model-index.json` before each interactive launch, using the `$ConfiguredModelScanPath` line inside the script. If that line is left blank, it falls back to the model folder inferred from the existing index.
+現在 [`PS1/Start_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) 每次進入互動式選單前，都會先依腳本裡的 `$ConfiguredModelScanPath` 重掃 `*.gguf` 並刷新 `json/model-index.json`。如果那一行留空，腳本會退回到既有索引推測出的模型資料夾。  
+[`PS1/Start_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) now rescans `*.gguf` and refreshes `json/model-index.json` before each interactive launch, using the `$ConfiguredModelScanPath` line inside the script. If that line is left blank, it falls back to the model folder inferred from the existing index.
 
 每筆模型可以定義名稱、路徑與能力標記，例如是否支援推理或視覺：  
 Each model entry can define a display name, file path, and capability flags such as reasoning or vision:
@@ -145,25 +152,25 @@ You can now append extra `llama-server.exe` parameters directly after the `Start
 For example:
 
 ```powershell
-.\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
 ```
 
 ```powershell
-.\Start_LCPP.ps1 -Background --ctx-size 8192 --api-key my-secret-key --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 8192 --api-key my-secret-key --metrics
 ```
 
 如果你想看目前這版 `llama-server.exe` 實際支援哪些參數，可以直接用：  
 If you want to see the exact parameters supported by the installed `llama-server.exe`, run:
 
 ```powershell
-.\Start_LCPP.ps1 -LlamaHelp
+.\PS1\Start_LCPP.ps1 -LlamaHelp
 ```
 
 如果你想跳過互動式選單，直接用命令列參數啟動，請加上 `-BypassMenu`。這個模式特別適合排程、自動啟動或快捷方式。  
 If you want to skip the interactive launcher and start directly from command-line parameters, add `-BypassMenu`. This mode is especially useful for scheduled tasks, autostart, or shortcuts.
 
 ```powershell
-.\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause
 ```
 
 注意：以下這些仍然建議用腳本自己的參數設定，不要放在後面轉交：  
@@ -185,7 +192,7 @@ Purpose: Sets the HTTP port for `llama-server.exe`. The default is `8080`. In pr
 範例 / Example:
 
 ```powershell
-.\Start_LCPP.ps1 -Port 8081
+.\PS1\Start_LCPP.ps1 -Port 8081
 ```
 
 ### `-GpuLayers <string>`
@@ -196,9 +203,9 @@ Purpose: Passed to `--gpu-layers`. Allowed values are `auto`, `all`, or a non-ne
 範例 / Examples:
 
 ```powershell
-.\Start_LCPP.ps1 -GpuLayers auto
-.\Start_LCPP.ps1 -GpuLayers all
-.\Start_LCPP.ps1 -GpuLayers 99
+.\PS1\Start_LCPP.ps1 -GpuLayers auto
+.\PS1\Start_LCPP.ps1 -GpuLayers all
+.\PS1\Start_LCPP.ps1 -GpuLayers 99
 ```
 
 ### `-ExtremeMode`
@@ -209,18 +216,18 @@ Purpose: Enables a more aggressive auto-fit profile that prioritizes pushing VRA
 範例 / Example:
 
 ```powershell
-.\Start_LCPP.ps1 -BypassMenu -Background -ExtremeMode
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -ExtremeMode
 ```
 
 ### `-AutoTune`
 
-用途：啟用 per-model 的學習模式。當 `-GpuLayers auto` 這次啟動成功、模型完整放進 GPU、而且整體 GPU 使用率接近 95% 時，腳本會把 `GPU Layers`、`--fit-target`、`--cache-ram`、`--parallel` 等結果存到 [`model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/model-tuning.json)。之後同一個模型、同一組顯卡配置、同一組 llama 參數再啟動時，會優先重用那組已學到的設定。  
-Purpose: Enables per-model learning. When a `-GpuLayers auto` launch succeeds, fully fits on GPU, and lands near 95% aggregate GPU usage, the script stores the learned `GPU Layers`, `--fit-target`, `--cache-ram`, and `--parallel` values in [`model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/model-tuning.json). Later launches of the same model with the same GPU layout and llama arguments reuse that learned profile first.
+用途：啟用 per-model 的學習模式。當 `-GpuLayers auto` 這次啟動成功、模型完整放進 GPU、而且整體 GPU 使用率接近 95% 時，腳本會把 `GPU Layers`、`--fit-target`、`--cache-ram`、`--parallel` 等結果存到 [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json)。之後同一個模型、同一組顯卡配置、同一組 llama 參數再啟動時，會優先重用那組已學到的設定。  
+Purpose: Enables per-model learning. When a `-GpuLayers auto` launch succeeds, fully fits on GPU, and lands near 95% aggregate GPU usage, the script stores the learned `GPU Layers`, `--fit-target`, `--cache-ram`, and `--parallel` values in [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json). Later launches of the same model with the same GPU layout and llama arguments reuse that learned profile first.
 
 範例 / Example:
 
 ```powershell
-.\Start_LCPP.ps1 -BypassMenu -Background -AutoTune
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -AutoTune
 ```
 
 ### Tune And Launch: `Repeating Layers`
@@ -248,7 +255,7 @@ Purpose: Passed to `--threads`. When set to `-1`, the script uses automatic mode
 範例 / Example:
 
 ```powershell
-.\Start_LCPP.ps1 -Threads 12
+.\PS1\Start_LCPP.ps1 -Threads 12
 ```
 
 ### `-ThreadsBatch <int>`
@@ -259,19 +266,19 @@ Purpose: Passed to `--threads-batch`. When set to `-1`, the script uses automati
 範例 / Example:
 
 ```powershell
-.\Start_LCPP.ps1 -ThreadsBatch 16
+.\PS1\Start_LCPP.ps1 -ThreadsBatch 16
 ```
 
 ### `-ModelPath <string>`
 
-用途：指定 GGUF 模型路徑。可使用絕對路徑，也可使用相對於腳本資料夾的相對路徑。檔案必須存在。  
-Purpose: Specifies the GGUF model path. You can use either an absolute path or a path relative to the script folder. The file must exist.
+用途：指定 GGUF 模型路徑。可使用絕對路徑，也可使用相對於 launcher 根目錄的相對路徑。若省略 `-ModelPath`，腳本會改用 `json/model-index.json` 的 `default_model_id`。  
+Purpose: Specifies the GGUF model path. You can use either an absolute path or a path relative to the launcher root. If omitted, the launcher uses the `default_model_id` entry from `json/model-index.json`.
 
 範例 / Examples:
 
 ```powershell
-.\Start_LCPP.ps1 -ModelPath "C:\Models\example.gguf"
-.\Start_LCPP.ps1 -ModelPath ".\example.gguf"
+.\PS1\Start_LCPP.ps1 -ModelPath "C:\Models\example.gguf"
+.\PS1\Start_LCPP.ps1 -ModelPath ".\example.gguf"
 ```
 
 ### `-OpenPath <string>`
@@ -282,8 +289,8 @@ Purpose: Sets the browser path opened after the server is ready. The default is 
 範例 / Examples:
 
 ```powershell
-.\Start_LCPP.ps1 -OpenPath /docs
-.\Start_LCPP.ps1 -OpenPath v1/models
+.\PS1\Start_LCPP.ps1 -OpenPath /docs
+.\PS1\Start_LCPP.ps1 -OpenPath v1/models
 ```
 
 ### `-ReadyTimeoutSec <int>`
@@ -294,7 +301,7 @@ Purpose: Sets the timeout in seconds while waiting for the server to become read
 範例 / Example:
 
 ```powershell
-.\Start_LCPP.ps1 -ReadyTimeoutSec 300
+.\PS1\Start_LCPP.ps1 -ReadyTimeoutSec 300
 ```
 
 ### 開關參數 / Switch Parameters
@@ -332,56 +339,56 @@ These parameters do not require a value. Including them enables the option.
 Open the interactive launcher:
 
 ```powershell
-.\Start_LCPP.ps1
+.\PS1\Start_LCPP.ps1
 ```
 
 跳過選單、在背景啟動並指定模型：  
 Skip the menu and start in the background with a specific model:
 
 ```powershell
-.\Start_LCPP.ps1 -BypassMenu -Background -ModelPath "C:\Users\USER\Downloads\LLM\Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2.gguf"
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -ModelPath "C:\Users\USER\Downloads\LLM\Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2.gguf"
 ```
 
 跳過選單並改用其他埠號：  
 Skip the menu and use another port:
 
 ```powershell
-.\Start_LCPP.ps1 -BypassMenu -Background -Port 8081
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -Port 8081
 ```
 
 查看目前狀態：  
 Check the current status:
 
 ```powershell
-.\Start_LCPP.ps1 -Status
+.\PS1\Start_LCPP.ps1 -Status
 ```
 
 相容舊用法，仍可這樣呼叫，但現在會導向完整的 status 畫面：  
 Backward-compatible old usage; it now opens the richer status view:
 
 ```powershell
-.\Start_LCPP.ps1 -ShowGpuOffload
+.\PS1\Start_LCPP.ps1 -ShowGpuOffload
 ```
 
 用極限模式重啟背景 server：  
 Restart the background server with Extreme Mode:
 
 ```powershell
-.\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause -ExtremeMode
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause -ExtremeMode
 ```
 
 強制清理這個工作資料夾下舊的 `llama-server.exe` 進程：  
 Force-clean older `llama-server.exe` processes that belong to this workspace:
 
 ```powershell
-.\stop.ps1
+.\PS1\stop.ps1
 ```
 
 停止目前追蹤中的 server：  
 Stop the currently tracked server:
 
 ```powershell
-.\Start_LCPP.ps1 -Stop
+.\PS1\Start_LCPP.ps1 -Stop
 ```
 
 `stop.ps1` 會比 `-Stop` 更激進一些。它不只會處理目前追蹤中的 PID，也會掃描這個工作資料夾對應的 `llama-server.exe` 路徑，把殘留舊進程一起清掉，適合用在 VRAM / RAM 沒有正常釋放時。  
@@ -391,14 +398,14 @@ Stop the currently tracked server:
 Show all underlying `llama-server.exe` parameters:
 
 ```powershell
-.\Start_LCPP.ps1 -LlamaHelp
+.\PS1\Start_LCPP.ps1 -LlamaHelp
 ```
 
 透過腳本轉交額外 `llama-server` 參數：  
 Forward extra `llama-server` parameters through the wrapper:
 
 ```powershell
-.\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
 ```
 
 ## 模型切換行為 / Model Switching Behavior
@@ -422,7 +429,7 @@ If you enable `-AutoTune` and a launch fully fits on GPU within the target VRAM 
 This means you can switch models directly with a single command:
 
 ```powershell
-.\Start_LCPP.ps1 -Background -ModelPath "C:\Models\another-model.gguf"
+.\PS1\Start_LCPP.ps1 -Background -ModelPath "C:\Models\another-model.gguf"
 ```
 
 ## 詳細更新說明 / Detailed Update Guide For New llama.cpp Versions
@@ -452,7 +459,7 @@ The safest method is to replace the `bin\` contents as a matching set.
    Stop the currently running server first.
 
 ```powershell
-.\Start_LCPP.ps1 -Stop
+.\PS1\Start_LCPP.ps1 -Stop
 ```
 
 2. 下載新的 `llama.cpp` Windows 版本，最好確認它和你目前的 CUDA 環境相符。  
@@ -467,7 +474,7 @@ The safest method is to replace the `bin\` contents as a matching set.
 5. 不要覆蓋這些你自己的檔案。  
    Do not overwrite these files that belong to your custom setup.
 
-- [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/Start_LCPP.ps1)
+- [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1)
 - [Install_LCPP_Autostart.ps1](C:/Users/USER/llama%20win%20cuda%2013/Install_LCPP_Autostart.ps1)
 - [Remove_LCPP_Autostart.ps1](C:/Users/USER/llama%20win%20cuda%2013/Remove_LCPP_Autostart.ps1)
 - [README.md](C:/Users/USER/llama%20win%20cuda%2013/README.md)
@@ -476,8 +483,8 @@ The safest method is to replace the `bin\` contents as a matching set.
    After the update, start the server again and verify it.
 
 ```powershell
-.\Start_LCPP.ps1 -Background -NoBrowser -NoPause
-.\Start_LCPP.ps1 -Status
+.\PS1\Start_LCPP.ps1 -Background -NoBrowser -NoPause
+.\PS1\Start_LCPP.ps1 -Status
 ```
 
 7. 再打開 API 檢查模型列表是否正常。  
@@ -517,8 +524,8 @@ After updating, check at least these items:
 先查看這兩個 log：  
 Check these two logs first:
 
-- [llama-server.stdout.log](C:/Users/USER/llama%20win%20cuda%2013/llama-server.stdout.log)
-- [llama-server.stderr.log](C:/Users/USER/llama%20win%20cuda%2013/llama-server.stderr.log)
+- [logs/llama-server.stdout.log](C:/Users/USER/llama%20win%20cuda%2013/logs/llama-server.stdout.log)
+- [logs/llama-server.stderr.log](C:/Users/USER/llama%20win%20cuda%2013/logs/llama-server.stderr.log)
 
 也可以直接查看新版 `llama-server.exe` 的參數說明：  
 You can also inspect the new `llama-server.exe` options directly:
@@ -527,8 +534,8 @@ You can also inspect the new `llama-server.exe` options directly:
 .\bin\llama-server.exe --help
 ```
 
-有些新版 `llama.cpp` 可能會調整參數名稱、預設值或啟動行為。如果更新後出現錯誤，可能需要同步調整 [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/Start_LCPP.ps1)。  
-Some new `llama.cpp` releases may change parameter names, defaults, or startup behavior. If the update breaks startup, [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/Start_LCPP.ps1) may need a matching adjustment.
+有些新版 `llama.cpp` 可能會調整參數名稱、預設值或啟動行為。如果更新後出現錯誤，可能需要同步調整 [PS1/Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1)。  
+Some new `llama.cpp` releases may change parameter names, defaults, or startup behavior. If the update breaks startup, [PS1/Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) may need a matching adjustment.
 
 ### 回滾方式 / Rollback Method
 
@@ -542,7 +549,7 @@ Rollback steps:
    Stop the current server.
 
 ```powershell
-.\Start_LCPP.ps1 -Stop
+.\PS1\Start_LCPP.ps1 -Stop
 ```
 
 2. 用舊版備份覆蓋 `bin\`。  
@@ -552,23 +559,32 @@ Rollback steps:
    Start again and verify.
 
 ```powershell
-.\Start_LCPP.ps1 -Background -NoBrowser -NoPause
-.\Start_LCPP.ps1 -Status
+.\PS1\Start_LCPP.ps1 -Background -NoBrowser -NoPause
+.\PS1\Start_LCPP.ps1 -Status
 ```
 
 ## 腳本會產生的檔案 / Files Created By The Script
 
-- `llama-server.pid`：記錄目前追蹤中的 process ID。  
-  `llama-server.pid`: Stores the currently tracked process ID.
+- `logs/llama-server.pid`：記錄目前追蹤中的 process ID。  
+  `logs/llama-server.pid`: Stores the currently tracked process ID.
 
-- `llama-server.stdout.log`：標準輸出 log。  
-  `llama-server.stdout.log`: Standard output log.
+- `logs/llama-server.stdout.log`：標準輸出 log。  
+  `logs/llama-server.stdout.log`: Standard output log.
 
-- `llama-server.stderr.log`：錯誤輸出 log。  
-  `llama-server.stderr.log`: Error output log.
+- `logs/llama-server.stderr.log`：錯誤輸出 log。  
+  `logs/llama-server.stderr.log`: Error output log.
 
-這些檔案都會放在 `Start_LCPP.ps1` 同層。  
-These files are created in the same folder as `Start_LCPP.ps1`.
+- `json/model-index.json`：互動式選單使用的模型索引。  
+  `json/model-index.json`: Model index used by the interactive launcher.
+
+- `json/model-tuning.json`：`-AutoTune` 學到的 per-model 調校資料。  
+  `json/model-tuning.json`: Per-model tuning data learned by `-AutoTune`.
+
+- `json/model-switch-times.json`：模型切換時間紀錄。  
+  `json/model-switch-times.json`: Model switch timing history.
+
+這些檔案會分別放在專案根目錄下的 `logs\` 與 `json\`。  
+These files are created under the project's `logs\` and `json\` folders.
 
 ## llama.cpp 指令速查表 / llama.cpp Command Quick Reference
 
@@ -579,8 +595,8 @@ The following section is a Traditional Chinese focused quick reference for the `
 Current environment highlights:
 
 - `llama.cpp` 版本：`8281 (0cec84f99)`
-- GPU：`NVIDIA GeForce RTX 3050 Ti Laptop GPU`
-- 可用 VRAM 大約：`4 GB`
+- GPU：`NVIDIA GeForce RTX 5070 Ti`
+- VRAM：`16 GB`
 
 ### 先記住這 4 個主程式 / The 4 Main Executables
 
@@ -767,8 +783,8 @@ For your current machine and model path, you can use:
 
 ### 4A. `llama-server.exe` 常用參數中文版對照表 / Chinese Reference Table For Common `llama-server.exe` Options
 
-如果你是透過 [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/Start_LCPP.ps1) 啟動，請先記住這件事：  
-If you launch through [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/Start_LCPP.ps1), remember this first:
+如果你是透過 [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) 啟動，請先記住這件事：  
+If you launch through [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1), remember this first:
 
 - `--model`
 - `--port`
@@ -783,7 +799,7 @@ These should be configured through the wrapper script parameters, not forwarded 
 The complete parameter list still comes from the actual installed version on this machine:
 
 ```powershell
-.\Start_LCPP.ps1 -LlamaHelp
+.\PS1\Start_LCPP.ps1 -LlamaHelp
 ```
 
 下面這份是常見、實用、最值得記住的中文版對照：  
@@ -835,21 +851,21 @@ Below is a practical Traditional Chinese reference for the most useful options.
 Forward `ctx-size` and metrics through the wrapper:
 
 ```powershell
-.\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
 ```
 
 加上 API key：  
 Add an API key:
 
 ```powershell
-.\Start_LCPP.ps1 -Background --ctx-size 4096 --api-key my-secret-key --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --api-key my-secret-key --metrics
 ```
 
 綁到區網位址讓其他裝置可連線：  
 Bind to the LAN so other devices can connect:
 
 ```powershell
-.\Start_LCPP.ps1 -Background --host 0.0.0.0 --ctx-size 4096 --api-key my-secret-key
+.\PS1\Start_LCPP.ps1 -Background --host 0.0.0.0 --ctx-size 4096 --api-key my-secret-key
 ```
 
 #### 注意事項 / Notes
@@ -895,7 +911,7 @@ If you see entries such as `CUDA0` and `CUDA1`, this package can detect both CUD
 Use this first after migration to confirm the server starts cleanly.
 
 ```powershell
-.\Start_LCPP.ps1 `
+.\PS1\Start_LCPP.ps1 `
   -Background `
   -ModelPath "D:\Models\your-model.gguf" `
   -GpuLayers auto `
@@ -923,7 +939,7 @@ Notes:
 Use this when both GPUs are similar, for example `12 GB + 12 GB`.
 
 ```powershell
-.\Start_LCPP.ps1 `
+.\PS1\Start_LCPP.ps1 `
   -Background `
   -ModelPath "D:\Models\your-model.gguf" `
   -GpuLayers all `
@@ -949,7 +965,7 @@ Notes:
 Use this for mixed setups such as `12 GB + 8 GB` or `24 GB + 12 GB`.
 
 ```powershell
-.\Start_LCPP.ps1 `
+.\PS1\Start_LCPP.ps1 `
   -Background `
   -ModelPath "D:\Models\your-model.gguf" `
   -GpuLayers all `
@@ -978,7 +994,7 @@ Notes:
 If the new computer will serve as a shared host on your home or office network, use a setup like this.
 
 ```powershell
-.\Start_LCPP.ps1 `
+.\PS1\Start_LCPP.ps1 `
   -Background `
   -ModelPath "D:\Models\your-model.gguf" `
   -GpuLayers auto `
@@ -1110,22 +1126,22 @@ Constrain output with a grammar:
 
 ### 8. 依這台機器的建議 / Recommendations For This Machine
 
-因為這台是 RTX 3050 Ti Laptop GPU，VRAM 大約 4 GB，建議先這樣用：  
-Because this machine uses an RTX 3050 Ti Laptop GPU with about 4 GB VRAM, start with these recommendations:
+因為這台是 RTX 5070 Ti，VRAM 為 16 GB，建議先這樣用：  
+Because this machine uses an RTX 5070 Ti with 16 GB VRAM, start with these recommendations:
 
 - `--gpu-layers auto`
   先讓程式自動決定，不要一開始就用 `all`。  
   Let the program decide automatically instead of forcing `all` at the beginning.
 
-- `-c 4096`
-  大模型先用較保守的 context size。  
-  Use a conservative context size first for larger models.
+- `-c 8192`
+  大模型可以先從中等 context size 開始；如果還想往上推，再視 VRAM 使用量增加。  
+  For larger models, start with a moderate context size and increase it later based on actual VRAM usage.
 
 - CPU threads 不確定時，先讓目前腳本自動處理。  
   If you are unsure about CPU threads, let the current launcher script choose them automatically first.
 
-- 平常要穩定開 API，優先使用 [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/Start_LCPP.ps1)。  
-  For stable day-to-day API serving, prefer [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/Start_LCPP.ps1).
+- 平常要穩定開 API，優先使用 [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1)。  
+  For stable day-to-day API serving, prefer [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1).
 
 ### 9. 最常用速查 / Most Useful Quick Commands
 
@@ -1145,3 +1161,4 @@ Because this machine uses an RTX 3050 Ti Laptop GPU with about 4 GB VRAM, start 
 - [llama-server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 - [GBNF Guide](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md)
 - [llama-quantize README](https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md)
+

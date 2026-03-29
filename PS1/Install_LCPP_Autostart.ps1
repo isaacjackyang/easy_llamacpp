@@ -7,8 +7,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$LauncherScript = Join-Path $ScriptRoot "Start_LCPP.ps1"
+$ScriptHome = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$ProjectRoot = if ([string]::Equals([System.IO.Path]::GetFileName($ScriptHome), "PS1", [System.StringComparison]::OrdinalIgnoreCase)) {
+    Split-Path -Parent $ScriptHome
+}
+else {
+    $ScriptHome
+}
+$LauncherScript = Join-Path $ProjectRoot "PS1\Start_LCPP.ps1"
+if (-not (Test-Path -LiteralPath $LauncherScript)) {
+    $LauncherScript = Join-Path $ProjectRoot "Start_LCPP.ps1"
+}
 $PowerShellExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
 $CurrentUser = "{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME
 
@@ -34,7 +43,7 @@ $Arguments = @(
 $Action = New-ScheduledTaskAction `
     -Execute $PowerShellExe `
     -Argument $Arguments `
-    -WorkingDirectory $ScriptRoot
+    -WorkingDirectory $ProjectRoot
 
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `

@@ -36,13 +36,13 @@ Default is -1, which means auto and resolves to the logical CPU count.
 
 .PARAMETER ModelPath
 Path to the GGUF model file.
-Accepts either an absolute path or a path relative to the script folder.
-Default points to the current preferred model.
+Accepts either an absolute path or a path relative to the launcher root.
+When omitted, the launcher uses the default_model_id entry from json\model-index.json.
 
 .PARAMETER ModelIndexPath
 Path to the model index JSON file used by the interactive menu.
-Accepts either an absolute path or a path relative to the script folder.
-Default is .\model-index.json.
+Accepts either an absolute path or a path relative to the launcher root.
+Default is .\json\model-index.json.
 
 .PARAMETER OpenPath
 HTTP path opened in the browser after the server is ready.
@@ -94,47 +94,47 @@ Use this to access llama.cpp options that are not explicitly wrapped by this scr
 Do not pass managed options such as --model, --port, --gpu-layers, --threads, or --threads-batch here.
 
 .EXAMPLE
-.\Start_LCPP.ps1
+.\PS1\Start_LCPP.ps1
 Opens the interactive launcher menu.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -Background -ModelPath "C:\Models\example.gguf"
+.\PS1\Start_LCPP.ps1 -Background -ModelPath "C:\Models\example.gguf"
 Opens the interactive launcher and preloads the supplied values.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -Port 8081 -GpuLayers all -Threads 12 -ThreadsBatch 16
+.\PS1\Start_LCPP.ps1 -Port 8081 -GpuLayers all -Threads 12 -ThreadsBatch 16
 Starts the server on port 8081 and uses explicit CPU/GPU settings.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -Status
+.\PS1\Start_LCPP.ps1 -Status
 Shows the current tracked server status, runtime settings, and GPU offload summary.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -ShowGpuOffload
+.\PS1\Start_LCPP.ps1 -ShowGpuOffload
 Compatibility alias for -Status.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -BypassMenu -Background -ExtremeMode
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -ExtremeMode
 Starts the server with the aggressive auto-fit profile.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -BypassMenu -Background -AutoTune
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -AutoTune
 Starts the server, evaluates the resulting VRAM usage, and saves a reusable tuning profile if it qualifies.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -Stop
+.\PS1\Start_LCPP.ps1 -Stop
 Stops the tracked server.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -LlamaHelp
+.\PS1\Start_LCPP.ps1 -LlamaHelp
 Shows the llama-server.exe help output.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
 Opens the interactive launcher and preloads additional llama-server.exe arguments.
 
 .EXAMPLE
-.\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause
 Starts the server directly without opening the menu.
 
 .NOTES
@@ -145,15 +145,15 @@ to apply a smaller fit target, a bounded prompt cache, and fewer server slots on
 ExtremeMode makes that auto-fit behavior more aggressive for users who want to push VRAM harder.
 AutoTune can learn and reuse a per-model tuning profile when a launch fits fully in GPU memory
 and lands near the target VRAM usage range.
-The script stores the tracked PID in llama-server.pid and writes logs to
-llama-server.stdout.log and llama-server.stderr.log in the script folder.
+The script stores the tracked PID in logs\llama-server.pid and writes logs to
+logs\llama-server.stdout.log and logs\llama-server.stderr.log under the launcher root.
 The preferred layout stores llama.cpp executables and DLLs in the bin subfolder.
 For compatibility, the script can still use a legacy llama-server.exe beside the script if bin is not present.
-ModelPath accepts absolute paths and paths relative to the script folder.
-ModelIndexPath accepts absolute paths and paths relative to the script folder.
+ModelPath accepts absolute paths and paths relative to the launcher root.
+ModelIndexPath accepts absolute paths and paths relative to the launcher root.
 Status and Stop operate on the tracked server process recorded in the PID file.
 The interactive menu is the default entry point for manual launches.
-Use Get-Help .\Start_LCPP.ps1 -Detailed or Get-Help .\Start_LCPP.ps1 -Examples to view this help.
+Use Get-Help .\PS1\Start_LCPP.ps1 -Detailed or Get-Help .\PS1\Start_LCPP.ps1 -Examples to view this help.
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -162,8 +162,8 @@ param(
     [string]$GpuLayers = "auto",
     [int]$Threads = -1,
     [int]$ThreadsBatch = -1,
-    [string]$ModelPath = "C:\Users\USER\Downloads\LLM\Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2.gguf",
-    [string]$ModelIndexPath = ".\model-index.json",
+    [string]$ModelPath = $null,
+    [string]$ModelIndexPath = ".\json\model-index.json",
     [string]$OpenPath = "/v1/models",
     [int]$ReadyTimeoutSec = 180,
     [switch]$Background,
@@ -182,9 +182,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LauncherScriptHome = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$ScriptRoot = if ([string]::Equals([System.IO.Path]::GetFileName($LauncherScriptHome), "PS1", [System.StringComparison]::OrdinalIgnoreCase)) {
+    Split-Path -Parent $LauncherScriptHome
+}
+else {
+    $LauncherScriptHome
+}
+$Ps1Root = $LauncherScriptHome
 $PreferredBinRoot = Join-Path $ScriptRoot "bin"
 $LegacyBinRoot = $ScriptRoot
+$LogRoot = Join-Path $ScriptRoot "logs"
+$JsonRoot = Join-Path $ScriptRoot "json"
 $LlamaBinRoot = if (Test-Path -LiteralPath (Join-Path $PreferredBinRoot "llama-server.exe")) {
     $PreferredBinRoot
 }
@@ -195,11 +204,22 @@ else {
     $PreferredBinRoot
 }
 $ServerExe = Join-Path $LlamaBinRoot "llama-server.exe"
-$PidFile = Join-Path $ScriptRoot "llama-server.pid"
-$StdOutLog = Join-Path $ScriptRoot "llama-server.stdout.log"
-$StdErrLog = Join-Path $ScriptRoot "llama-server.stderr.log"
-$TuningProfileFile = Join-Path $ScriptRoot "model-tuning.json"
-$ModelSwitchTimingFile = Join-Path $ScriptRoot "model-switch-times.json"
+$LegacyServerExe = Join-Path $LegacyBinRoot "llama-server.exe"
+$ServerExeCandidates = @(
+    $ServerExe
+    $LegacyServerExe
+) | Select-Object -Unique
+$LegacyPidFile = Join-Path $ScriptRoot "llama-server.pid"
+$LegacyStdOutLog = Join-Path $ScriptRoot "llama-server.stdout.log"
+$LegacyStdErrLog = Join-Path $ScriptRoot "llama-server.stderr.log"
+$LegacyModelIndexFile = Join-Path $ScriptRoot "model-index.json"
+$LegacyTuningProfileFile = Join-Path $ScriptRoot "model-tuning.json"
+$LegacyModelSwitchTimingFile = Join-Path $ScriptRoot "model-switch-times.json"
+$PidFile = Join-Path $LogRoot "llama-server.pid"
+$StdOutLog = Join-Path $LogRoot "llama-server.stdout.log"
+$StdErrLog = Join-Path $LogRoot "llama-server.stderr.log"
+$TuningProfileFile = Join-Path $JsonRoot "model-tuning.json"
+$ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
 # Edit this line to force model scanning from a specific GGUF folder on each interactive launch.
 $ConfiguredModelScanPath = "E:\LLM Model"
 $BaseUrl = "http://127.0.0.1:$Port"
@@ -222,8 +242,24 @@ $AutoTuneMinUsagePercent = 93.0
 $AutoTuneMaxUsagePercent = 98.5
 $AutoTuneReuseHeadroomMiB = 128
 
-if ([string]::IsNullOrWhiteSpace($ModelPath)) {
-    throw "ModelPath cannot be empty."
+foreach ($DirectoryPath in @($LogRoot, $JsonRoot)) {
+    if (-not (Test-Path -LiteralPath $DirectoryPath -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $DirectoryPath -Force)
+    }
+}
+
+foreach ($Migration in @(
+        [pscustomobject]@{ Legacy = $LegacyModelIndexFile; Preferred = (Join-Path $JsonRoot "model-index.json") },
+        [pscustomobject]@{ Legacy = $LegacyTuningProfileFile; Preferred = $TuningProfileFile },
+        [pscustomobject]@{ Legacy = $LegacyModelSwitchTimingFile; Preferred = $ModelSwitchTimingFile }
+    )) {
+    if ((Test-Path -LiteralPath $Migration.Legacy) -and -not (Test-Path -LiteralPath $Migration.Preferred)) {
+        try {
+            Move-Item -LiteralPath $Migration.Legacy -Destination $Migration.Preferred -Force
+        }
+        catch {
+        }
+    }
 }
 
 if (-not $OpenPath.StartsWith("/")) {
@@ -641,7 +677,7 @@ function Resolve-ModelPath {
         return $null
     }
 
-    # Resolve relative model paths from the script folder so shortcuts and autostart use the same base path.
+    # Resolve relative model paths from the launcher root so shortcuts and autostart use the same base path.
     return Resolve-ScriptRelativePath -Path $Path
 }
 
@@ -1089,6 +1125,8 @@ function Sync-LaunchConfigGpuFields {
 function Get-GpuOffloadInfo {
     $TrackedProcess = Get-TrackedServerProcess
     $TrackedModelPath = Get-TrackedServerModelPath -Process $TrackedProcess
+    $TrackedLogPaths = Get-TrackedLogPaths
+    $TrackedStdErrLog = $TrackedLogPaths.StdErrLog
     $RequestedGpuLayers = $null
 
     if ($TrackedProcess) {
@@ -1105,7 +1143,7 @@ function Get-GpuOffloadInfo {
         }
     }
 
-    if (-not (Test-Path -LiteralPath $StdErrLog)) {
+    if (-not (Test-Path -LiteralPath $TrackedStdErrLog)) {
         return [pscustomobject]@{
             Running             = [bool]$TrackedProcess
             ModelPath           = $TrackedModelPath
@@ -1116,11 +1154,11 @@ function Get-GpuOffloadInfo {
             GpuModelBufferMiB   = $null
             GpuModelBufferTotalMiB = $null
             CpuMappedModelBufferMiB = $null
-            LogPath             = $StdErrLog
+            LogPath             = $TrackedStdErrLog
         }
     }
 
-    $LogText = Get-Content -LiteralPath $StdErrLog -Raw -ErrorAction SilentlyContinue
+    $LogText = Get-Content -LiteralPath $TrackedStdErrLog -Raw -ErrorAction SilentlyContinue
     $RepeatingMatches = [regex]::Matches($LogText, 'load_tensors:\s+offloading\s+(\d+)\s+repeating layers to GPU')
     $OffloadedMatches = [regex]::Matches($LogText, 'load_tensors:\s+offloaded\s+(\d+)/(\d+)\s+layers to GPU')
     $BufferMatches = [regex]::Matches($LogText, 'load_tensors:\s+CUDA(?<id>\d+)\s+model buffer size =\s+(?<size>[0-9.]+)\s+MiB')
@@ -1149,7 +1187,7 @@ function Get-GpuOffloadInfo {
         GpuModelBufferMiB      = $GpuModelBufferMiB
         GpuModelBufferTotalMiB = $GpuModelBufferTotalMiB
         CpuMappedModelBufferMiB = $CpuMappedModelBufferMiB
-        LogPath                = $StdErrLog
+        LogPath                = $TrackedStdErrLog
     }
 }
 
@@ -2371,13 +2409,18 @@ function Ensure-ModelIndexFile {
         return
     }
 
+    $BootstrapModelPath = Resolve-ModelPath -Path $ModelPath
+    if ([string]::IsNullOrWhiteSpace($BootstrapModelPath)) {
+        throw "Cannot create model index automatically at $Path. Set -ModelPath or update json\model-index.json."
+    }
+
     $Bootstrap = [ordered]@{
         default_model_id = "default"
         models           = @(
             [ordered]@{
                 id           = "default"
-                name         = [System.IO.Path]::GetFileNameWithoutExtension($ModelPath)
-                path         = $ModelPath
+                name         = [System.IO.Path]::GetFileNameWithoutExtension($BootstrapModelPath)
+                path         = $BootstrapModelPath
                 capabilities = $null
                 notes        = "Bootstrap entry created by Start_LCPP.ps1."
             }
@@ -2429,6 +2472,26 @@ function Get-ModelIndexData {
     }
 
     return $Data
+}
+
+function Resolve-LaunchModelPath {
+    param(
+        [string]$IndexPath,
+        [string]$RequestedModelPath
+    )
+
+    $ResolvedRequestedModelPath = Resolve-ModelPath -Path $RequestedModelPath
+    if (-not [string]::IsNullOrWhiteSpace($ResolvedRequestedModelPath)) {
+        return $ResolvedRequestedModelPath
+    }
+
+    Ensure-ModelIndexFile -Path $IndexPath
+    $DefaultModelPath = Get-PreferredDefaultModelPath -IndexPath $IndexPath -PrimaryModelPath $null
+    if (-not [string]::IsNullOrWhiteSpace($DefaultModelPath)) {
+        return $DefaultModelPath
+    }
+
+    throw "Could not determine a default model from $IndexPath. Set -ModelPath or update json\model-index.json."
 }
 
 function Format-ModelCapabilities {
@@ -3477,7 +3540,7 @@ function Stop-TrackedServer {
 
     Stop-Process -Id $TrackedProcess.Id -Force
     $RemainingIds = Wait-ForProcessExit -ProcessIds @([int]$TrackedProcess.Id) -TimeoutSec $ServerCleanupTimeoutSec
-    Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
+    Remove-TrackedPidFiles
     if ($RemainingIds.Count -gt 0) {
         throw "Tracked llama.cpp server is still shutting down: $($RemainingIds -join ', ')"
     }
@@ -3570,33 +3633,114 @@ function Invoke-InteractiveLauncher {
     }
 }
 
-function Get-TrackedServerProcess {
-    if (-not (Test-Path -LiteralPath $PidFile)) {
-        return $null
-    }
+function Get-TrackedPidFileCandidates {
+    return @(
+        $PidFile
+        $LegacyPidFile
+    ) | Select-Object -Unique
+}
 
-    $PidText = (Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
-    if ($PidText -notmatch '^\d+$') {
-        Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
-        return $null
+function Remove-TrackedPidFiles {
+    foreach ($CandidatePath in @(Get-TrackedPidFileCandidates)) {
+        Remove-Item -LiteralPath $CandidatePath -ErrorAction SilentlyContinue
     }
+}
 
-    $Process = Get-Process -Id ([int]$PidText) -ErrorAction SilentlyContinue
-    if (-not $Process) {
-        Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
-        return $null
-    }
+function Get-TrackedServerRecord {
+    foreach ($CandidatePath in @(Get-TrackedPidFileCandidates)) {
+        if (-not (Test-Path -LiteralPath $CandidatePath)) {
+            continue
+        }
 
-    try {
-        if ($Process.Path -ne $ServerExe) {
-            return $null
+        $PidText = ((Get-Content -LiteralPath $CandidatePath -ErrorAction SilentlyContinue | Select-Object -First 1) | Out-String).Trim()
+        if ($PidText -notmatch '^\d+$') {
+            Remove-Item -LiteralPath $CandidatePath -ErrorAction SilentlyContinue
+            continue
+        }
+
+        $Process = Get-Process -Id ([int]$PidText) -ErrorAction SilentlyContinue
+        if (-not $Process) {
+            Remove-Item -LiteralPath $CandidatePath -ErrorAction SilentlyContinue
+            continue
+        }
+
+        try {
+            $MatchesServerPath = $false
+            foreach ($CandidateExe in $ServerExeCandidates) {
+                if ([string]::Equals($Process.Path, $CandidateExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $MatchesServerPath = $true
+                    break
+                }
+            }
+
+            if (-not $MatchesServerPath) {
+                continue
+            }
+        }
+        catch {
+            continue
+        }
+
+        return [pscustomobject]@{
+            Process     = $Process
+            PidFilePath = $CandidatePath
         }
     }
-    catch {
-        return $null
+
+    return $null
+}
+
+function Get-TrackedPidFilePath {
+    $TrackedRecord = Get-TrackedServerRecord
+    if ($TrackedRecord) {
+        return [string]$TrackedRecord.PidFilePath
     }
 
-    return $Process
+    return $null
+}
+
+function Get-TrackedLogPaths {
+    $TrackedPidFilePath = Get-TrackedPidFilePath
+    $PreferLegacyPaths = -not [string]::IsNullOrWhiteSpace($TrackedPidFilePath) -and [string]::Equals($TrackedPidFilePath, $LegacyPidFile, [System.StringComparison]::OrdinalIgnoreCase)
+
+    $ResolveLogPath = {
+        param(
+            [string]$PreferredPath,
+            [string]$LegacyPath
+        )
+
+        if ($PreferLegacyPaths) {
+            if (Test-Path -LiteralPath $LegacyPath) {
+                return $LegacyPath
+            }
+
+            return $PreferredPath
+        }
+
+        if (Test-Path -LiteralPath $PreferredPath) {
+            return $PreferredPath
+        }
+
+        if (Test-Path -LiteralPath $LegacyPath) {
+            return $LegacyPath
+        }
+
+        return $PreferredPath
+    }
+
+    return [pscustomobject]@{
+        StdOutLog = & $ResolveLogPath $StdOutLog $LegacyStdOutLog
+        StdErrLog = & $ResolveLogPath $StdErrLog $LegacyStdErrLog
+    }
+}
+
+function Get-TrackedServerProcess {
+    $TrackedRecord = Get-TrackedServerRecord
+    if ($TrackedRecord) {
+        return $TrackedRecord.Process
+    }
+
+    return $null
 }
 
 function Get-TrackedServerModelPath {
@@ -4055,17 +4199,35 @@ function Wait-ForProcessExit {
 function Stop-WorkspaceServerProcesses {
     $TrackedProcess = Get-TrackedServerProcess
     $TrackedModelPath = Get-TrackedServerModelPath -Process $TrackedProcess
-    $ServerPathPattern = [regex]::Escape($ServerExe)
+    $ServerPathPatterns = @($ServerExeCandidates | ForEach-Object { [regex]::Escape($_) })
     $WorkspaceServerProcesses = @(
         Get-CimInstance Win32_Process -Filter "Name = 'llama-server.exe'" -ErrorAction SilentlyContinue |
             Where-Object {
-                ($_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $ServerExe, [System.StringComparison]::OrdinalIgnoreCase)) -or
-                ($_.CommandLine -and $_.CommandLine -match $ServerPathPattern)
+                $WorkspaceProcess = $_
+                $MatchesExecutablePath = $false
+                foreach ($CandidateExe in $ServerExeCandidates) {
+                    if ($WorkspaceProcess.ExecutablePath -and [string]::Equals($WorkspaceProcess.ExecutablePath, $CandidateExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $MatchesExecutablePath = $true
+                        break
+                    }
+                }
+
+                $MatchesCommandLine = $false
+                if ($WorkspaceProcess.CommandLine) {
+                    foreach ($PathPattern in $ServerPathPatterns) {
+                        if ($WorkspaceProcess.CommandLine -match $PathPattern) {
+                            $MatchesCommandLine = $true
+                            break
+                        }
+                    }
+                }
+
+                $MatchesExecutablePath -or $MatchesCommandLine
             }
     )
 
     if (-not $WorkspaceServerProcesses) {
-        Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
+        Remove-TrackedPidFiles
         return [pscustomobject]@{
             HadRunningServer = $false
             PreviousModelPath = $TrackedModelPath
@@ -4088,7 +4250,7 @@ function Stop-WorkspaceServerProcesses {
         }
     }
 
-    Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
+    Remove-TrackedPidFiles
 
     if ($StoppedIds.Count -gt 0) {
         Write-Host "Cleaned old llama.cpp server process(es): $($StoppedIds -join ', ')" -ForegroundColor Yellow
@@ -4221,7 +4383,7 @@ function Wait-ForBackgroundServerStartup {
         }
 
         if ($Process.HasExited) {
-            Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
+            Remove-TrackedPidFiles
 
             $FailureLog = Get-LogTailText -Path $StdErrLog
             if (-not $FailureLog) {
@@ -4311,6 +4473,7 @@ function Show-ServerStatus {
 
     if ($TrackedProcess) {
         $TrackedSettings = Get-TrackedServerLaunchSettings -Process $TrackedProcess
+        $TrackedLogPaths = Get-TrackedLogPaths
         $TrackedModelPath = Get-TrackedServerModelPath -Process $TrackedProcess
         if (-not $TrackedModelPath -and $TrackedSettings -and -not [string]::IsNullOrWhiteSpace($TrackedSettings.ModelPath)) {
             $TrackedModelPath = Resolve-ModelPath -Path $TrackedSettings.ModelPath
@@ -4436,8 +4599,8 @@ function Show-ServerStatus {
                 Write-Host "Build  : $($TrackedRuntimeProperties.build_info) (llama.cpp build)"
             }
         }
-        Write-Host "Logs   : $StdOutLog"
-        Write-Host "Error  : $StdErrLog"
+        Write-Host "Logs   : $($TrackedLogPaths.StdOutLog)"
+        Write-Host "Error  : $($TrackedLogPaths.StdErrLog)"
         return
     }
 
@@ -4455,8 +4618,10 @@ $PendingSwitchTimingLaunchPid = [Nullable[int]]$null
 $SwitchTimingCompleted = $false
 
 try {
-    $ModelPath = Resolve-ModelPath -Path $ModelPath
     $ModelIndexPath = Resolve-ScriptRelativePath -Path $ModelIndexPath
+    if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
+        $ModelPath = Resolve-ModelPath -Path $ModelPath
+    }
     Test-LlamaArgConflict -Arguments $LlamaArgs
 
     if (-not (Test-Path -LiteralPath $ServerExe)) {
@@ -4496,6 +4661,8 @@ try {
     if ($GpuLayers -notmatch '^(auto|all|\d+)$') {
         throw "GpuLayers must be auto, all, or a non-negative integer."
     }
+
+    $ModelPath = Resolve-LaunchModelPath -IndexPath $ModelIndexPath -RequestedModelPath $ModelPath
 
     $ResolvedThreads = Resolve-RequestedThreads -RequestedThreads $RawThreads -RequestedThreadsBatch $RawThreadsBatch
     $Threads = $ResolvedThreads.Threads

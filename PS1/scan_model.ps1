@@ -3,8 +3,8 @@
 Scans local GGUF files and rebuilds model-index.json.
 
 .DESCRIPTION
-Looks for *.gguf files in the same folder as this script and writes a
-model-index.json file compatible with Start_LCPP.ps1. Model paths are
+Looks for *.gguf files in the launcher root folder and writes a
+json\model-index.json file compatible with Start_LCPP.ps1. Model paths are
 written as absolute paths so the generated JSON can be copied elsewhere.
 The first model in alphabetical order becomes the default model.
 #>
@@ -221,12 +221,23 @@ function Get-ModelCapabilities {
     }
 }
 
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$IndexPath = Join-Path -Path $ScriptDir -ChildPath "model-index.json"
-$ModelFiles = @(Get-ChildItem -LiteralPath $ScriptDir -Filter "*.gguf" -File | Sort-Object Name)
+$ScriptHome = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$ProjectRoot = if ([string]::Equals([System.IO.Path]::GetFileName($ScriptHome), "PS1", [System.StringComparison]::OrdinalIgnoreCase)) {
+    Split-Path -Parent $ScriptHome
+}
+else {
+    $ScriptHome
+}
+$JsonRoot = Join-Path -Path $ProjectRoot -ChildPath "json"
+if (-not (Test-Path -LiteralPath $JsonRoot -PathType Container)) {
+    [void](New-Item -ItemType Directory -Path $JsonRoot -Force)
+}
+
+$IndexPath = Join-Path -Path $JsonRoot -ChildPath "model-index.json"
+$ModelFiles = @(Get-ChildItem -LiteralPath $ProjectRoot -Filter "*.gguf" -File | Sort-Object Name)
 
 if ($ModelFiles.Count -eq 0) {
-    Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f $ScriptDir)
+    Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f $ProjectRoot)
     exit 1
 }
 
