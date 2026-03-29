@@ -586,6 +586,9 @@ Rollback steps:
 這些檔案會分別放在專案根目錄下的 `logs\` 與 `json\`。  
 These files are created under the project's `logs\` and `json\` folders.
 
+第一次執行 `Start.cmd` 或 `.\PS1\Start_LCPP.ps1` 時，腳本就會先初始化這三個 JSON。若當下已能掃到模型，`json/model-index.json` 會直接寫入模型清單；若還沒有可用模型，則會先建立空的初始檔。  
+On the first `Start.cmd` or `.\PS1\Start_LCPP.ps1` run, the launcher initializes all three JSON files up front. If models are already discoverable, `json/model-index.json` is populated immediately; otherwise an empty starter file is created first.
+
 ## llama.cpp 指令速查表 / llama.cpp Command Quick Reference
 
 以下內容以繁體中文為主，整理目前這台機器最常用的 `llama.cpp` 指令。  

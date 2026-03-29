@@ -2410,13 +2410,14 @@ function Ensure-ModelIndexFile {
     }
 
     $BootstrapModelPath = Resolve-ModelPath -Path $ModelPath
-    if ([string]::IsNullOrWhiteSpace($BootstrapModelPath)) {
-        throw "Cannot create model index automatically at $Path. Set -ModelPath or update json\model-index.json."
+    $Bootstrap = [ordered]@{
+        default_model_id = $null
+        models           = @()
     }
 
-    $Bootstrap = [ordered]@{
-        default_model_id = "default"
-        models           = @(
+    if (-not [string]::IsNullOrWhiteSpace($BootstrapModelPath)) {
+        $Bootstrap.default_model_id = "default"
+        $Bootstrap.models = @(
             [ordered]@{
                 id           = "default"
                 name         = [System.IO.Path]::GetFileNameWithoutExtension($BootstrapModelPath)
@@ -2425,11 +2426,21 @@ function Ensure-ModelIndexFile {
                 notes        = "Bootstrap entry created by Start_LCPP.ps1."
             }
         )
+
+        $Bootstrap.models[0].capabilities = Resolve-ModelEntryCapabilities -ModelEntry ([pscustomobject]$Bootstrap.models[0])
     }
 
-    $Bootstrap.models[0].capabilities = Resolve-ModelEntryCapabilities -ModelEntry ([pscustomobject]$Bootstrap.models[0])
-
     $Bootstrap | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Initialize-JsonWorkspaceFiles {
+    param(
+        [string]$IndexPath
+    )
+
+    Ensure-TuningProfileFile -Path $TuningProfileFile
+    Ensure-ModelSwitchTimingFile -Path $ModelSwitchTimingFile
+    Ensure-ModelIndexFile -Path $IndexPath
 }
 
 function Get-ModelIndexData {
@@ -2442,7 +2453,7 @@ function Get-ModelIndexData {
     $Data = $Json | ConvertFrom-Json
 
     if (-not $Data.models -or $Data.models.Count -eq 0) {
-        throw "The model index is empty: $Path"
+        throw "The model index is empty: $Path. Add GGUF models to the scan folder or edit json\model-index.json."
     }
 
     $SwitchTimingByPath = @{}
@@ -4622,6 +4633,7 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
         $ModelPath = Resolve-ModelPath -Path $ModelPath
     }
+    Initialize-JsonWorkspaceFiles -IndexPath $ModelIndexPath
     Test-LlamaArgConflict -Arguments $LlamaArgs
 
     if (-not (Test-Path -LiteralPath $ServerExe)) {
