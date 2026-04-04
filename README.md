@@ -1,7 +1,7 @@
 ﻿# llama.cpp Launcher / llama.cpp 啟動器
 
-這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd` 與 `stop.cmd`。它們用來啟動、停止、檢查本機的 `llama-server.exe`，並管理模型切換與背景執行。  
-This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd` and `stop.cmd` wrappers for double-click or command-line use. They start, stop, and check a local `llama-server.exe` instance, including model switching and background execution.
+這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop.cmd`、`install_all.cmd`。它們分別用來啟動、停止、以及編譯安裝最新官方 `llama.cpp` 到本機 `bin\`，並管理本機的 `llama-server.exe`、模型切換與背景執行。  
+This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop.cmd`, and `install_all.cmd` wrappers for double-click or command-line use. They are used to start, stop, and build/install the latest official `llama.cpp` into the local `bin\` folder, including local `llama-server.exe` management, model switching, and background execution.
 
 ## 目錄結構 / Folder Layout
 
@@ -10,9 +10,11 @@ Use the following layout so your own scripts stay separate from the `llama.cpp` 
 
 ```text
 Start.cmd
+install_all.cmd
 stop.cmd
 README.md
 PS1\
+  Install_LCPP.ps1
   Start_LCPP.ps1
   stop.ps1
   scan_model.ps1
@@ -41,6 +43,39 @@ bin\
 
 如果 `bin\` 不存在，但根目錄仍有舊版 `llama-server.exe`，腳本也能相容使用。  
 If `bin\` does not exist but a legacy `llama-server.exe` is still beside the script, the launcher can still use it for compatibility.
+
+## 安裝最新版 llama.cpp / Install Latest llama.cpp
+
+`install_all.cmd` 與 [`PS1/Install_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP.ps1) 會從官方 `ggml-org/llama.cpp` 下載最新版原始碼壓縮包，用 CMake 在本機重新編譯，然後把新的執行檔與 DLL 安裝到 `bin\`。  
+`install_all.cmd` and [`PS1/Install_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP.ps1) download the latest official `ggml-org/llama.cpp` source archive, rebuild it locally with CMake, and then install the fresh executables and DLLs into `bin\`.
+
+建議先準備好以下環境：  
+Recommended prerequisites:
+
+- Visual Studio 2022 或 Build Tools 2022，並勾選 `Desktop development with C++`
+- CMake
+- 如果要編譯 CUDA 版，請先安裝 CUDA Toolkit
+- 如果要編譯 Vulkan 版，請先安裝 Vulkan SDK 或至少能通過 `vulkaninfo`
+
+最簡單的安裝方式：  
+The simplest install command:
+
+```bat
+.\install_all.cmd
+```
+
+常見範例：  
+Common examples:
+
+```bat
+.\install_all.cmd -Backend CUDA
+.\install_all.cmd -Backend CPU
+.\install_all.cmd -Backend CUDA -InstallAutostart -TriggerMode Startup
+.\install_all.cmd -Source Master
+```
+
+`Install_LCPP_Autostart.ps1` 仍然只負責安裝 Windows 排程工作，不負責下載或編譯 `llama.cpp`。  
+`Install_LCPP_Autostart.ps1` still only manages the Windows scheduled task. It does not download or build `llama.cpp`.
 
 ## 內建說明 / Built-in Help
 
@@ -74,6 +109,20 @@ If you only want to quickly clear old processes, you can also use:
 
 ```bat
 .\stop.cmd
+```
+
+如果你想直接編譯並安裝最新版官方 `llama.cpp`，也可以用：
+If you want to build and install the latest official `llama.cpp` directly, you can also use:
+
+```bat
+.\install_all.cmd
+```
+
+如果你只想單獨安裝開機自動啟動排程，請直接用：
+If you only want to install the Windows autostart scheduled task by itself, use:
+
+```powershell
+.\PS1\Install_LCPP_Autostart.ps1 -TriggerMode Startup
 ```
 
 第一層選單提供這幾個入口：  

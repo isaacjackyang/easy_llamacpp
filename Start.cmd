@@ -18,5 +18,14 @@ if not exist "%POWERSHELL_EXE%" (
     set "POWERSHELL_EXE=powershell.exe"
 )
 
-"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LAUNCHER_PS1%" %*
-exit /b %ERRORLEVEL%
+"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LAUNCHER_PS1%" -ReturnNonZeroOnError -WrapperControlsPause %*
+set "EXIT_CODE=%ERRORLEVEL%"
+
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo Start failed with exit code %EXIT_CODE%.
+    echo.
+    if /I not "%LCPP_NO_PAUSE_ON_ERROR%"=="1" pause
+)
+
+exit /b %EXIT_CODE%

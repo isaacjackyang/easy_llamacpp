@@ -176,6 +176,8 @@ param(
     [switch]$BypassMenu,
     [switch]$NoBrowser,
     [switch]$NoPause,
+    [switch]$ReturnNonZeroOnError,
+    [switch]$WrapperControlsPause,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$LlamaArgs
 )
@@ -225,6 +227,7 @@ $ConfiguredModelScanPath = "E:\LLM Model"
 $BaseUrl = "http://127.0.0.1:$Port"
 $BrowserJob = $null
 $UsedInteractiveMenu = $false
+$EncounteredFatalError = $false
 $LogicalThreads = [Environment]::ProcessorCount
 $RawThreads = $Threads
 $RawThreadsBatch = $ThreadsBatch
@@ -4869,8 +4872,12 @@ try {
     }
 
     & $ServerExe @ServerArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "llama.cpp exited with code $LASTEXITCODE."
+    }
 }
 catch {
+    $EncounteredFatalError = $true
     if ($PendingSwitchTimingContext -and -not $SwitchTimingCompleted) {
         Clear-ModelSwitchTimingPending -TargetModelPath $PendingSwitchTimingContext.TargetModelPath -LaunchPid $PendingSwitchTimingLaunchPid
     }
@@ -4887,10 +4894,14 @@ finally {
         Remove-Job -Job $BrowserJob -Force -ErrorAction SilentlyContinue
     }
 
-    $ShouldPause = (-not $NoPause) -and (-not $Background) -and (-not $Status) -and (-not $ShowGpuOffload) -and (-not $Stop) -and (-not $LlamaHelp) -and (-not $UsedInteractiveMenu)
+    $ShouldPause = (-not $NoPause) -and (-not $WrapperControlsPause) -and (-not $Status) -and (-not $ShowGpuOffload) -and (-not $Stop) -and (-not $LlamaHelp) -and ($EncounteredFatalError -or ((-not $Background) -and (-not $UsedInteractiveMenu)))
     if ($ShouldPause) {
         Write-Host ""
         Write-Host "Press Enter to exit..." -ForegroundColor Yellow
         Read-Host | Out-Null
+    }
+
+    if ($EncounteredFatalError -and $ReturnNonZeroOnError) {
+        exit 1
     }
 }

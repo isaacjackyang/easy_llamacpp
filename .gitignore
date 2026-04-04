@@ -1,0 +1,28 @@
+# Local llama.cpp binaries and build/output folders
+/bin/
+/.cache/
+/backup/
+/llama-latest/
+
+# Runtime logs and PID files
+/logs/
+/*.log
+/*.pid
+
+# Generated local model inventory and tuning state
+/json/model-index.json
+/json/model-tuning.json
+/json/model-switch-times.json
+/model-index.json
+/model-tuning.json
+/model-switch-times.json
+
+# Local model files and ad-hoc download folders
+/*.gguf
+/*-hf/
+
+# Keep launcher entrypoints and repo scripts tracked
+!/Start.cmd
+!/stop.cmd
+!/install_all.cmd
+!/commit_github.cmd
