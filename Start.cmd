@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 
 set "SCRIPT_DIR=%~dp0"
 set "LAUNCHER_PS1=%SCRIPT_DIR%PS1\Start_LCPP.ps1"
@@ -18,6 +18,7 @@ if not exist "%POWERSHELL_EXE%" (
     set "POWERSHELL_EXE=powershell.exe"
 )
 
+rem Pass arguments through directly so quoted paths and llama.cpp flags stay intact.
 "%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LAUNCHER_PS1%" -ReturnNonZeroOnError -WrapperControlsPause %*
 set "EXIT_CODE=%ERRORLEVEL%"
 

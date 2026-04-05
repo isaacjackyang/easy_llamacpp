@@ -1,7 +1,7 @@
 ﻿# llama.cpp Launcher / llama.cpp 啟動器
 
-這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop.cmd`、`install_all.cmd`。它們分別用來啟動、停止、以及編譯安裝最新官方 `llama.cpp` 到本機 `bin\`，並管理本機的 `llama-server.exe`、模型切換與背景執行。  
-This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop.cmd`, and `install_all.cmd` wrappers for double-click or command-line use. They are used to start, stop, and build/install the latest official `llama.cpp` into the local `bin\` folder, including local `llama-server.exe` management, model switching, and background execution.
+這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、停止、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換與背景執行。  
+This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, and background execution.
 
 ## 目錄結構 / Folder Layout
 
@@ -10,10 +10,12 @@ Use the following layout so your own scripts stay separate from the `llama.cpp` 
 
 ```text
 Start.cmd
-install_all.cmd
+install.cmd
+install_latest.cmd
 stop.cmd
 README.md
 PS1\
+  Install_LCPP_Prebuilt.ps1
   Install_LCPP.ps1
   Start_LCPP.ps1
   stop.ps1
@@ -44,15 +46,44 @@ bin\
 如果 `bin\` 不存在，但根目錄仍有舊版 `llama-server.exe`，腳本也能相容使用。  
 If `bin\` does not exist but a legacy `llama-server.exe` is still beside the script, the launcher can still use it for compatibility.
 
-## 安裝最新版 llama.cpp / Install Latest llama.cpp
+## 安裝官方 Windows 預編譯版 / Install Official Windows Prebuilt
 
-`install_all.cmd` 與 [`PS1/Install_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP.ps1) 會從官方 `ggml-org/llama.cpp` 下載最新版原始碼壓縮包，用 CMake 在本機重新編譯，然後把新的執行檔與 DLL 安裝到 `bin\`。  
-`install_all.cmd` and [`PS1/Install_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP.ps1) download the latest official `ggml-org/llama.cpp` source archive, rebuild it locally with CMake, and then install the fresh executables and DLLs into `bin\`.
+`install.cmd` 與 [`PS1/Install_LCPP_Prebuilt.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP_Prebuilt.ps1) 會從官方 `ggml-org/llama.cpp` 最新 release 下載 Windows 預編譯版 ZIP，預設安裝 CUDA x64 版本，並把執行檔與 DLL 安裝到 `bin\`。  
+`install.cmd` and [`PS1/Install_LCPP_Prebuilt.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP_Prebuilt.ps1) download the latest official `ggml-org/llama.cpp` Windows release ZIP assets, default to the CUDA x64 package, and install the executables and DLLs into `bin\`.
+
+最簡單的安裝方式：  
+The simplest install command:
+
+```bat
+.\install.cmd
+```
+
+`install.cmd` 現在預設會安裝最新版官方 Windows CUDA 預編譯版。  
+`install.cmd` now installs the latest official Windows CUDA prebuilt package by default.
+
+如果 `.cache\llama.cpp-prebuilt\downloads\` 已經有對應這個 latest release 的 ZIP，`install.cmd` 會直接重用，不會重複下載；需要時可加 `-ForceDownload` 強制重抓。  
+If `.cache\llama.cpp-prebuilt\downloads\` already contains the ZIP assets for that latest release, `install.cmd` reuses them instead of downloading again; use `-ForceDownload` when you want a fresh download.
+
+常見範例：  
+Common examples:
+
+```bat
+.\install.cmd -InstallAutostart -TriggerMode Startup
+.\install.cmd -ForceDownload
+.\PS1\Install_LCPP_Prebuilt.ps1 -Backend CPU
+.\PS1\Install_LCPP_Prebuilt.ps1 -Backend Vulkan
+.\PS1\Install_LCPP_Prebuilt.ps1 -CudaVersion 12.4
+```
+
+## 本機編譯最新版 / Build Latest Locally
+
+`install_latest.cmd` 與 [`PS1/Install_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP.ps1) 會從官方 `ggml-org/llama.cpp` 下載最新版原始碼壓縮包，用 CMake 在本機重新編譯，然後把新的執行檔與 DLL 安裝到 `bin\`。  
+`install_latest.cmd` and [`PS1/Install_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Install_LCPP.ps1) download the latest official `ggml-org/llama.cpp` source archive, rebuild it locally with CMake, and then install the fresh executables and DLLs into `bin\`.
 
 建議先準備好以下環境：  
 Recommended prerequisites:
 
-- Visual Studio 2022 或 Build Tools 2022，並勾選 `Desktop development with C++`
+- Visual Studio Community / Build Tools（例如 2022、2026 或更新版），並勾選 `Desktop development with C++`
 - CMake
 - 如果要編譯 CUDA 版，請先安裝 CUDA Toolkit
 - 如果要編譯 Vulkan 版，請先安裝 Vulkan SDK 或至少能通過 `vulkaninfo`
@@ -61,17 +92,24 @@ Recommended prerequisites:
 The simplest install command:
 
 ```bat
-.\install_all.cmd
+.\install_latest.cmd
 ```
+
+`install_latest.cmd` 現在固定會編譯最新版官方 release 的 CUDA 版。  
+`install_latest.cmd` now always builds the latest official release with the CUDA backend.
+
+如果 `.cache\llama.cpp-install\downloads\` 已經有對應這個 latest release 的原始碼 ZIP，`install_latest.cmd` 會直接重用，不會重複下載；需要時可加 `-ForceDownload` 強制重抓。  
+If `.cache\llama.cpp-install\downloads\` already contains the source ZIP for that latest release, `install_latest.cmd` reuses it instead of downloading again; use `-ForceDownload` when you want a fresh download.
 
 常見範例：  
 Common examples:
 
 ```bat
-.\install_all.cmd -Backend CUDA
-.\install_all.cmd -Backend CPU
-.\install_all.cmd -Backend CUDA -InstallAutostart -TriggerMode Startup
-.\install_all.cmd -Source Master
+.\install_latest.cmd -InstallAutostart -TriggerMode Startup
+.\install_latest.cmd -ForceDownload
+.\PS1\Install_LCPP.ps1 -Backend CPU
+.\PS1\Install_LCPP.ps1 -Backend Vulkan
+.\PS1\Install_LCPP.ps1 -Source Master -Backend CUDA
 ```
 
 `Install_LCPP_Autostart.ps1` 仍然只負責安裝 Windows 排程工作，不負責下載或編譯 `llama.cpp`。  
@@ -115,7 +153,14 @@ If you only want to quickly clear old processes, you can also use:
 If you want to build and install the latest official `llama.cpp` directly, you can also use:
 
 ```bat
-.\install_all.cmd
+.\install_latest.cmd
+```
+
+如果你只想直接安裝官方 Windows CUDA 預編譯版，請用：
+If you only want the official Windows CUDA prebuilt package, use:
+
+```bat
+.\install.cmd
 ```
 
 如果你只想單獨安裝開機自動啟動排程，請直接用：

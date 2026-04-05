@@ -26,7 +26,8 @@ Target Windows architecture for Visual Studio generators. Default is x64.
 
 .PARAMETER Generator
 Optional CMake generator override.
-When omitted, the script uses "Visual Studio 17 2022" if it is installed.
+When omitted, the script auto-selects the newest installed Visual Studio generator
+that the local CMake build supports.
 
 .PARAMETER Jobs
 Optional parallel build count passed to CMake with --parallel.
@@ -50,6 +51,10 @@ Do not stop the currently tracked llama.cpp server before replacing binaries.
 
 .PARAMETER NoCudaRuntimeCopy
 When building with CUDA, do not copy CUDA runtime DLLs from the locally installed toolkit.
+
+.PARAMETER ForceDownload
+Always download the source archive again, even when the matching cached archive
+for the resolved release already exists.
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -80,7 +85,9 @@ param(
 
     [switch]$SkipStop,
 
-    [switch]$NoCudaRuntimeCopy
+    [switch]$NoCudaRuntimeCopy,
+
+    [switch]$ForceDownload
 )
 
 $ErrorActionPreference = "Stop"
@@ -240,6 +247,25 @@ function Invoke-ExternalCommand {
     }
 }
 
+function Test-CachedArchiveAvailable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $Item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        return $Item.Length -gt 0
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-LatestReleaseMetadata {
     return Invoke-RestMethod `
         -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" `
@@ -327,30 +353,88 @@ function Get-VswherePath {
     return $Candidates | Select-Object -First 1
 }
 
+function Get-CMakeSupportedVisualStudioGenerators {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CMakePath
+    )
+
+    try {
+        $CapabilitiesJson = & $CMakePath -E capabilities 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $CapabilitiesJson) {
+            return @()
+        }
+
+        $Capabilities = $CapabilitiesJson | ConvertFrom-Json -ErrorAction Stop
+        return @(
+            $Capabilities.generators |
+                Where-Object { $_.name -like "Visual Studio *" } |
+                Select-Object -ExpandProperty name
+        )
+    }
+    catch {
+        return @()
+    }
+}
+
 function Resolve-CMakeGenerator {
     param(
-        [string]$RequestedGenerator
+        [string]$RequestedGenerator,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CMakePath
     )
 
     if (-not [string]::IsNullOrWhiteSpace($RequestedGenerator)) {
         return $RequestedGenerator
     }
 
+    $SupportedGenerators = Get-CMakeSupportedVisualStudioGenerators -CMakePath $CMakePath
     $VswherePath = Get-VswherePath
     if ($VswherePath) {
-        $InstallationPath = & $VswherePath `
-            -latest `
+        $InstancesJson = & $VswherePath `
+            -all `
             -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -version "[17.0,18.0)" `
-            -property installationPath
+            -format json
 
-        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($InstallationPath)) {
-            return "Visual Studio 17 2022"
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($InstancesJson | Out-String))) {
+            $Instances = @($InstancesJson | ConvertFrom-Json -ErrorAction Stop)
+            $Candidates = foreach ($Instance in $Instances) {
+                if ([string]::IsNullOrWhiteSpace($Instance.installationVersion)) {
+                    continue
+                }
+
+                try {
+                    $Version = [Version]$Instance.installationVersion
+                }
+                catch {
+                    continue
+                }
+
+                $MatchedGenerator = $SupportedGenerators |
+                    Where-Object { $_ -like ("Visual Studio {0} *" -f $Version.Major) } |
+                    Select-Object -First 1
+
+                if ($MatchedGenerator) {
+                    [pscustomobject]@{
+                        Version   = $Version
+                        Generator = $MatchedGenerator
+                    }
+                }
+            }
+
+            $ResolvedGenerator = $Candidates |
+                Sort-Object -Property Version -Descending |
+                Select-Object -First 1 -ExpandProperty Generator
+
+            if (-not [string]::IsNullOrWhiteSpace($ResolvedGenerator)) {
+                return $ResolvedGenerator
+            }
         }
     }
 
-    throw "Cannot find a usable Visual Studio 2022 / Build Tools 2022 C++ toolchain. Install Visual Studio 2022 or Build Tools 2022 with the 'Desktop development with C++' workload, then run install_all.cmd again. If you already have another working CMake toolchain, pass -Generator explicitly."
+    throw "Cannot find a usable Visual Studio C++ toolchain that matches a CMake Visual Studio generator. Install Visual Studio / Build Tools with the 'Desktop development with C++' workload, then run install_latest.cmd again. If you already have another working CMake toolchain, pass -Generator explicitly."
 }
 
 function Get-BuildArtifactDirectory {
@@ -500,7 +584,7 @@ function Install-AutostartBestEffort {
 }
 
 if (-not (Get-Command cmake.exe -ErrorAction SilentlyContinue) -and -not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-    throw "Cannot find cmake.exe. Install Visual Studio 2022 / Build Tools 2022 with CMake support first."
+    throw "Cannot find cmake.exe. Install Visual Studio / Build Tools with CMake support first."
 }
 
 $CMakeExe = (Get-Command cmake.exe -ErrorAction SilentlyContinue)
@@ -517,7 +601,7 @@ Ensure-Directory -Path $BinRoot
 
 $SourceInfo = Get-SourceMetadata
 $ResolvedBackend = Resolve-Backend -RequestedBackend $Backend
-$ResolvedGenerator = Resolve-CMakeGenerator -RequestedGenerator $Generator
+$ResolvedGenerator = Resolve-CMakeGenerator -RequestedGenerator $Generator -CMakePath $CMakePath
 
 $SafeSourceLabel = Get-SafeName -Value $SourceInfo.Label
 $SafeBackendLabel = $ResolvedBackend.ToLowerInvariant()
@@ -538,10 +622,16 @@ Write-Host "CMake   : $ResolvedGenerator"
 Write-Host "Bin     : $BinRoot"
 
 Write-Step "Downloading official llama.cpp source archive..."
-if (Test-Path -LiteralPath $ArchivePath) {
-    Remove-Item -LiteralPath $ArchivePath -Force
+if (-not $ForceDownload -and $Source -eq "LatestRelease" -and -not $Ref -and (Test-CachedArchiveAvailable -Path $ArchivePath)) {
+    Write-Host "Using cached source archive: $ArchivePath" -ForegroundColor DarkGray
 }
-Invoke-WebRequest -Uri $SourceInfo.ArchiveUrl -Headers (Get-GitHubHeaders) -OutFile $ArchivePath
+else {
+    if (Test-Path -LiteralPath $ArchivePath) {
+        Remove-Item -LiteralPath $ArchivePath -Force
+    }
+
+    Invoke-WebRequest -Uri $SourceInfo.ArchiveUrl -Headers (Get-GitHubHeaders) -OutFile $ArchivePath
+}
 
 Write-Step "Expanding source archive..."
 Clear-ManagedDirectory -Path $ExpandedRoot -Root $ManagedRoot

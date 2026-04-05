@@ -235,10 +235,13 @@ $script:ModelFileSizeBytesCache = @{}
 $script:ModelFileSizeLabelCache = @{}
 $script:ModelRepeatingLayerCountCache = @{}
 $script:LastAutoTuneProfile = $null
+$script:BackgroundStartupProgressLineLength = 0
+$script:BackgroundStartupProgressLastText = $null
 $ServerCleanupTimeoutSec = 20
 $ServerCleanupSettleMs = 2000
 $BackgroundStartupCheckSec = 20
 $BackgroundStartupPollMs = 1000
+$BackgroundExitGraceSec = 6
 $StartupFailureLogLineCount = 40
 $AutoTuneTargetUsagePercent = 95.0
 $AutoTuneMinUsagePercent = 93.0
@@ -4210,11 +4213,20 @@ function Wait-ForProcessExit {
     )
 }
 
-function Stop-WorkspaceServerProcesses {
-    $TrackedProcess = Get-TrackedServerProcess
-    $TrackedModelPath = Get-TrackedServerModelPath -Process $TrackedProcess
+function Get-WorkspaceServerProcesses {
+    param(
+        [string]$TargetModelPath = $null
+    )
+
     $ServerPathPatterns = @($ServerExeCandidates | ForEach-Object { [regex]::Escape($_) })
-    $WorkspaceServerProcesses = @(
+    $TargetModelPattern = if (-not [string]::IsNullOrWhiteSpace($TargetModelPath)) {
+        [regex]::Escape($TargetModelPath)
+    }
+    else {
+        $null
+    }
+
+    return @(
         Get-CimInstance Win32_Process -Filter "Name = 'llama-server.exe'" -ErrorAction SilentlyContinue |
             Where-Object {
                 $WorkspaceProcess = $_
@@ -4236,9 +4248,20 @@ function Stop-WorkspaceServerProcesses {
                     }
                 }
 
-                $MatchesExecutablePath -or $MatchesCommandLine
+                $MatchesTargetModel = $true
+                if ($TargetModelPattern) {
+                    $MatchesTargetModel = $WorkspaceProcess.CommandLine -and ($WorkspaceProcess.CommandLine -match $TargetModelPattern)
+                }
+
+                ($MatchesExecutablePath -or $MatchesCommandLine) -and $MatchesTargetModel
             }
     )
+}
+
+function Stop-WorkspaceServerProcesses {
+    $TrackedProcess = Get-TrackedServerProcess
+    $TrackedModelPath = Get-TrackedServerModelPath -Process $TrackedProcess
+    $WorkspaceServerProcesses = @(Get-WorkspaceServerProcesses)
 
     if (-not $WorkspaceServerProcesses) {
         Remove-TrackedPidFiles
@@ -4295,13 +4318,77 @@ function Stop-WorkspaceServerProcesses {
 
 function Reset-BackgroundServerLogs {
     foreach ($LogPath in @($StdOutLog, $StdErrLog)) {
-        Set-Content -LiteralPath $LogPath -Value "" -Encoding ASCII
+        try {
+            if (Test-Path -LiteralPath $LogPath) {
+                Remove-Item -LiteralPath $LogPath -Force -ErrorAction Stop
+            }
+
+            [void](New-Item -ItemType File -Path $LogPath -Force)
+            Set-Content -LiteralPath $LogPath -Value "" -Encoding ASCII
+        }
+        catch {
+            throw "Could not reset background log file: $LogPath. Make sure no old llama-server.exe process is still using it."
+        }
     }
 }
 
 function Test-PortInUse {
     $Listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     return $Listener
+}
+
+function Get-ListeningWorkspaceServerProcess {
+    param(
+        [string]$TargetModelPath = $null
+    )
+
+    $Listener = Test-PortInUse
+    if (-not $Listener) {
+        return $null
+    }
+
+    $WorkspaceServerProcesses = @(Get-WorkspaceServerProcesses -TargetModelPath $TargetModelPath)
+    foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
+        if ([int]$WorkspaceServerProcess.ProcessId -eq [int]$Listener.OwningProcess) {
+            return $WorkspaceServerProcess
+        }
+    }
+
+    return $null
+}
+
+function Get-BackgroundServerCandidate {
+    param(
+        [int[]]$BaselineProcessIds = @(),
+        [Nullable[int]]$ExpectedLaunchPid = $null,
+        [string]$TargetModelPath = $null
+    )
+
+    $WorkspaceServerProcesses = @(Get-WorkspaceServerProcesses -TargetModelPath $TargetModelPath)
+    if ($WorkspaceServerProcesses.Count -eq 0) {
+        return $null
+    }
+
+    $ListeningProcess = Get-ListeningWorkspaceServerProcess -TargetModelPath $TargetModelPath
+    if ($ListeningProcess) {
+        return $ListeningProcess
+    }
+
+    if ($ExpectedLaunchPid -and $ExpectedLaunchPid.Value -gt 0) {
+        foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
+            if ([int]$WorkspaceServerProcess.ProcessId -eq $ExpectedLaunchPid.Value) {
+                return $WorkspaceServerProcess
+            }
+        }
+    }
+
+    foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
+        if ($BaselineProcessIds -notcontains ([int]$WorkspaceServerProcess.ProcessId)) {
+            return $WorkspaceServerProcess
+        }
+    }
+
+    return $WorkspaceServerProcesses | Select-Object -First 1
 }
 
 function Wait-ForPortRelease {
@@ -4337,6 +4424,295 @@ function Get-LogTailText {
     }
 
     return ($Lines -join [Environment]::NewLine).Trim()
+}
+
+function Test-StartupLogsCaptured {
+    return (-not [string]::IsNullOrWhiteSpace((Get-LogTailText -Path $StdErrLog))) -or (-not [string]::IsNullOrWhiteSpace((Get-LogTailText -Path $StdOutLog)))
+}
+
+function Get-BackgroundStartupProgressInfo {
+    param(
+        [string]$LogPath,
+        [switch]$ServerReady
+    )
+
+    $Info = [ordered]@{
+        DiskState         = "waiting"
+        DiskDetail        = $null
+        MemoryState       = "waiting"
+        MemoryDetail      = $null
+        GpuState          = "waiting"
+        GpuDetail         = $null
+        ServiceState      = "waiting"
+        ServiceDetail     = $null
+        HasServerListening = $false
+    }
+
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        if ($ServerReady) {
+            $Info.DiskState = "done"
+            $Info.MemoryState = "done"
+            $Info.GpuState = "skipped"
+            $Info.ServiceState = "done"
+        }
+
+        return [pscustomobject]$Info
+    }
+
+    $LogText = Get-Content -LiteralPath $LogPath -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($LogText)) {
+        if ($ServerReady) {
+            $Info.DiskState = "done"
+            $Info.MemoryState = "done"
+            $Info.GpuState = "skipped"
+            $Info.ServiceState = "done"
+        }
+
+        return [pscustomobject]$Info
+    }
+
+    $HasMetadata = $LogText -match 'llama_model_loader:\s+loaded meta data with'
+    $HasTensorLoad = $LogText -match 'load_tensors:\s+loading model tensors'
+    $CpuMappedMatches = [regex]::Matches($LogText, 'load_tensors:\s+CPU_Mapped model buffer size =\s+([0-9.]+)\s+MiB')
+    $CpuMappedModelBufferMiB = if ($CpuMappedMatches.Count -gt 0) { [double]$CpuMappedMatches[$CpuMappedMatches.Count - 1].Groups[1].Value } else { $null }
+    $HasContextConstruction = $LogText -match 'llama_context:\s+constructing llama_context'
+    $HasKvCache = $LogText -match 'llama_kv_cache:'
+    $HasWarmup = $LogText -match 'common_init_from_params:\s+warming up'
+    $HasSlotInitialization = $LogText -match 'srv\s+load_model:'
+    $HasModelLoaded = $LogText -match 'main:\s+model loaded'
+    $HasServerListening = $LogText -match 'main:\s+server is listening on '
+    $Info.HasServerListening = $HasServerListening
+
+    $GpuBufferMatches = [regex]::Matches($LogText, 'load_tensors:\s+(?!CPU(?:_Mapped)?)(?<device>[A-Za-z0-9_]+)\s+model buffer size =\s+(?<size>[0-9.]+)\s+MiB')
+    $OffloadingMatches = [regex]::Matches($LogText, 'load_tensors:\s+offloading\s+(\d+)\s+repeating layers to GPU')
+    $OffloadedMatches = [regex]::Matches($LogText, 'load_tensors:\s+offloaded\s+(\d+)/(\d+)\s+layers to GPU')
+    $HasGpuActivity = ($GpuBufferMatches.Count -gt 0) -or ($OffloadingMatches.Count -gt 0) -or ($OffloadedMatches.Count -gt 0)
+
+    if ($HasMetadata -or $HasTensorLoad) {
+        $Info.DiskState = "loading"
+    }
+    if ($null -ne $CpuMappedModelBufferMiB) {
+        $Info.DiskState = "done"
+        $Info.DiskDetail = ("{0:N2} MiB mapped" -f $CpuMappedModelBufferMiB)
+    }
+    elseif ($HasContextConstruction -or $HasWarmup -or $HasModelLoaded -or $HasServerListening -or $ServerReady) {
+        $Info.DiskState = "done"
+    }
+
+    if ($null -ne $CpuMappedModelBufferMiB) {
+        $Info.MemoryState = "loading"
+        $Info.MemoryDetail = ("{0:N2} MiB mapped" -f $CpuMappedModelBufferMiB)
+    }
+    if ($HasContextConstruction -or $HasKvCache -or $HasWarmup -or $HasModelLoaded -or $HasServerListening -or $ServerReady) {
+        $Info.MemoryState = "done"
+    }
+
+    if ($HasGpuActivity) {
+        $Info.GpuState = "loading"
+
+        if ($GpuBufferMatches.Count -gt 0) {
+            $TotalGpuModelBufferMiB = 0.0
+            foreach ($GpuBufferMatch in $GpuBufferMatches) {
+                $TotalGpuModelBufferMiB += [double]$GpuBufferMatch.Groups["size"].Value
+            }
+
+            $Info.GpuDetail = ("{0:N2} MiB buffers" -f $TotalGpuModelBufferMiB)
+        }
+
+        if ($OffloadingMatches.Count -gt 0) {
+            $Info.GpuDetail = ("repeat {0} layers" -f [int]$OffloadingMatches[$OffloadingMatches.Count - 1].Groups[1].Value)
+        }
+
+        if ($OffloadedMatches.Count -gt 0) {
+            $Info.GpuState = "done"
+            $Info.GpuDetail = ("{0}/{1} layers" -f [int]$OffloadedMatches[$OffloadedMatches.Count - 1].Groups[1].Value, [int]$OffloadedMatches[$OffloadedMatches.Count - 1].Groups[2].Value)
+        }
+        elseif ($HasModelLoaded -or $HasServerListening -or $ServerReady) {
+            $Info.GpuState = "done"
+        }
+    }
+    elseif ($HasModelLoaded -or $HasServerListening -or $ServerReady) {
+        $Info.GpuState = "skipped"
+    }
+
+    if ($HasWarmup -or $HasSlotInitialization -or $HasModelLoaded) {
+        $Info.ServiceState = "loading"
+    }
+    if ($HasWarmup) {
+        $Info.ServiceDetail = "warmup"
+    }
+    elseif ($HasSlotInitialization) {
+        $Info.ServiceDetail = "initializing slots"
+    }
+    elseif ($HasModelLoaded) {
+        $Info.ServiceDetail = "binding HTTP listener"
+    }
+
+    if ($HasServerListening -or $ServerReady) {
+        $Info.ServiceState = "done"
+        $Info.ServiceDetail = "ready"
+    }
+
+    if ($ServerReady) {
+        if ($Info.DiskState -eq "waiting") {
+            $Info.DiskState = "done"
+        }
+        if ($Info.MemoryState -eq "waiting") {
+            $Info.MemoryState = "done"
+        }
+        if ($Info.GpuState -eq "waiting") {
+            $Info.GpuState = "skipped"
+        }
+    }
+
+    return [pscustomobject]$Info
+}
+
+function Format-BackgroundStartupStageSegment {
+    param(
+        [string]$Label,
+        [string]$State,
+        [string]$Detail = $null
+    )
+
+    $StateText = switch ($State) {
+        "done" { "done" }
+        "loading" { "loading" }
+        "skipped" { "skipped" }
+        default { "waiting" }
+    }
+
+    $Segment = "{0}:{1}" -f $Label, $StateText
+    if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+        $Segment += " ({0})" -f $Detail
+    }
+
+    return $Segment
+}
+
+function Format-BackgroundStartupProgressLine {
+    param(
+        [psobject]$ProgressInfo,
+        [int]$Tick,
+        [switch]$Ready
+    )
+
+    $SpinnerFrames = @("|", "/", "-", "\")
+    $Prefix = if ($Ready) { "Ready     " } else { "Loading {0}" -f $SpinnerFrames[$Tick % $SpinnerFrames.Count] }
+    $Segments = @(
+        (Format-BackgroundStartupStageSegment -Label "Disk" -State $ProgressInfo.DiskState -Detail $ProgressInfo.DiskDetail),
+        (Format-BackgroundStartupStageSegment -Label "RAM" -State $ProgressInfo.MemoryState -Detail $ProgressInfo.MemoryDetail),
+        (Format-BackgroundStartupStageSegment -Label "GPU" -State $ProgressInfo.GpuState -Detail $ProgressInfo.GpuDetail),
+        (Format-BackgroundStartupStageSegment -Label "Server" -State $ProgressInfo.ServiceState -Detail $ProgressInfo.ServiceDetail)
+    )
+
+    return "{0}  {1}" -f $Prefix, ($Segments -join " | ")
+}
+
+function Write-BackgroundStartupProgressLine {
+    param(
+        [string]$Text,
+        [switch]$Complete
+    )
+
+    if (-not (Test-InteractiveConsole)) {
+        if ($Complete -or $Text -ne $script:BackgroundStartupProgressLastText) {
+            Write-Host $Text
+            $script:BackgroundStartupProgressLastText = $Text
+        }
+        return
+    }
+
+    $DisplayText = Get-FitText -Text $Text -Width ([Math]::Max(40, (Get-ConsoleWidth) - 1))
+    $PaddingLength = [Math]::Max(0, $script:BackgroundStartupProgressLineLength - $DisplayText.Length)
+    $PaddedText = $DisplayText + (" " * $PaddingLength)
+
+    Write-Host ("`r{0}" -f $PaddedText) -NoNewline
+    $script:BackgroundStartupProgressLineLength = [Math]::Max($script:BackgroundStartupProgressLineLength, $DisplayText.Length)
+    $script:BackgroundStartupProgressLastText = $DisplayText
+
+    if ($Complete) {
+        Write-Host ""
+        $script:BackgroundStartupProgressLineLength = 0
+        $script:BackgroundStartupProgressLastText = $null
+    }
+}
+
+function Wait-ForBackgroundServerReadyWithProgress {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$ServerBaseUrl,
+        [int[]]$BaselineProcessIds = @(),
+        [string]$TargetModelPath = $null,
+        [int]$TimeoutSec = 0
+    )
+
+    $ExpectedLaunchPid = [Nullable[int]]$null
+    if ($Process) {
+        try {
+            $ExpectedLaunchPid = [Nullable[int]]$Process.Id
+        }
+        catch {
+        }
+    }
+
+    $Deadline = if ($TimeoutSec -gt 0) { (Get-Date).AddSeconds($TimeoutSec) } else { $null }
+    $Tick = 0
+
+    while ($true) {
+        $CandidateProcess = Get-BackgroundServerCandidate -BaselineProcessIds $BaselineProcessIds -ExpectedLaunchPid $ExpectedLaunchPid -TargetModelPath $TargetModelPath
+        $ProgressInfo = Get-BackgroundStartupProgressInfo -LogPath $StdErrLog
+        $ShouldCheckReady = $ProgressInfo.HasServerListening -or ($Tick -eq 0) -or (($Tick % 5) -eq 0)
+        $ServerReady = $false
+
+        if ($ShouldCheckReady) {
+            $ServerReady = Test-ServerReady -ServerBaseUrl $ServerBaseUrl
+        }
+
+        if ($ServerReady) {
+            $ProgressInfo = Get-BackgroundStartupProgressInfo -LogPath $StdErrLog -ServerReady
+            Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick -Ready) -Complete
+            return [pscustomobject]@{
+                State     = "Ready"
+                ProcessId = if ($CandidateProcess) { [int]$CandidateProcess.ProcessId } elseif ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }
+            }
+        }
+
+        Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick)
+
+        try {
+            $Process.Refresh()
+        }
+        catch {
+        }
+
+        if (($Process -and $Process.HasExited) -and -not $CandidateProcess) {
+            Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick) -Complete
+
+            $FailureLog = Get-LogTailText -Path $StdErrLog
+            if (-not $FailureLog) {
+                $FailureLog = Get-LogTailText -Path $StdOutLog
+            }
+
+            if (-not $FailureLog) {
+                $FailureLog = "No startup log output was captured."
+            }
+
+            Remove-TrackedPidFiles
+            throw "llama.cpp exited during model startup (PID $($Process.Id)). Last log lines:`n$FailureLog"
+        }
+
+        if ($Deadline -and (Get-Date) -ge $Deadline) {
+            Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick) -Complete
+            return [pscustomobject]@{
+                State     = "Loading"
+                ProcessId = if ($CandidateProcess) { [int]$CandidateProcess.ProcessId } elseif ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }
+            }
+        }
+
+        Start-Sleep -Milliseconds $BackgroundStartupPollMs
+        $Tick++
+    }
 }
 
 function Test-ServerReady {
@@ -4385,11 +4761,33 @@ function Wait-ForBackgroundServerStartup {
     param(
         [System.Diagnostics.Process]$Process,
         [string]$ServerBaseUrl,
-        [int]$TimeoutSec = $BackgroundStartupCheckSec
+        [int]$TimeoutSec = $BackgroundStartupCheckSec,
+        [int[]]$BaselineProcessIds = @(),
+        [string]$TargetModelPath = $null
     )
 
+    $ExpectedLaunchPid = [Nullable[int]]$null
+    if ($Process) {
+        try {
+            $ExpectedLaunchPid = [Nullable[int]]$Process.Id
+        }
+        catch {
+        }
+    }
+
+    $ObservedExitedProcess = $false
+    $ObservedExitCodeLabel = "unknown"
     $Deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $Deadline) {
+        $CandidateProcess = Get-BackgroundServerCandidate -BaselineProcessIds $BaselineProcessIds -ExpectedLaunchPid $ExpectedLaunchPid -TargetModelPath $TargetModelPath
+
+        if (Test-ServerReady -ServerBaseUrl $ServerBaseUrl) {
+            return [pscustomobject]@{
+                State     = "Ready"
+                ProcessId = if ($CandidateProcess) { [int]$CandidateProcess.ProcessId } elseif ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }
+            }
+        }
+
         try {
             $Process.Refresh()
         }
@@ -4397,28 +4795,43 @@ function Wait-ForBackgroundServerStartup {
         }
 
         if ($Process.HasExited) {
-            Remove-TrackedPidFiles
-
-            $FailureLog = Get-LogTailText -Path $StdErrLog
-            if (-not $FailureLog) {
-                $FailureLog = Get-LogTailText -Path $StdOutLog
+            $ObservedExitedProcess = $true
+            try {
+                $ObservedExitCodeLabel = [string]$Process.ExitCode
             }
-
-            if (-not $FailureLog) {
-                $FailureLog = "No startup log output was captured."
+            catch {
             }
-
-            throw "llama.cpp exited during model startup (PID $($Process.Id)). Last log lines:`n$FailureLog"
-        }
-
-        if (Test-ServerReady -ServerBaseUrl $ServerBaseUrl) {
-            return "Ready"
         }
 
         Start-Sleep -Milliseconds $BackgroundStartupPollMs
     }
 
-    return "Loading"
+    $CandidateProcess = Get-BackgroundServerCandidate -BaselineProcessIds $BaselineProcessIds -ExpectedLaunchPid $ExpectedLaunchPid -TargetModelPath $TargetModelPath
+    if ($CandidateProcess) {
+        return [pscustomobject]@{
+            State     = "Loading"
+            ProcessId = [int]$CandidateProcess.ProcessId
+        }
+    }
+
+    if ($ObservedExitedProcess) {
+        $FailureLog = Get-LogTailText -Path $StdErrLog
+        if (-not $FailureLog) {
+            $FailureLog = Get-LogTailText -Path $StdOutLog
+        }
+
+        if (-not $FailureLog) {
+            $FailureLog = "No startup log output was captured."
+        }
+
+        Remove-TrackedPidFiles
+        throw "llama.cpp exited during model startup (PID $($Process.Id), exit code $ObservedExitCodeLabel). Last log lines:`n$FailureLog"
+    }
+
+    return [pscustomobject]@{
+        State     = "Loading"
+        ProcessId = if ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }
+    }
 }
 
 function Open-BrowserWhenReady {
@@ -4749,25 +5162,72 @@ try {
     $ServerArgs = Get-ServerArgs -AutoTuning $AutoLaunchTuning
 
     if ($Background) {
-        Reset-BackgroundServerLogs
         $ArgumentString = ConvertTo-ArgumentString -Arguments $ServerArgs
-        $BackgroundProcess = Start-Process `
-            -FilePath $ServerExe `
-            -ArgumentList $ArgumentString `
-            -WorkingDirectory $ScriptRoot `
-            -RedirectStandardOutput $StdOutLog `
-            -RedirectStandardError $StdErrLog `
-            -WindowStyle Hidden `
-            -PassThru
-
-        Set-Content -LiteralPath $PidFile -Value $BackgroundProcess.Id -Encoding ASCII
-        if ($SwitchTimingContext) {
-            Set-ModelSwitchTimingPending -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -LaunchPid $BackgroundProcess.Id | Out-Null
-            $PendingSwitchTimingContext = $SwitchTimingContext
-            $PendingSwitchTimingLaunchPid = [Nullable[int]]$BackgroundProcess.Id
-        }
         $StartupCheckSec = [Math]::Min($BackgroundStartupCheckSec, [Math]::Max(10, $ReadyTimeoutSec))
-        $StartupState = Wait-ForBackgroundServerStartup -Process $BackgroundProcess -ServerBaseUrl $BaseUrl -TimeoutSec $StartupCheckSec
+        $BaselineWorkspaceServerIds = @(
+            Get-WorkspaceServerProcesses |
+                ForEach-Object { [int]$_.ProcessId } |
+                Select-Object -Unique
+        )
+        $BackgroundProcess = $null
+        $TrackedBackgroundPid = $null
+        $BackgroundAttemptCount = 0
+        $LastBackgroundStartupError = $null
+
+        while ($BackgroundAttemptCount -lt 2) {
+            $BackgroundAttemptCount++
+            Reset-BackgroundServerLogs
+            $BackgroundProcess = Start-Process `
+                -FilePath $ServerExe `
+                -ArgumentList $ArgumentString `
+                -WorkingDirectory $ScriptRoot `
+                -RedirectStandardOutput $StdOutLog `
+                -RedirectStandardError $StdErrLog `
+                -WindowStyle Hidden `
+                -PassThru
+
+            Set-Content -LiteralPath $PidFile -Value $BackgroundProcess.Id -Encoding ASCII
+            if ($SwitchTimingContext) {
+                Set-ModelSwitchTimingPending -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -LaunchPid $BackgroundProcess.Id | Out-Null
+                $PendingSwitchTimingContext = $SwitchTimingContext
+                $PendingSwitchTimingLaunchPid = [Nullable[int]]$BackgroundProcess.Id
+            }
+
+            try {
+                if ($WrapperControlsPause) {
+                    Write-Host "Waiting for the server to finish loading..." -ForegroundColor Cyan
+                    $StartupResult = Wait-ForBackgroundServerReadyWithProgress -Process $BackgroundProcess -ServerBaseUrl $BaseUrl -BaselineProcessIds $BaselineWorkspaceServerIds -TargetModelPath $ModelPath
+                }
+                else {
+                    $StartupResult = Wait-ForBackgroundServerStartup -Process $BackgroundProcess -ServerBaseUrl $BaseUrl -TimeoutSec $StartupCheckSec -BaselineProcessIds $BaselineWorkspaceServerIds -TargetModelPath $ModelPath
+                }
+
+                $StartupState = $StartupResult.State
+                $TrackedBackgroundPid = $StartupResult.ProcessId
+                if ($TrackedBackgroundPid) {
+                    Set-Content -LiteralPath $PidFile -Value $TrackedBackgroundPid -Encoding ASCII
+                }
+                $LastBackgroundStartupError = $null
+                break
+            }
+            catch {
+                $LastBackgroundStartupError = $_.Exception
+                $HasStartupLogs = Test-StartupLogsCaptured
+                $RetryBackgroundStart = ($BackgroundAttemptCount -lt 2) -and (-not $HasStartupLogs)
+                if (-not $RetryBackgroundStart) {
+                    throw
+                }
+
+                Write-Host "Background start exited before any logs were captured. Retrying once..." -ForegroundColor Yellow
+                Remove-TrackedPidFiles
+                Start-Sleep -Seconds 2
+            }
+        }
+
+        if ($LastBackgroundStartupError) {
+            throw $LastBackgroundStartupError
+        }
+
         $AutoTuneSaveResult = $null
 
         if ($AutoLaunchTuning.AutoTuneEnabled -and $StartupState -ne "Ready") {
@@ -4792,18 +5252,20 @@ try {
 
         if ($SwitchTimingContext) {
             if ($StartupState -eq "Ready") {
-                Complete-ModelSwitchTimingMeasurement -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -CompletedAt (Get-Date) -LaunchPid $BackgroundProcess.Id | Out-Null
+                $CompletedLaunchPid = if ($TrackedBackgroundPid) { [int]$TrackedBackgroundPid } else { $BackgroundProcess.Id }
+                Complete-ModelSwitchTimingMeasurement -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -CompletedAt (Get-Date) -LaunchPid $CompletedLaunchPid | Out-Null
                 $SwitchTimingCompleted = $true
                 $PendingSwitchTimingContext = $null
                 $PendingSwitchTimingLaunchPid = [Nullable[int]]$null
             }
             else {
-                Start-ModelSwitchTimingRecorderDetached -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max($ReadyTimeoutSec, 600)) -ExpectedLaunchPid $BackgroundProcess.Id -TrackingPidFile $PidFile
+                $ExpectedLaunchPid = if ($TrackedBackgroundPid) { [int]$TrackedBackgroundPid } else { $BackgroundProcess.Id }
+                Start-ModelSwitchTimingRecorderDetached -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max($ReadyTimeoutSec, 600)) -ExpectedLaunchPid $ExpectedLaunchPid -TrackingPidFile $PidFile
             }
         }
 
         Write-Host "Background server started." -ForegroundColor Green
-        Write-Host "PID    : $($BackgroundProcess.Id)"
+        Write-Host "PID    : $(if ($TrackedBackgroundPid) { $TrackedBackgroundPid } else { $BackgroundProcess.Id })"
         Write-Host "State  : $(if ($StartupState -eq 'Ready') { 'ready' } else { "loading (process alive after $StartupCheckSec seconds)" })"
         Write-Host "URL    : $BaseUrl"
         Write-Host "Logs   : $StdOutLog"
@@ -4829,7 +5291,12 @@ try {
                 Start-BrowserWhenReadyDetached
             }
         }
-        Write-Host "You can close this PowerShell window." -ForegroundColor Cyan
+        if ($WrapperControlsPause) {
+            Write-Host "Server is ready. Closing the launcher window..." -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "You can close this PowerShell window." -ForegroundColor Cyan
+        }
         return
     }
 

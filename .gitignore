@@ -24,5 +24,6 @@
 # Keep launcher entrypoints and repo scripts tracked
 !/Start.cmd
 !/stop.cmd
-!/install_all.cmd
+!/install.cmd
+!/install_latest.cmd
 !/commit_github.cmd
