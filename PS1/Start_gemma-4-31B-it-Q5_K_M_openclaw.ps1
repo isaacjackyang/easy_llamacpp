@@ -68,6 +68,38 @@ function Save-JsonUtf8 {
   )
 }
 
+function Remove-JsonNoteProperty {
+  param(
+    [Parameter(Mandatory = $true)][object]$Node,
+    [Parameter(Mandatory = $true)][string]$Name
+  )
+
+  if (-not ($Node -is [pscustomobject])) {
+    return $false
+  }
+
+  if (-not ($Node.PSObject.Properties.Name -contains $Name)) {
+    return $false
+  }
+
+  [void]$Node.PSObject.Properties.Remove($Name)
+  return $true
+}
+
+function Remove-DeprecatedOpenClawConfigKeys {
+  param([Parameter(Mandatory = $true)][object]$Config)
+
+  $removedKeys = New-Object System.Collections.Generic.List[string]
+
+  if ($Config.PSObject.Properties.Name -contains "models" -and $Config.models -is [pscustomobject]) {
+    if (Remove-JsonNoteProperty -Node $Config.models -Name "bedrockDiscovery") {
+      $removedKeys.Add("models.bedrockDiscovery")
+    }
+  }
+
+  return @($removedKeys)
+}
+
 function Get-OpenClawCommandPath {
   $candidate = Get-Command openclaw.cmd -ErrorAction SilentlyContinue
   if (-not $candidate) {
@@ -375,6 +407,7 @@ try {
   Write-Ok "Detected context window $resolvedContextWindow"
 
   $config = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
+  $removedConfigKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
   $currentPrimary = [string]$config.agents.defaults.model.primary
   $previousLlamaModelId = $null
 
@@ -389,6 +422,9 @@ try {
   Save-JsonUtf8 -Path $openClawConfigPath -Payload $config
   Write-Ok "Updated openclaw.json -> $targetPrimary"
   Write-Info "Backup written to $configBackup"
+  if ($removedConfigKeys.Count -gt 0) {
+    Write-Info "Removed deprecated OpenClaw config keys: $($removedConfigKeys -join ', ')"
+  }
 
   $agentModels = Get-Content -LiteralPath $agentModelsPath -Raw | ConvertFrom-Json
   Ensure-LlamaCppModelEntry -Payload $agentModels -ContextWindow $resolvedContextWindow

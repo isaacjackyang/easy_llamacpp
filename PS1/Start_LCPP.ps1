@@ -546,7 +546,7 @@ function Get-AutoLaunchTuning {
             MemoryInfo          = $MemoryInfo
             FitTargetMiB        = if ($null -ne $SavedProfile.fit_target_mib) { [int]$SavedProfile.fit_target_mib } else { $null }
             CacheRamMiB         = if ($null -ne $SavedProfile.cache_ram_mib) { [int]$SavedProfile.cache_ram_mib } else { $null }
-            ParallelSlots       = if ($null -ne $SavedProfile.parallel_slots) { [int]$SavedProfile.parallel_slots } else { $null }
+            ParallelSlots       = if ($null -ne $SavedProfile.parallel_slots) { 1 } else { 1 }
             Source              = "saved-profile"
             SourceLabel         = "saved auto-tune profile"
             AutoTuneEnabled     = [bool]$EnableAutoTune
@@ -633,8 +633,8 @@ function Get-AutoLaunchTuning {
         elseif (($AcceleratorInfo -and ($AcceleratorInfo.TotalMiB -le 6144 -or $AcceleratorInfo.FreeMiB -lt 4096)) -or ($MemoryInfo -and $MemoryInfo.FreeMiB -lt 8192)) {
             $ParallelSlots = 1
         }
-        elseif (($AcceleratorInfo -and ($AcceleratorInfo.TotalMiB -le 12288 -or $AcceleratorInfo.FreeMiB -lt 8192)) -or ($MemoryInfo -and $MemoryInfo.FreeMiB -lt 12288)) {
-            $ParallelSlots = 2
+        else {
+            $ParallelSlots = 1
         }
     }
 
@@ -3958,6 +3958,51 @@ function Get-TrackedServerRuntimeProperties {
     }
 }
 
+function Get-LlamaRuntimeTokenSnapshot {
+    param(
+        [string]$LogPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LogPath) -or -not (Test-Path -LiteralPath $LogPath)) {
+        return $null
+    }
+
+    $Lines = @(Get-Content -LiteralPath $LogPath -Tail 4000 -ErrorAction SilentlyContinue)
+    if (-not $Lines -or $Lines.Count -eq 0) {
+        return $null
+    }
+
+    for ($Index = $Lines.Count - 1; $Index -ge 0; $Index -= 1) {
+        if ($Lines[$Index] -match 'request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)') {
+            return [pscustomobject]@{
+                PromptTokens  = [int]$Matches[1]
+                ContextTokens = [int]$Matches[2]
+                Overflow      = $true
+            }
+        }
+
+        if ($Lines[$Index] -match 'new prompt, n_ctx_slot = (\d+), n_keep = \d+, task\.n_tokens = (\d+)') {
+            return [pscustomobject]@{
+                PromptTokens  = [int]$Matches[2]
+                ContextTokens = [int]$Matches[1]
+                Overflow      = $false
+            }
+        }
+    }
+
+    for ($Index = $Lines.Count - 1; $Index -ge 0; $Index -= 1) {
+        if ($Lines[$Index] -match 'llama_context:\s+n_ctx\s*=\s*(\d+)') {
+            return [pscustomobject]@{
+                PromptTokens  = $null
+                ContextTokens = [int]$Matches[1]
+                Overflow      = $false
+            }
+        }
+    }
+
+    return $null
+}
+
 function Format-TrackedServerScalarValue {
     param(
         $Value
@@ -4047,25 +4092,95 @@ function Format-TrackedServerContextValue {
     )
 
     $ExplicitContextSize = if ($TrackedSettings) { [string]$TrackedSettings.ContextSize } else { "" }
-    $RuntimeContextSize = ""
+    $PerSlotContextSize = $null
+    $RuntimeSlots = $null
 
     try {
         if ($RuntimeProperties -and $RuntimeProperties.default_generation_settings -and $RuntimeProperties.default_generation_settings.n_ctx) {
-            $RuntimeContextSize = [string]$RuntimeProperties.default_generation_settings.n_ctx
+            $PerSlotContextSize = [int]$RuntimeProperties.default_generation_settings.n_ctx
+        }
+    }
+    catch {
+    }
+
+    try {
+        if ($RuntimeProperties -and $RuntimeProperties.total_slots) {
+            $RuntimeSlots = [int]$RuntimeProperties.total_slots
         }
     }
     catch {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitContextSize)) {
+        $ExplicitContextValue = 0
+        if ([int]::TryParse($ExplicitContextSize, [ref]$ExplicitContextValue)) {
+            if ($null -ne $PerSlotContextSize -and $null -ne $RuntimeSlots -and $RuntimeSlots -gt 1) {
+                return ("{0:N0} total / {1:N0} per slot ({2} slots, requested via --ctx-size)" -f $ExplicitContextValue, $PerSlotContextSize, $RuntimeSlots)
+            }
+
+            return ("{0:N0} total (requested via --ctx-size)" -f $ExplicitContextValue)
+        }
+
         return $ExplicitContextSize
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($RuntimeContextSize)) {
-        return "$RuntimeContextSize (server default)"
+    if ($null -ne $PerSlotContextSize) {
+        if ($null -ne $RuntimeSlots -and $RuntimeSlots -gt 1) {
+            $AggregateContextSize = $PerSlotContextSize * $RuntimeSlots
+            return ("{0:N0} total / {1:N0} per slot ({2} slots, server default)" -f $AggregateContextSize, $PerSlotContextSize, $RuntimeSlots)
+        }
+
+        return ("{0:N0} (server default)" -f $PerSlotContextSize)
     }
 
     return "server default"
+}
+
+function Format-TrackedServerTokenUsageValue {
+    param(
+        $TokenSnapshot,
+        $RuntimeProperties
+    )
+
+    if (-not $TokenSnapshot -or $null -eq $TokenSnapshot.ContextTokens) {
+        return "unknown"
+    }
+
+    $ContextText = ([int]$TokenSnapshot.ContextTokens).ToString("N0")
+    if ($null -eq $TokenSnapshot.PromptTokens) {
+        return "unknown / $ContextText"
+    }
+
+    $PromptValue = [int]$TokenSnapshot.PromptTokens
+    $PromptText = $PromptValue.ToString("N0")
+    $Percent = if ($TokenSnapshot.ContextTokens -gt 0) {
+        [Math]::Round(($PromptValue / [double]$TokenSnapshot.ContextTokens) * 100.0, 1)
+    }
+    else {
+        0
+    }
+
+    $Suffix = if ($TokenSnapshot.Overflow -or $PromptValue -gt $TokenSnapshot.ContextTokens) {
+        " overflow"
+    }
+    else {
+        ""
+    }
+
+    $RuntimeSlots = $null
+    try {
+        if ($RuntimeProperties -and $RuntimeProperties.total_slots) {
+            $RuntimeSlots = [int]$RuntimeProperties.total_slots
+        }
+    }
+    catch {
+    }
+
+    if ($null -ne $RuntimeSlots -and $RuntimeSlots -gt 1) {
+        return "$PromptText / $ContextText per active slot ($Percent%)$Suffix"
+    }
+
+    return "$PromptText / $ContextText ($Percent%)$Suffix"
 }
 
 function Format-TrackedServerGpuValue {
@@ -4894,6 +5009,58 @@ while ((Get-Date) -lt `$Deadline) {
         -WindowStyle Hidden | Out-Null
 }
 
+function Invoke-OpenClawStatusSyncSilently {
+    $OpenClawConfigPath = Join-Path $env:USERPROFILE ".openclaw\openclaw.json"
+    if (-not (Test-Path -LiteralPath $OpenClawConfigPath)) {
+        return
+    }
+
+    $SyncScriptPath = Join-Path $Ps1Root "Update_OpenClaw_Status.ps1"
+    if (-not (Test-Path -LiteralPath $SyncScriptPath)) {
+        return
+    }
+
+    $PowerShellExe = (Get-Process -Id $PID).Path
+    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+        $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    }
+    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+        $PowerShellExe = "powershell.exe"
+    }
+
+    $SyncStdOutLog = Join-Path $LogRoot "openclaw-sync.stdout.log"
+    $SyncStdErrLog = Join-Path $LogRoot "openclaw-sync.stderr.log"
+
+    try {
+        $SyncProcess = Start-Process `
+            -FilePath $PowerShellExe `
+            -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $SyncScriptPath, "-NoPause") `
+            -WorkingDirectory $ScriptRoot `
+            -RedirectStandardOutput $SyncStdOutLog `
+            -RedirectStandardError $SyncStdErrLog `
+            -WindowStyle Hidden `
+            -PassThru
+
+        if (-not $SyncProcess.WaitForExit(45000)) {
+            try {
+                $SyncProcess.Kill()
+            }
+            catch {
+            }
+
+            Write-Host "OpenClaw sync: timed out after launch; keeping llama.cpp running with the new runtime state." -ForegroundColor Yellow
+            return
+        }
+
+        if ($SyncProcess.ExitCode -ne 0) {
+            Write-Host "OpenClaw sync: skipped after launch (see $SyncStdErrLog if you need details)." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "OpenClaw sync: skipped after launch ($($_.Exception.Message))." -ForegroundColor Yellow
+    }
+}
+
 function Show-ServerStatus {
     $TrackedProcess = Get-TrackedServerProcess
     $Listener = Test-PortInUse
@@ -4909,6 +5076,7 @@ function Show-ServerStatus {
         $TrackedBaseUrl = "http://127.0.0.1:$TrackedPort"
         $TrackedRuntimeProperties = Get-TrackedServerRuntimeProperties -ServerBaseUrl $TrackedBaseUrl
         $TrackedGpuOffloadInfo = Get-GpuOffloadInfo
+        $TrackedTokenSnapshot = Get-LlamaRuntimeTokenSnapshot -LogPath $TrackedLogPaths.StdErrLog
         Write-Host "Status : running" -ForegroundColor Green
         Write-Host "PID    : $($TrackedProcess.Id)"
         Write-Host "URL    : $TrackedBaseUrl"
@@ -4923,6 +5091,9 @@ function Show-ServerStatus {
         if ($TrackedSettings) {
             $GenerationSettings = Get-TrackedServerGenerationSettings -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties
             Write-Host "Ctx    : $(Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties)"
+            if ($TrackedTokenSnapshot) {
+                Write-Host "Tokens : $(Format-TrackedServerTokenUsageValue -TokenSnapshot $TrackedTokenSnapshot -RuntimeProperties $TrackedRuntimeProperties) last real prompt seen by llama.cpp"
+            }
             Write-Host "GPU    : $(Format-TrackedServerGpuValue -TrackedSettings $TrackedSettings -GpuOffloadInfo $TrackedGpuOffloadInfo)"
             if ($TrackedGpuOffloadInfo) {
                 $BufferSummary = Format-TrackedServerBufferValue -GpuOffloadInfo $TrackedGpuOffloadInfo
@@ -5248,6 +5419,10 @@ try {
         if ($AutoLaunchTuning.AutoTuneEnabled -and $StartupState -eq "Ready" -and -not $AutoTuneSaveResult) {
             $ObservedUsage = Get-ObservedGpuUsage -LogPath $StdErrLog -AcceleratorInventory $AutoLaunchTuning.AcceleratorInventory
             $AutoTuneSaveResult = Save-AutoTuneProfile -AutoTuning $AutoLaunchTuning -ObservedUsage $ObservedUsage
+        }
+
+        if ($StartupState -eq "Ready") {
+            Invoke-OpenClawStatusSyncSilently
         }
 
         if ($SwitchTimingContext) {

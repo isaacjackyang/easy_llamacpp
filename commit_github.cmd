@@ -12,8 +12,9 @@ set "DEFAULT_COMMIT_MESSAGE=Update easy_llamacpp"
 
 rem Expected GitHub remote for this repo.
 set "EXPECTED_REMOTE_URL=https://github.com/isaacjackyang/easy_llamacpp"
-rem Push strategy: overwrite the remote branch with the current local branch.
-set "PUSH_ARGS=--force -u origin"
+rem Push strategy: overwrite the remote main branch with the current local HEAD.
+set "TARGET_BRANCH=main"
+set "PUSH_ARGS=--force origin"
 rem ============================================================
 
 if /I "%~1"=="/?" goto :usage
@@ -94,13 +95,14 @@ if not defined ORIGIN_URL (
 
 echo Repository : %CD%
 echo Branch     : %CURRENT_BRANCH%
+echo Target     : origin/%TARGET_BRANCH%
 echo Remote     : %ORIGIN_URL%
 echo Message    : %COMMIT_MESSAGE%
 if /I not "%ORIGIN_URL%"=="%EXPECTED_REMOTE_URL%" (
     echo Warning    : origin does not match expected repo.
     echo Expected   : %EXPECTED_REMOTE_URL%
 )
-echo Push mode  : force push current local branch to origin
+echo Push mode  : force push current local HEAD to origin/%TARGET_BRANCH%
 echo.
 echo Staging all changes...
 git add -A
@@ -108,7 +110,7 @@ if errorlevel 1 goto :fail
 
 git diff --cached --quiet --exit-code
 if errorlevel 1 goto :has_changes
-echo No staged changes to commit. Skipping commit and pushing current branch as-is.
+echo No staged changes to commit. Skipping commit and pushing current local HEAD to origin/%TARGET_BRANCH% as-is.
 goto :push_branch
 
 :has_changes
@@ -120,7 +122,7 @@ if errorlevel 1 goto :fail
 :push_branch
 echo.
 echo Pushing to GitHub...
-git push %PUSH_ARGS% %CURRENT_BRANCH%
+git push %PUSH_ARGS% HEAD:%TARGET_BRANCH%
 if errorlevel 1 goto :fail
 
 echo.
@@ -154,7 +156,7 @@ echo Default remote:
 echo   %EXPECTED_REMOTE_URL%
 echo.
 echo Push behavior:
-echo   Force-push the current local branch to origin, replacing the remote branch state.
+echo   Force-push the current local HEAD to origin/%TARGET_BRANCH%, replacing that remote branch state.
 echo.
 echo Examples:
 echo   commit_github.cmd "Update project files"

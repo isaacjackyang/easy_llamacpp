@@ -14,6 +14,8 @@ $llamaStdErrLogPath = Join-Path $projectRoot "logs\llama-server.stderr.log"
 $llamaPidPath = Join-Path $projectRoot "logs\llama-server.pid"
 $openClawRoot = Join-Path $env:USERPROFILE ".openclaw"
 $openClawConfigPath = Join-Path $openClawRoot "openclaw.json"
+$gatewayScriptPath = Join-Path $openClawRoot "gateway.cmd"
+$nodeScriptPath = Join-Path $openClawRoot "node.cmd"
 $agentModelsPath = Join-Path $openClawRoot "agents\main\agent\models.json"
 $sessionPaths = @(
   (Join-Path $openClawRoot "agents\main\sessions\sessions.json"),
@@ -69,6 +71,38 @@ function Save-JsonUtf8 {
   )
 }
 
+function Remove-JsonNoteProperty {
+  param(
+    [Parameter(Mandatory = $true)][object]$Node,
+    [Parameter(Mandatory = $true)][string]$Name
+  )
+
+  if (-not ($Node -is [pscustomobject])) {
+    return $false
+  }
+
+  if (-not ($Node.PSObject.Properties.Name -contains $Name)) {
+    return $false
+  }
+
+  [void]$Node.PSObject.Properties.Remove($Name)
+  return $true
+}
+
+function Remove-DeprecatedOpenClawConfigKeys {
+  param([Parameter(Mandatory = $true)][object]$Config)
+
+  $removedKeys = New-Object System.Collections.Generic.List[string]
+
+  if ($Config.PSObject.Properties.Name -contains "models" -and $Config.models -is [pscustomobject]) {
+    if (Remove-JsonNoteProperty -Node $Config.models -Name "bedrockDiscovery") {
+      $removedKeys.Add("models.bedrockDiscovery")
+    }
+  }
+
+  return @($removedKeys)
+}
+
 function Get-OpenClawCommandPath {
   $candidate = Get-Command openclaw.cmd -ErrorAction SilentlyContinue
   if (-not $candidate) {
@@ -80,6 +114,16 @@ function Get-OpenClawCommandPath {
   }
 
   return $candidate.Source
+}
+
+function Start-BackgroundCmd {
+  param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+  if (-not (Test-Path -LiteralPath $ScriptPath)) {
+    throw "Cannot find startup script: $ScriptPath"
+  }
+
+  Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$ScriptPath`"") -WindowStyle Hidden | Out-Null
 }
 
 function Get-LlamaContextWindowFromLogs {
@@ -106,6 +150,48 @@ function Get-LlamaContextWindowFromLogs {
   }
 
   return $Fallback
+}
+
+function Get-LlamaRuntimeTokenSnapshot {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return $null
+  }
+
+  $lines = @(Get-Content -LiteralPath $Path -Tail 4000 -ErrorAction SilentlyContinue)
+  if (-not $lines -or $lines.Count -eq 0) {
+    return $null
+  }
+
+  for ($index = $lines.Count - 1; $index -ge 0; $index -= 1) {
+    if ($lines[$index] -match 'request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)') {
+      return [pscustomobject]@{
+        PromptTokens = [int]$Matches[1]
+        ContextTokens = [int]$Matches[2]
+        Overflow = $true
+      }
+    }
+
+    if ($lines[$index] -match 'new prompt, n_ctx_slot = (\d+), n_keep = \d+, task\.n_tokens = (\d+)') {
+      return [pscustomobject]@{
+        PromptTokens = [int]$Matches[2]
+        ContextTokens = [int]$Matches[1]
+        Overflow = $false
+      }
+    }
+  }
+
+  $contextWindow = Get-LlamaContextWindowFromLogs -Path $Path -Fallback 0
+  if ($contextWindow -gt 0) {
+    return [pscustomobject]@{
+      PromptTokens = $null
+      ContextTokens = $contextWindow
+      Overflow = $false
+    }
+  }
+
+  return $null
 }
 
 function Get-RunningLlamaModelInfo {
@@ -172,6 +258,27 @@ function Test-TcpPort {
   finally {
     $client.Close()
   }
+}
+
+function Get-OpenClawGatewayHostProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bgateway\b') -or
+        ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'gateway\.cmd')
+      }
+  )
+}
+
+function Get-OpenClawNodeHostProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bnode\s+run\b') -or
+        ($_.Name -like "powershell*.exe" -and $_.CommandLine -match 'start-openclaw-node\.ps1') -or
+        ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'node\.cmd')
+      }
+  )
 }
 
 function Get-LlamaCppProviderNode {
@@ -280,6 +387,66 @@ function Replace-ExactStringValue {
   return $Node
 }
 
+function Set-JsonNoteProperty {
+  param(
+    [Parameter(Mandatory = $true)][object]$Node,
+    [Parameter(Mandatory = $true)][string]$Name,
+    [AllowNull()]$Value
+  )
+
+  if ($Node.PSObject.Properties.Name -contains $Name) {
+    $Node.$Name = $Value
+  } else {
+    $Node | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+  }
+}
+
+function Update-LlamaCppSessionEntries {
+  param(
+    [Parameter(Mandatory = $true)][object]$Sessions,
+    [Parameter(Mandatory = $true)][string]$ModelId,
+    [string]$PreviousModelId,
+    [Parameter(Mandatory = $true)][int]$ContextWindow,
+    [Nullable[int]]$PromptTokens
+  )
+
+  $updated = $false
+
+  foreach ($sessionProperty in $Sessions.PSObject.Properties) {
+    $entry = $sessionProperty.Value
+    if ($null -eq $entry -or -not ($entry -is [pscustomobject])) {
+      continue
+    }
+
+    $entryModelProvider = if ($entry.PSObject.Properties.Name -contains "modelProvider") { [string]$entry.modelProvider } else { "" }
+    $entryModel = if ($entry.PSObject.Properties.Name -contains "model") { [string]$entry.model } else { "" }
+    $isLlamaEntry = ($entryModelProvider -eq "llama-cpp") -or ($entryModel -eq $ModelId) -or ((-not [string]::IsNullOrWhiteSpace($PreviousModelId)) -and $entryModel -eq $PreviousModelId)
+
+    if (-not $isLlamaEntry) {
+      continue
+    }
+
+    Set-JsonNoteProperty -Node $entry -Name "modelProvider" -Value "llama-cpp"
+    Set-JsonNoteProperty -Node $entry -Name "model" -Value $ModelId
+    Set-JsonNoteProperty -Node $entry -Name "contextTokens" -Value $ContextWindow
+
+    if ($null -ne $PromptTokens) {
+      Set-JsonNoteProperty -Node $entry -Name "totalTokens" -Value ([int]$PromptTokens)
+      Set-JsonNoteProperty -Node $entry -Name "totalTokensFresh" -Value $true
+    }
+    else {
+      if ($entry.PSObject.Properties.Name -contains "totalTokens") {
+        $entry.totalTokens = $null
+      }
+      Set-JsonNoteProperty -Node $entry -Name "totalTokensFresh" -Value $false
+    }
+
+    $updated = $true
+  }
+
+  return $updated
+}
+
 function Invoke-Checked {
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
@@ -296,9 +463,23 @@ function Invoke-Checked {
 function Restart-OpenClawServices {
   param([Parameter(Mandatory = $true)][string]$OpenClawCommandPath)
 
-  Invoke-Checked -FilePath $OpenClawCommandPath -Arguments @("--no-color", "gateway", "restart")
+  foreach ($taskName in @("OpenClaw Gateway", "OpenClaw Node")) {
+    & schtasks.exe /End /TN $taskName *> $null
+  }
+
+  $processesToStop = @(
+    @(Get-OpenClawGatewayHostProcesses) +
+    @(Get-OpenClawNodeHostProcesses)
+  ) | Sort-Object ProcessId -Unique
+
+  foreach ($process in $processesToStop) {
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+
   Start-Sleep -Seconds 2
-  Invoke-Checked -FilePath $OpenClawCommandPath -Arguments @("--no-color", "node", "restart")
+  Start-BackgroundCmd -ScriptPath $gatewayScriptPath
+  Start-Sleep -Seconds 2
+  Start-BackgroundCmd -ScriptPath $nodeScriptPath
 }
 
 function Show-Summary {
@@ -355,13 +536,23 @@ try {
 
   $runtimeModel = Get-RunningLlamaModelInfo -ModelsUrl $llamaModelsUrl
   $targetModelId = $runtimeModel.ModelId
-  $resolvedContextWindow = Get-LlamaContextWindowFromLogs -Path $llamaStdErrLogPath -Fallback $(if ($runtimeModel.TrainContext) { $runtimeModel.TrainContext } else { 8192 })
+  $runtimeTokenSnapshot = Get-LlamaRuntimeTokenSnapshot -Path $llamaStdErrLogPath
+  $resolvedContextWindow = if ($runtimeTokenSnapshot -and $runtimeTokenSnapshot.ContextTokens) {
+    [int]$runtimeTokenSnapshot.ContextTokens
+  } else {
+    Get-LlamaContextWindowFromLogs -Path $llamaStdErrLogPath -Fallback $(if ($runtimeModel.TrainContext) { $runtimeModel.TrainContext } else { 8192 })
+  }
+  $resolvedPromptTokens = if ($runtimeTokenSnapshot -and $null -ne $runtimeTokenSnapshot.PromptTokens) { [int]$runtimeTokenSnapshot.PromptTokens } else { $null }
   $targetPrimary = "llama-cpp/$targetModelId"
 
   Write-Ok "Detected running llama.cpp model $targetModelId"
   Write-Info "Resolved context window $resolvedContextWindow"
+  if ($null -ne $resolvedPromptTokens) {
+    Write-Info "Resolved last real prompt tokens $resolvedPromptTokens"
+  }
 
   $config = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
+  $removedConfigKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
   $currentPrimary = [string]$config.agents.defaults.model.primary
   $previousLlamaModelId = $null
 
@@ -370,12 +561,16 @@ try {
   }
 
   Ensure-LlamaCppModelEntry -Payload $config -ModelId $targetModelId -ContextWindow $resolvedContextWindow
-  $config.agents.defaults.model.primary = $targetPrimary
+  Set-JsonNoteProperty -Node $config.agents.defaults.model -Name "primary" -Value $targetPrimary
+  Set-JsonNoteProperty -Node $config.agents.defaults -Name "contextTokens" -Value $resolvedContextWindow
 
   $configBackup = Backup-File -Path $openClawConfigPath -Suffix $targetModelId
   Save-JsonUtf8 -Path $openClawConfigPath -Payload $config
   Write-Ok "Updated openclaw.json -> $targetPrimary"
   Write-Info "Backup written to $configBackup"
+  if ($removedConfigKeys.Count -gt 0) {
+    Write-Warn "Removed deprecated OpenClaw config keys: $($removedConfigKeys -join ', ')"
+  }
 
   $agentModels = Get-Content -LiteralPath $agentModelsPath -Raw | ConvertFrom-Json
   Ensure-LlamaCppModelEntry -Payload $agentModels -ModelId $targetModelId -ContextWindow $resolvedContextWindow
@@ -385,18 +580,31 @@ try {
   Write-Ok "Updated agents/main/agent/models.json"
   Write-Info "Backup written to $agentModelsBackup"
 
-  if (-not $SkipSessionUpdate -and $previousLlamaModelId -and $previousLlamaModelId -ne $targetModelId) {
+  if (-not $SkipSessionUpdate) {
     foreach ($sessionPath in $sessionPaths) {
       if (-not (Test-Path -LiteralPath $sessionPath)) {
         continue
       }
 
       $sessions = Get-Content -LiteralPath $sessionPath -Raw | ConvertFrom-Json
-      [void](Replace-ExactStringValue -Node $sessions -OldValue $previousLlamaModelId -NewValue $targetModelId)
+      $sessionChanged = $false
+
+      if ($previousLlamaModelId -and $previousLlamaModelId -ne $targetModelId) {
+        [void](Replace-ExactStringValue -Node $sessions -OldValue $previousLlamaModelId -NewValue $targetModelId)
+        $sessionChanged = $true
+      }
+
+      if (Update-LlamaCppSessionEntries -Sessions $sessions -ModelId $targetModelId -PreviousModelId $previousLlamaModelId -ContextWindow $resolvedContextWindow -PromptTokens $resolvedPromptTokens) {
+        $sessionChanged = $true
+      }
+
+      if (-not $sessionChanged) {
+        continue
+      }
 
       $sessionBackup = Backup-File -Path $sessionPath -Suffix $targetModelId
       Save-JsonUtf8 -Path $sessionPath -Payload $sessions
-      Write-Ok "Updated session model references in $sessionPath"
+      Write-Ok "Updated llama-cpp session runtime state in $sessionPath"
       Write-Info "Backup written to $sessionBackup"
     }
   } elseif ($SkipSessionUpdate) {
@@ -406,7 +614,7 @@ try {
   }
 
   if ($RestartOpenClaw) {
-    Write-Info "Restarting OpenClaw via official CLI service commands"
+    Write-Info "Restarting OpenClaw via local gateway/node startup scripts"
     Restart-OpenClawServices -OpenClawCommandPath $openClawCommandPath
     Write-Ok "OpenClaw gateway and node restart requested"
   } else {
