@@ -4,9 +4,10 @@ Launches llama.cpp through an interactive menu or direct control switches.
 
 .DESCRIPTION
 By default the script opens an interactive launcher menu.
-The first screen lets you choose Quick Start or Tune And Launch, then select a model
-from model-index.json, review model capabilities, and launch either a background service
-or the built-in Web UI. Direct control switches such as -Status, -Stop, and -LlamaHelp
+The first screen lets you choose Quick Start, Quick Start And OpenClaw, or Tune And Launch,
+then select a model from model-index.json, review model capabilities, and launch either
+a background service, the built-in Web UI, or a llama.cpp + OpenClaw flow. Direct control
+switches such as -Status, -Stop, and -LlamaHelp
 still work without opening the menu. The script prefers llama.cpp binaries stored under
 the bin subfolder. Script parameters are the wrapper's own options. Additional
 llama-server.exe options can be passed through as trailing arguments.
@@ -237,6 +238,7 @@ $script:ModelRepeatingLayerCountCache = @{}
 $script:LastAutoTuneProfile = $null
 $script:BackgroundStartupProgressLineLength = 0
 $script:BackgroundStartupProgressLastText = $null
+$script:OpenClawAfterStart = $false
 $ServerCleanupTimeoutSec = 20
 $ServerCleanupSettleMs = 2000
 $BackgroundStartupCheckSec = 20
@@ -3055,6 +3057,7 @@ function Show-LaunchModeMenu {
 function Show-MainLauncherMenu {
     $Options = @(
         [pscustomobject]@{ Name = "Quick Start"; Description = "Pick a model, then choose background service or Web UI."; Value = "QuickStart" },
+        [pscustomobject]@{ Name = "Quick Start And OpenClaw"; Description = "Pick a model, start llama.cpp, then sync and start OpenClaw."; Value = "QuickStartOpenClaw" },
         [pscustomobject]@{ Name = "Tune And Launch"; Description = "Pick a model, edit a parameter matrix, then start."; Value = "TuneLaunch" },
         [pscustomobject]@{ Name = "Server Status"; Description = "Show tracked server status, runtime settings, and GPU offload summary."; Value = "Status" },
         [pscustomobject]@{ Name = "Stop Running Server"; Description = "Stop the currently tracked llama.cpp server."; Value = "Stop" },
@@ -3062,7 +3065,7 @@ function Show-MainLauncherMenu {
         [pscustomobject]@{ Name = "Exit"; Description = "Leave the launcher without changing anything."; Value = "Exit" }
     )
 
-    return Show-ListMenu -Title "llama.cpp Launcher" -Subtitle "First choose Quick Start or Tune And Launch. Utility actions stay here too." -Items $Options
+    return Show-ListMenu -Title "llama.cpp Launcher" -Subtitle "First choose Quick Start, Quick Start And OpenClaw, or Tune And Launch. Utility actions stay here too." -Items $Options
 }
 
 function New-LaunchConfig {
@@ -3080,6 +3083,7 @@ function New-LaunchConfig {
         ModelPath       = Resolve-ModelPath -Path $ModelEntry.path
         ModelCapabilities = Format-ModelCapabilities -ModelEntry $ModelEntry
         LaunchMode      = if ($NoBrowser) { "Background Service" } else { "Open Web UI" }
+        OpenClawAfterStart = $false
         Port            = [string]$Port
         GpuLayers       = [string]$GpuLayers
         RepeatingLayers = ""
@@ -3534,6 +3538,7 @@ function Apply-LaunchSelection {
     $script:Background = $true
     $script:NoPause = $true
     $script:NoBrowser = $Config.LaunchMode -eq "Background Service"
+    $script:OpenClawAfterStart = [bool]$Config.OpenClawAfterStart
     if (-not $script:NoBrowser -and ($script:OpenPath -eq "/v1/models" -or [string]::IsNullOrWhiteSpace($script:OpenPath))) {
         $script:OpenPath = "/"
     }
@@ -3601,6 +3606,21 @@ function Invoke-InteractiveLauncher {
                 if ($LaunchMode -eq "Open Web UI") {
                     $Config.OpenPath = "/"
                 }
+
+                Apply-LaunchSelection -Config $Config
+                return $true
+            }
+            "QuickStartOpenClaw" {
+                $ModelEntry = Select-ModelEntry -IndexPath $IndexPath -CurrentModelPath $ModelPath
+                if (-not $ModelEntry) {
+                    continue
+                }
+
+                $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $LlamaArgs
+                $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
+                $Config.LaunchMode = "Background Service"
+                $Config.OpenClawAfterStart = $true
+                $Config.OpenPath = "/v1/models"
 
                 Apply-LaunchSelection -Config $Config
                 return $true
@@ -5009,9 +5029,113 @@ while ((Get-Date) -lt `$Deadline) {
         -WindowStyle Hidden | Out-Null
 }
 
-function Invoke-OpenClawStatusSyncSilently {
+function Test-TcpPort {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetHost,
+        [Parameter(Mandatory = $true)][int]$Port,
+        [int]$TimeoutMs = 1000
+    )
+
+    $Client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $Connect = $Client.BeginConnect($TargetHost, $Port, $null, $null)
+        if (-not $Connect.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            return $false
+        }
+
+        $Client.EndConnect($Connect)
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $Client.Close()
+    }
+}
+
+function Get-OpenClawGatewayHostProcesses {
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bgateway\b') -or
+                ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'gateway\.cmd')
+            }
+    )
+}
+
+function Get-OpenClawNodeHostProcesses {
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bnode\s+run\b') -or
+                ($_.Name -like "powershell*.exe" -and $_.CommandLine -match 'start-openclaw-node\.ps1') -or
+                ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'node\.cmd')
+            }
+    )
+}
+
+function Get-OpenClawRuntimeStatus {
     $OpenClawConfigPath = Join-Path $env:USERPROFILE ".openclaw\openclaw.json"
-    if (-not (Test-Path -LiteralPath $OpenClawConfigPath)) {
+    $GatewayHost = "127.0.0.1"
+    $GatewayPort = 29644
+    $GatewayProcesses = @()
+    $NodeProcesses = @()
+    $GatewayListening = $false
+
+    $Installed = Test-Path -LiteralPath $OpenClawConfigPath
+    if ($Installed) {
+        $GatewayProcesses = @(Get-OpenClawGatewayHostProcesses)
+        $NodeProcesses = @(Get-OpenClawNodeHostProcesses)
+        $GatewayListening = Test-TcpPort -TargetHost $GatewayHost -Port $GatewayPort
+    }
+
+    return [pscustomobject]@{
+        Installed           = $Installed
+        ConfigPath          = $OpenClawConfigPath
+        GatewayHost         = $GatewayHost
+        GatewayPort         = $GatewayPort
+        GatewayUrl          = "http://{0}:{1}/" -f $GatewayHost, $GatewayPort
+        GatewayListening    = $GatewayListening
+        GatewayProcessCount = $GatewayProcesses.Count
+        NodeProcessCount    = $NodeProcesses.Count
+        NeedsRuntimeStart   = $Installed -and ((-not $GatewayListening) -or $NodeProcesses.Count -eq 0)
+    }
+}
+
+function Write-OpenClawStatusLines {
+    param([Parameter(Mandatory = $true)]$RuntimeStatus)
+
+    if (-not $RuntimeStatus.Installed) {
+        Write-Host "Claw   : not installed/configured for this Windows user" -ForegroundColor DarkGray
+        return
+    }
+
+    $GatewayText = if ($RuntimeStatus.GatewayListening) {
+        "gateway listening on $($RuntimeStatus.GatewayHost):$($RuntimeStatus.GatewayPort)"
+    }
+    elseif ($RuntimeStatus.GatewayProcessCount -gt 0) {
+        "gateway process exists, but $($RuntimeStatus.GatewayHost):$($RuntimeStatus.GatewayPort) is not listening yet"
+    }
+    else {
+        "gateway not running"
+    }
+
+    $NodeText = if ($RuntimeStatus.NodeProcessCount -gt 0) {
+        "node running ($($RuntimeStatus.NodeProcessCount) process entry/entries)"
+    }
+    else {
+        "node not running"
+    }
+
+    $StatusColor = if ($RuntimeStatus.GatewayListening -and $RuntimeStatus.NodeProcessCount -gt 0) { "Green" } else { "Yellow" }
+    Write-Host "Claw   : $GatewayText | $NodeText" -ForegroundColor $StatusColor
+    Write-Host "ClawURL: $($RuntimeStatus.GatewayUrl)"
+}
+
+function Invoke-OpenClawStatusSyncSilently {
+    $OpenClawStatus = Get-OpenClawRuntimeStatus
+    if (-not $OpenClawStatus.Installed) {
         return
     }
 
@@ -5030,11 +5154,15 @@ function Invoke-OpenClawStatusSyncSilently {
 
     $SyncStdOutLog = Join-Path $LogRoot "openclaw-sync.stdout.log"
     $SyncStdErrLog = Join-Path $LogRoot "openclaw-sync.stderr.log"
+    $SyncArguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $SyncScriptPath, "-NoPause")
+    if ($OpenClawStatus.NeedsRuntimeStart) {
+        $SyncArguments += "-RestartOpenClaw"
+    }
 
     try {
         $SyncProcess = Start-Process `
             -FilePath $PowerShellExe `
-            -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $SyncScriptPath, "-NoPause") `
+            -ArgumentList $SyncArguments `
             -WorkingDirectory $ScriptRoot `
             -RedirectStandardOutput $SyncStdOutLog `
             -RedirectStandardError $SyncStdErrLog `
@@ -5061,9 +5189,55 @@ function Invoke-OpenClawStatusSyncSilently {
     }
 }
 
+function Invoke-OpenClawLauncherAfterStart {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServerBaseUrl,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec
+    )
+
+    $OpenClawStatus = Get-OpenClawRuntimeStatus
+    if (-not $OpenClawStatus.Installed) {
+        Write-Host "OpenClaw: skipped because no local OpenClaw config was found for this Windows user." -ForegroundColor Yellow
+        return
+    }
+
+    $OpenClawLauncherPath = Join-Path $Ps1Root "Start_OpenClaw.ps1"
+    if (-not (Test-Path -LiteralPath $OpenClawLauncherPath)) {
+        Write-Host "OpenClaw: skipped because the launcher script is missing: $OpenClawLauncherPath" -ForegroundColor Yellow
+        return
+    }
+
+    if (-not (Wait-ForServerReady -ServerBaseUrl $ServerBaseUrl -TimeoutSec $TimeoutSec)) {
+        Write-Host "OpenClaw: llama.cpp was not ready in time, so OpenClaw startup was skipped for now." -ForegroundColor Yellow
+        return
+    }
+
+    $PowerShellExe = (Get-Process -Id $PID).Path
+    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+        $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    }
+    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+        $PowerShellExe = "powershell.exe"
+    }
+
+    Write-Host "OpenClaw: llama.cpp is ready. Starting OpenClaw now." -ForegroundColor Cyan
+
+    try {
+        & $PowerShellExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $OpenClawLauncherPath -NoPause
+        $OpenClawExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+        if ($OpenClawExitCode -ne 0) {
+            Write-Host "OpenClaw: launcher exited with code $OpenClawExitCode. llama.cpp is still running." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "OpenClaw: launcher failed ($($_.Exception.Message)). llama.cpp is still running." -ForegroundColor Yellow
+    }
+}
+
 function Show-ServerStatus {
     $TrackedProcess = Get-TrackedServerProcess
     $Listener = Test-PortInUse
+    $OpenClawStatus = Get-OpenClawRuntimeStatus
 
     if ($TrackedProcess) {
         $TrackedSettings = Get-TrackedServerLaunchSettings -Process $TrackedProcess
@@ -5197,6 +5371,7 @@ function Show-ServerStatus {
                 Write-Host "Build  : $($TrackedRuntimeProperties.build_info) (llama.cpp build)"
             }
         }
+        Write-OpenClawStatusLines -RuntimeStatus $OpenClawStatus
         Write-Host "Logs   : $($TrackedLogPaths.StdOutLog)"
         Write-Host "Error  : $($TrackedLogPaths.StdErrLog)"
         return
@@ -5209,6 +5384,7 @@ function Show-ServerStatus {
     }
 
     Write-Host "Status : stopped" -ForegroundColor Yellow
+    Write-OpenClawStatusLines -RuntimeStatus $OpenClawStatus
 }
 
 $PendingSwitchTimingContext = $null
@@ -5421,10 +5597,6 @@ try {
             $AutoTuneSaveResult = Save-AutoTuneProfile -AutoTuning $AutoLaunchTuning -ObservedUsage $ObservedUsage
         }
 
-        if ($StartupState -eq "Ready") {
-            Invoke-OpenClawStatusSyncSilently
-        }
-
         if ($SwitchTimingContext) {
             if ($StartupState -eq "Ready") {
                 $CompletedLaunchPid = if ($TrackedBackgroundPid) { [int]$TrackedBackgroundPid } else { $BackgroundProcess.Id }
@@ -5455,6 +5627,17 @@ try {
             elseif (-not [string]::IsNullOrWhiteSpace($AutoTuneSaveResult.Message)) {
                 Write-Host "AutoTune: $($AutoTuneSaveResult.Message)" -ForegroundColor Yellow
             }
+        }
+        if ($StartupState -eq "Ready") {
+            if ($OpenClawAfterStart) {
+                Invoke-OpenClawLauncherAfterStart -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max(1, $ReadyTimeoutSec))
+            }
+            else {
+                Invoke-OpenClawStatusSyncSilently
+            }
+        }
+        elseif ($OpenClawAfterStart) {
+            Invoke-OpenClawLauncherAfterStart -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max(1, $ReadyTimeoutSec - $StartupCheckSec))
         }
         if (-not $NoBrowser) {
             if ($StartupState -eq "Ready") {
