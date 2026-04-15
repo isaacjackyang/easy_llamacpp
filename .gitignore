@@ -23,7 +23,11 @@
 
 # Keep launcher entrypoints and repo scripts tracked
 !/Start.cmd
-!/stop.cmd
+!/stop_all.cmd
+!/stop_opencalw.cmd
+!/stop_llamacpp.cmd
+!/start_voice_service.cmd
+!/stop_voice_service.cmd
 !/install.cmd
 !/install_latest.cmd
 !/commit_github.cmd

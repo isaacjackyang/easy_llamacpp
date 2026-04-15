@@ -14,6 +14,11 @@ $openClawRoot = Join-Path $env:USERPROFILE ".openclaw"
 $openClawConfigPath = Join-Path $openClawRoot "openclaw.json"
 $gatewayScriptPath = Join-Path $openClawRoot "gateway.cmd"
 $nodeScriptPath = Join-Path $openClawRoot "node.cmd"
+$managedGatewayScriptName = "run-openclaw-gateway-with-media.ps1"
+$managedTtsHealthPort = 8000
+$managedSttHealthPort = 8001
+$defaultGatewayReadyTimeoutSeconds = 60
+$managedMediaGatewayReadyTimeoutSeconds = 480
 
 function Write-Info {
   param([Parameter(Mandatory = $true)][string]$Message)
@@ -213,6 +218,73 @@ function Wait-TcpPort {
   return $false
 }
 
+function Test-OpenClawGatewayUsesManagedMedia {
+  if (-not (Test-Path -LiteralPath $gatewayScriptPath)) {
+    return $false
+  }
+
+  try {
+    $gatewayText = Get-Content -LiteralPath $gatewayScriptPath -Raw -ErrorAction Stop
+  } catch {
+    return $false
+  }
+
+  return ($gatewayText -match [regex]::Escape($managedGatewayScriptName))
+}
+
+function Get-OpenClawManagedMediaProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        $commandLine = $_.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) {
+          return $false
+        }
+
+        ($commandLine -match 'workspace[\\/]+tts_server\.py') -or
+        ($commandLine -match 'workspace[\\/]+stt_server\.py')
+      }
+  )
+}
+
+function Get-OpenClawManagedMediaStatusText {
+  if (-not (Test-OpenClawGatewayUsesManagedMedia)) {
+    return "not configured"
+  }
+
+  $mediaProcesses = @(Get-OpenClawManagedMediaProcesses)
+  $ttsProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+tts_server\.py' }).Count -gt 0
+  $sttProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+stt_server\.py' }).Count -gt 0
+  $ttsListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedTtsHealthPort
+  $sttListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedSttHealthPort
+
+  $ttsStatus = if ($ttsListening) {
+    "TTS ready on 127.0.0.1:$managedTtsHealthPort"
+  } elseif ($ttsProcessDetected) {
+    "TTS process detected"
+  } else {
+    "TTS not detected"
+  }
+
+  $sttStatus = if ($sttListening) {
+    "STT ready on 127.0.0.1:$managedSttHealthPort"
+  } elseif ($sttProcessDetected) {
+    "STT process detected"
+  } else {
+    "STT not detected"
+  }
+
+  return "$ttsStatus; $sttStatus"
+}
+
+function Get-OpenClawGatewayReadyTimeoutSeconds {
+  if (Test-OpenClawGatewayUsesManagedMedia) {
+    return $managedMediaGatewayReadyTimeoutSeconds
+  }
+
+  return $defaultGatewayReadyTimeoutSeconds
+}
+
 function Invoke-Checked {
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
@@ -246,6 +318,10 @@ function Invoke-OpenClawRestart {
 
   Write-Info "Stopping any existing OpenClaw gateway/node processes"
   Stop-OpenClawRuntime
+
+  if (Test-OpenClawGatewayUsesManagedMedia) {
+    Write-Info "OpenClaw gateway manages TTS/STT sidecars, so they will be restarted together."
+  }
 
   Write-Info "Restarting OpenClaw gateway"
   Start-BackgroundCmd -ScriptPath $gatewayScriptPath
@@ -389,17 +465,29 @@ function Invoke-SyncCurrentModel {
 }
 
 function Ensure-OpenClawRuntime {
-  if (-not (Wait-TcpPort -TargetHost "127.0.0.1" -Port 29644 -TimeoutSeconds 60 -ProbeIntervalSeconds 2)) {
+  $gatewayUsesManagedMedia = Test-OpenClawGatewayUsesManagedMedia
+  $gatewayReadyTimeoutSeconds = Get-OpenClawGatewayReadyTimeoutSeconds
+
+  if ($gatewayUsesManagedMedia) {
+    Write-Info "Detected managed TTS/STT sidecars behind gateway.cmd. Allowing up to $gatewayReadyTimeoutSeconds seconds for gateway warmup."
+  }
+
+  $gatewayReady = Wait-TcpPort -TargetHost "127.0.0.1" -Port 29644 -TimeoutSeconds $gatewayReadyTimeoutSeconds -ProbeIntervalSeconds 2
+  if (-not $gatewayReady) {
     if (@(Get-OpenClawGatewayHostProcesses).Count -eq 0) {
       Write-Warn "Gateway process was not detected after the restart. Launching gateway.cmd directly."
       Start-BackgroundCmd -ScriptPath $gatewayScriptPath
+      $gatewayReady = Wait-TcpPort -TargetHost "127.0.0.1" -Port 29644 -TimeoutSeconds $gatewayReadyTimeoutSeconds -ProbeIntervalSeconds 2
+    } elseif ($gatewayUsesManagedMedia) {
+      Write-Warn "Gateway host is still warming up while the managed TTS/STT sidecars initialize."
     } else {
-      Write-Warn "Gateway process exists but 127.0.0.1:29644 is still warming up. Waiting a bit longer."
+      Write-Warn "Gateway process exists but 127.0.0.1:29644 is still warming up."
     }
+  }
 
-    if (-not (Wait-TcpPort -TargetHost "127.0.0.1" -Port 29644 -TimeoutSeconds 60 -ProbeIntervalSeconds 2)) {
-      throw "OpenClaw gateway did not become ready on 127.0.0.1:29644."
-    }
+  if (-not $gatewayReady) {
+    $managedMediaDetail = if ($gatewayUsesManagedMedia) { " Managed TTS/STT sidecars: $(Get-OpenClawManagedMediaStatusText)." } else { "" }
+    throw "OpenClaw gateway did not become ready on 127.0.0.1:29644.$managedMediaDetail"
   }
 
   Write-Ok "OpenClaw gateway is listening on 127.0.0.1:29644"
@@ -422,6 +510,7 @@ function Show-Summary {
   $activeModelId = Get-RunningLlamaModelId -ModelsUrl $llamaModelsUrl
   $gatewayListening = Test-TcpPort -TargetHost "127.0.0.1" -Port 29644
   $nodeProcesses = @(Get-OpenClawNodeHostProcesses)
+  $managedMediaStatus = if (Test-OpenClawGatewayUsesManagedMedia) { Get-OpenClawManagedMediaStatusText } else { $null }
 
   Write-Host ""
   Write-Host "OpenClaw Start Summary" -ForegroundColor Green
@@ -431,6 +520,9 @@ function Show-Summary {
   }
   Write-Host ("Gateway   : {0}" -f $(if ($gatewayListening) { "listening on 127.0.0.1:29644" } else { "not listening" }))
   Write-Host ("Node      : {0}" -f $(if ($nodeProcesses.Count -gt 0) { "running ($($nodeProcesses.Count) process entry/entries)" } else { "not detected" }))
+  if ($null -ne $managedMediaStatus) {
+    Write-Host "Media     : $managedMediaStatus"
+  }
   Write-Host "Config    : $openClawRoot"
 }
 

@@ -1,7 +1,7 @@
 ﻿# llama.cpp Launcher / llama.cpp 啟動器
 
-這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、停止、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換與背景執行。  
-This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, and background execution.
+這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop_all.cmd`、`stop_opencalw.cmd`、`stop_llamacpp.cmd`、`start_voice_service.cmd`、`stop_voice_service.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、全部停止、只停止 OpenClaw、只停止 `llama.cpp`、只啟動 TTS/STT、只停止 TTS/STT、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換、背景執行與 OpenClaw runtime。  
+This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop_all.cmd`, `stop_opencalw.cmd`, `stop_llamacpp.cmd`, `start_voice_service.cmd`, `stop_voice_service.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop everything, stop OpenClaw only, stop `llama.cpp` only, start TTS/STT only, stop TTS/STT only, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, background execution, and the OpenClaw runtime.
 
 ## 目錄結構 / Folder Layout
 
@@ -12,12 +12,17 @@ Use the following layout so your own scripts stay separate from the `llama.cpp` 
 Start.cmd
 install.cmd
 install_latest.cmd
-stop.cmd
+stop_all.cmd
+stop_opencalw.cmd
+stop_llamacpp.cmd
+start_voice_service.cmd
+stop_voice_service.cmd
 README.md
 PS1\
   Install_LCPP_Prebuilt.ps1
   Install_LCPP.ps1
   Start_LCPP.ps1
+  Start_Voice_Service.ps1
   stop.ps1
   scan_model.ps1
   Install_LCPP_Autostart.ps1
@@ -146,7 +151,35 @@ You can also use `Start.cmd` for the same launcher flow, which is more convenien
 If you only want to quickly clear old processes, you can also use:
 
 ```bat
-.\stop.cmd
+.\stop_all.cmd
+```
+
+若只想關閉 OpenClaw，可用：  
+If you only want to stop OpenClaw, use:
+
+```bat
+.\stop_opencalw.cmd
+```
+
+若只想關閉 `llama.cpp`，可用：  
+If you only want to stop `llama.cpp`, use:
+
+```bat
+.\stop_llamacpp.cmd
+```
+
+若只想啟動語音服務 TTS/STT，可用：  
+If you only want to start the TTS/STT voice services, use:
+
+```bat
+.\start_voice_service.cmd
+```
+
+若只想停止語音服務 TTS/STT，可用：  
+If you only want to stop the TTS/STT voice services, use:
+
+```bat
+.\stop_voice_service.cmd
 ```
 
 如果你想直接編譯並安裝最新版官方 `llama.cpp`，也可以用：
@@ -471,8 +504,8 @@ Restart the background server with Extreme Mode:
 .\PS1\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause -ExtremeMode
 ```
 
-強制清理這個工作資料夾下舊的 `llama-server.exe` 進程：  
-Force-clean older `llama-server.exe` processes that belong to this workspace:
+強制清理這個工作資料夾下舊的 `llama-server.exe`、OpenClaw、TTS、STT 進程：  
+Force-clean older `llama-server.exe`, OpenClaw, TTS, and STT processes that belong to this workspace:
 
 ```powershell
 .\PS1\stop.ps1
@@ -485,8 +518,8 @@ Stop the currently tracked server:
 .\PS1\Start_LCPP.ps1 -Stop
 ```
 
-`stop.ps1` 會比 `-Stop` 更激進一些。它不只會處理目前追蹤中的 PID，也會掃描這個工作資料夾對應的 `llama-server.exe` 路徑，把殘留舊進程一起清掉，適合用在 VRAM / RAM 沒有正常釋放時。  
-`stop.ps1` is more aggressive than `-Stop`. It does not only stop the tracked PID, but also scans for `llama-server.exe` processes that belong to this workspace and clears lingering old processes too. It is useful when VRAM / RAM has not been released cleanly.
+`stop.ps1` 會比 `-Stop` 更激進一些。它不只會處理目前追蹤中的 PID，也會掃描這個工作資料夾對應的 `llama-server.exe` 路徑，並一起停止 OpenClaw、TTS、STT 的殘留進程，適合用在 VRAM / RAM 沒有正常釋放時。  
+`stop.ps1` is more aggressive than `-Stop`. It does not only stop the tracked PID, but also scans for `llama-server.exe` processes that belong to this workspace and clears lingering OpenClaw, TTS, and STT processes too. It is useful when VRAM / RAM has not been released cleanly.
 
 查看底層 `llama-server.exe` 全部參數：  
 Show all underlying `llama-server.exe` parameters:

@@ -2950,6 +2950,420 @@ function Show-ListMenu {
     }
 }
 
+function Get-ModelSeriesLabelFromText {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    $CandidateText = $Text -replace '(?i)\.gguf$', ''
+    $NormalizedText = [regex]::Replace($CandidateText, '[^A-Za-z0-9\.]+', ' ')
+    $NormalizedText = [regex]::Replace($NormalizedText, '\s+', ' ').Trim()
+    if ([string]::IsNullOrWhiteSpace($NormalizedText)) {
+        return $null
+    }
+
+    if ($NormalizedText -match '\bDeepSeek\s+(?<series>R1|V3)(?:\s+(?<tag>\d{4}))?(?:\s+Qwen(?<version>\d+(?:\.\d+)?)\s+(?<size>\d+(?:\.\d+)?B))?') {
+        $Parts = @("DeepSeek", $Matches.series.ToUpperInvariant())
+        if ($Matches.tag) {
+            $Parts += $Matches.tag
+        }
+        if ($Matches.version -and $Matches.size) {
+            $Parts += ("Qwen{0}-{1}" -f $Matches.version, $Matches.size.ToUpperInvariant())
+        }
+
+        return $Parts -join "-"
+    }
+
+    if ($NormalizedText -match '\bgpt\s*oss\s+(?<size>\d+(?:\.\d+)?B)\b') {
+        return "GPT-OSS-{0}" -f $Matches.size.ToUpperInvariant()
+    }
+
+    if ($NormalizedText -match '\bNemotron\s*(?<version>\d+(?:\.\d+)?)?(?:\s+(?<tier>Super|Mini|Nano|Ultra))?(?:\s+(?<size>\d+(?:\.\d+)?B))?(?:\s+(?<active>A\d+B))?') {
+        $Parts = @()
+        if ($Matches.version) {
+            $Parts += "Nemotron{0}" -f $Matches.version
+        }
+        else {
+            $Parts += "Nemotron"
+        }
+
+        if ($Matches.tier) {
+            $Parts += ($Matches.tier.Substring(0, 1).ToUpperInvariant() + $Matches.tier.Substring(1).ToLowerInvariant())
+        }
+        if ($Matches.size) {
+            $Parts += $Matches.size.ToUpperInvariant()
+        }
+        if ($Matches.active) {
+            $Parts += $Matches.active.ToUpperInvariant()
+        }
+
+        return $Parts -join "-"
+    }
+
+    if ($NormalizedText -match '\bGemma\s*(?<version>\d+(?:\.\d+)?)\s+(?<size>E?\d+(?:\.\d+)?B)\b') {
+        return "Gemma{0}-{1}" -f $Matches.version, $Matches.size.ToUpperInvariant()
+    }
+
+    if ($NormalizedText -match '\bGLM\s*(?<version>\d+(?:\.\d+)?)\s+(?<variant>Flash|Air|Chat|Coder|V)(?:\s+(?<size>\d+(?:\.\d+)?B))?\b') {
+        $Parts = @("GLM{0}" -f $Matches.version)
+        $Parts += ($Matches.variant.Substring(0, 1).ToUpperInvariant() + $Matches.variant.Substring(1).ToLowerInvariant())
+        if ($Matches.size) {
+            $Parts += $Matches.size.ToUpperInvariant()
+        }
+
+        return $Parts -join "-"
+    }
+
+    if ($NormalizedText -match '\bGLM\s*(?<version>\d+(?:\.\d+)?)\s+(?<size>\d+(?:\.\d+)?B)\b') {
+        return "GLM{0}-{1}" -f $Matches.version, $Matches.size.ToUpperInvariant()
+    }
+
+    if ($NormalizedText -match '\bQwen(?<version>\d+(?:\.\d+)?)\s+Coder(?:\s+(?<next>Next))?(?:\s+(?<size>\d+(?:\.\d+)?B))?\b') {
+        $Parts = @(
+            ("Qwen{0}" -f $Matches.version),
+            "Coder"
+        )
+        if ($Matches.next) {
+            $Parts += "Next"
+        }
+        if ($Matches.size) {
+            $Parts += $Matches.size.ToUpperInvariant()
+        }
+
+        return $Parts -join "-"
+    }
+
+    if ($NormalizedText -match '\bQwen(?<version>\d+(?:\.\d+)?)\s+(?<size>\d+(?:\.\d+)?B)(?:\s+(?<active>A\d+B))?\b') {
+        $Parts = @(
+            ("Qwen{0}" -f $Matches.version),
+            $Matches.size.ToUpperInvariant()
+        )
+        if ($Matches.active) {
+            $Parts += $Matches.active.ToUpperInvariant()
+        }
+
+        return $Parts -join "-"
+    }
+
+    if ($NormalizedText -match '\bLlama\s*(?<version>\d+(?:\.\d+)?)\s+(?<size>\d+(?:\.\d+)?B)\b') {
+        return "Llama{0}-{1}" -f $Matches.version, $Matches.size.ToUpperInvariant()
+    }
+
+    if ($NormalizedText -match '\bPhi\s*(?<version>\d+(?:\.\d+)?)\s+(?<size>\d+(?:\.\d+)?B)\b') {
+        return "Phi{0}-{1}" -f $Matches.version, $Matches.size.ToUpperInvariant()
+    }
+
+    if ($NormalizedText -match '\bMistral\s*(?<version>\d+(?:\.\d+)?)?\s+(?<size>\d+(?:\.\d+)?B)\b') {
+        if ($Matches.version) {
+            return "Mistral{0}-{1}" -f $Matches.version, $Matches.size.ToUpperInvariant()
+        }
+
+        return "Mistral-{0}" -f $Matches.size.ToUpperInvariant()
+    }
+
+    return $null
+}
+
+function Get-FallbackModelSeriesLabel {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return "Other Models"
+    }
+
+    $CandidateText = $Text -replace '(?i)\.gguf$', ''
+    $Tokens = @([regex]::Matches($CandidateText, '[A-Za-z0-9]+') | ForEach-Object { $_.Value })
+    if ($Tokens.Count -eq 0) {
+        return $CandidateText.Trim()
+    }
+
+    $StopTokens = @(
+        "BF16",
+        "F16",
+        "FP16",
+        "FP32",
+        "MXFP4",
+        "GGUF",
+        "UD",
+        "IT",
+        "INSTRUCT",
+        "CHAT",
+        "VISION",
+        "TOOLS",
+        "REASONING",
+        "DISTILLED",
+        "DISTILL",
+        "HERETIC",
+        "ABLITERATED",
+        "UNCENSORED",
+        "ROTORQUANT",
+        "COPY"
+    )
+
+    $SelectedTokens = New-Object System.Collections.Generic.List[string]
+    foreach ($Token in $Tokens) {
+        $UpperToken = $Token.ToUpperInvariant()
+        if ($SelectedTokens.Count -ge 1 -and ($UpperToken -match '^Q\d(?:_\d+)?$' -or $StopTokens -contains $UpperToken)) {
+            break
+        }
+
+        if ($SelectedTokens.Count -ge 3) {
+            break
+        }
+
+        $SelectedTokens.Add($Token) | Out-Null
+    }
+
+    if ($SelectedTokens.Count -eq 0) {
+        return $CandidateText.Trim()
+    }
+
+    return $SelectedTokens -join "-"
+}
+
+function Get-ModelSeriesLabel {
+    param(
+        $ModelEntry
+    )
+
+    if (-not $ModelEntry) {
+        return "Other Models"
+    }
+
+    $Candidates = @()
+    if ($ModelEntry.PSObject.Properties["name"] -and -not [string]::IsNullOrWhiteSpace([string]$ModelEntry.name)) {
+        $Candidates += [string]$ModelEntry.name
+    }
+
+    if ($ModelEntry.PSObject.Properties["path"] -and -not [string]::IsNullOrWhiteSpace([string]$ModelEntry.path)) {
+        try {
+            $Candidates += [System.IO.Path]::GetFileNameWithoutExtension([string]$ModelEntry.path)
+        }
+        catch {
+            $Candidates += [string]$ModelEntry.path
+        }
+    }
+
+    foreach ($Candidate in $Candidates) {
+        $Label = Get-ModelSeriesLabelFromText -Text $Candidate
+        if (-not [string]::IsNullOrWhiteSpace($Label)) {
+            return $Label
+        }
+    }
+
+    foreach ($Candidate in $Candidates) {
+        $FallbackLabel = Get-FallbackModelSeriesLabel -Text $Candidate
+        if (-not [string]::IsNullOrWhiteSpace($FallbackLabel)) {
+            return $FallbackLabel
+        }
+    }
+
+    return "Other Models"
+}
+
+function Get-ModelSelectionSeries {
+    param(
+        [object[]]$Models
+    )
+
+    $SeriesMap = @{}
+    $SeriesLabels = @{}
+
+    foreach ($Model in @($Models)) {
+        $SeriesLabel = Get-ModelSeriesLabel -ModelEntry $Model
+        $SeriesKey = $SeriesLabel.ToLowerInvariant()
+        if (-not $SeriesMap.ContainsKey($SeriesKey)) {
+            $SeriesMap[$SeriesKey] = New-Object System.Collections.ArrayList
+            $SeriesLabels[$SeriesKey] = $SeriesLabel
+        }
+
+        [void]$SeriesMap[$SeriesKey].Add($Model)
+    }
+
+    $SeriesList = foreach ($SeriesKey in $SeriesMap.Keys) {
+        $SeriesModels = @(
+            $SeriesMap[$SeriesKey] |
+                Sort-Object `
+                    @{ Expression = { Get-ModelFileSizeBytes -Path $_.path }; Descending = $true }, `
+                    @{ Expression = { [string]$_.name }; Descending = $false }
+        )
+
+        $AvailableCount = 0
+        foreach ($SeriesModel in $SeriesModels) {
+            $ResolvedSeriesModelPath = Resolve-ModelPath -Path $SeriesModel.path
+            if (-not [string]::IsNullOrWhiteSpace($ResolvedSeriesModelPath) -and (Test-Path -LiteralPath $ResolvedSeriesModelPath)) {
+                $AvailableCount++
+            }
+        }
+
+        [pscustomobject]@{
+            Key            = $SeriesKey
+            Name           = $SeriesLabels[$SeriesKey]
+            Models         = $SeriesModels
+            Count          = $SeriesModels.Count
+            AvailableCount = $AvailableCount
+        }
+    }
+
+    return @($SeriesList | Sort-Object @{ Expression = { [string]$_.Name }; Descending = $false })
+}
+
+function Show-ModelSeriesMenu {
+    param(
+        [object[]]$Series,
+        [string]$CurrentSeriesKey
+    )
+
+    if (-not $Series -or $Series.Count -eq 0) {
+        return [pscustomobject]@{ Action = "Back"; Group = $null }
+    }
+
+    $SelectedIndex = 0
+    if (-not [string]::IsNullOrWhiteSpace($CurrentSeriesKey)) {
+        for ($Index = 0; $Index -lt $Series.Count; $Index++) {
+            if ([string]::Equals([string]$Series[$Index].Key, $CurrentSeriesKey, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $SelectedIndex = $Index
+                break
+            }
+        }
+    }
+
+    while ($true) {
+        Show-MenuHeader -Title "Select Model Series" -Subtitle "Choose a base model family first. Press E to edit the index file."
+
+        for ($Index = 0; $Index -lt $Series.Count; $Index++) {
+            $SeriesEntry = $Series[$Index]
+            $IsSelected = $Index -eq $SelectedIndex
+            $Prefix = if ($IsSelected) { ">" } else { " " }
+            $Foreground = if ($IsSelected) { "Black" } else { "Gray" }
+            $Background = if ($IsSelected) { "DarkCyan" } else { "Black" }
+            $Summary = if ($SeriesEntry.Count -eq 1) { "1 variant" } else { "{0} variants" -f $SeriesEntry.Count }
+            if ($SeriesEntry.AvailableCount -lt $SeriesEntry.Count) {
+                $Summary = "{0} | {1} available" -f $Summary, $SeriesEntry.AvailableCount
+            }
+
+            $DisplayText = "{0} [{1}]" -f $SeriesEntry.Name, $Summary
+            Write-Host ("{0} {1}" -f $Prefix, (Get-FitText -Text $DisplayText -Width ([Math]::Max(30, (Get-ConsoleWidth) - 6)))) -ForegroundColor $Foreground -BackgroundColor $Background
+        }
+
+        Write-Host ""
+        Write-Host "Use Up/Down to move. Enter or Space opens the series. E edits model-index.json. Esc returns." -ForegroundColor Yellow
+        $Key = Read-ConsoleKey
+
+        switch ($Key.VirtualKeyCode) {
+            38 { $SelectedIndex = if ($SelectedIndex -le 0) { $Series.Count - 1 } else { $SelectedIndex - 1 } }
+            40 { $SelectedIndex = if ($SelectedIndex -ge ($Series.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
+            13 { return [pscustomobject]@{ Action = "Open"; Group = $Series[$SelectedIndex] } }
+            32 { return [pscustomobject]@{ Action = "Open"; Group = $Series[$SelectedIndex] } }
+            27 { return [pscustomobject]@{ Action = "Back"; Group = $null } }
+            default {
+                if ($Key.Character -match '^[Ee]$') {
+                    return [pscustomobject]@{ Action = "Edit"; Group = $null }
+                }
+
+                if ($Key.Character -match '^\d$') {
+                    $HotIndex = [int]$Key.Character.ToString() - 1
+                    if ($HotIndex -ge 0 -and $HotIndex -lt $Series.Count) {
+                        return [pscustomobject]@{ Action = "Open"; Group = $Series[$HotIndex] }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Show-ModelVariantMenu {
+    param(
+        $SeriesEntry,
+        [string]$CurrentModelPath
+    )
+
+    if (-not $SeriesEntry -or -not $SeriesEntry.Models -or $SeriesEntry.Models.Count -eq 0) {
+        return [pscustomobject]@{ Action = "Back"; Model = $null }
+    }
+
+    $ResolvedCurrentPath = Resolve-ModelPath -Path $CurrentModelPath
+    $SelectedIndex = 0
+    if ($ResolvedCurrentPath) {
+        for ($Index = 0; $Index -lt $SeriesEntry.Models.Count; $Index++) {
+            $CandidatePath = Resolve-ModelPath -Path $SeriesEntry.Models[$Index].path
+            if ([string]::Equals($CandidatePath, $ResolvedCurrentPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $SelectedIndex = $Index
+                break
+            }
+        }
+    }
+
+    while ($true) {
+        Show-MenuHeader -Title "Select Model Variant" -Subtitle ("Choose a variant for {0}. Press E to edit the index file." -f $SeriesEntry.Name)
+
+        for ($Index = 0; $Index -lt $SeriesEntry.Models.Count; $Index++) {
+            $Model = $SeriesEntry.Models[$Index]
+            $IsSelected = $Index -eq $SelectedIndex
+            $ModelPathResolved = Resolve-ModelPath -Path $Model.path
+            $Exists = Test-Path -LiteralPath $ModelPathResolved
+            $SizeLabel = Get-ModelFileSizeLabel -Path $Model.path
+            $Prefix = if ($IsSelected) { ">" } else { " " }
+            $Foreground = if ($IsSelected) { "Black" } else { "Gray" }
+            $Background = if ($IsSelected) { "DarkCyan" } else { "Black" }
+            $StateText = if ($Exists) { "OK" } else { "Missing" }
+            $Summary = "{0} {1} [{2}] {3}" -f $SizeLabel, $Model.name, $StateText, (Format-ModelCapabilities -ModelEntry $Model)
+            Write-Host ("{0} {1}" -f $Prefix, (Get-FitText -Text $Summary -Width ([Math]::Max(30, (Get-ConsoleWidth) - 6)))) -ForegroundColor $Foreground -BackgroundColor $Background
+            if ($Model.notes) {
+                Write-Host ("    {0}" -f $Model.notes) -ForegroundColor DarkGray
+            }
+            $SwitchSummary = Get-ModelSwitchTimingSummary -ModelEntry $Model
+            if ($SwitchSummary) {
+                Write-Host ("    {0}" -f $SwitchSummary) -ForegroundColor DarkGray
+            }
+        }
+
+        $SelectedModel = $SeriesEntry.Models[$SelectedIndex]
+        $SelectedModelPath = Resolve-ModelPath -Path $SelectedModel.path
+        Write-Host ""
+        Write-Host ("Series       : {0}" -f $SeriesEntry.Name) -ForegroundColor Cyan
+        Write-Host ("Name         : {0}" -f $SelectedModel.name) -ForegroundColor Cyan
+        Write-Host ("Path         : {0}" -f $SelectedModelPath)
+        Write-Host ("Size         : {0}" -f ((Get-ModelFileSizeLabel -Path $SelectedModel.path).TrimStart("[").TrimEnd("]")))
+        Write-Host ("Capabilities : {0}" -f (Format-ModelCapabilities -ModelEntry $SelectedModel))
+        foreach ($DetailLine in @(Get-ModelSwitchTimingDetailLines -ModelEntry $SelectedModel)) {
+            Write-Host $DetailLine
+        }
+        if ($SelectedModel.notes) {
+            Write-Host ("Notes        : {0}" -f $SelectedModel.notes) -ForegroundColor DarkGray
+        }
+        Write-Host ""
+        Write-Host "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns to series." -ForegroundColor Yellow
+
+        $Key = Read-ConsoleKey
+        switch ($Key.VirtualKeyCode) {
+            38 { $SelectedIndex = if ($SelectedIndex -le 0) { $SeriesEntry.Models.Count - 1 } else { $SelectedIndex - 1 } }
+            40 { $SelectedIndex = if ($SelectedIndex -ge ($SeriesEntry.Models.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
+            13 { return [pscustomobject]@{ Action = "Select"; Model = $SelectedModel } }
+            32 { return [pscustomobject]@{ Action = "Select"; Model = $SelectedModel } }
+            27 { return [pscustomobject]@{ Action = "Back"; Model = $null } }
+            default {
+                if ($Key.Character -match '^[Ee]$') {
+                    return [pscustomobject]@{ Action = "Edit"; Model = $null }
+                }
+
+                if ($Key.Character -match '^\d$') {
+                    $HotIndex = [int]$Key.Character.ToString() - 1
+                    if ($HotIndex -ge 0 -and $HotIndex -lt $SeriesEntry.Models.Count) {
+                        return [pscustomobject]@{ Action = "Select"; Model = $SeriesEntry.Models[$HotIndex] }
+                    }
+                }
+            }
+        }
+    }
+}
+
 function Select-ModelEntry {
     param(
         [string]$IndexPath,
@@ -2966,79 +3380,68 @@ function Select-ModelEntry {
                     @{ Expression = { Get-ModelFileSizeBytes -Path $_.path }; Descending = $true }, `
                     @{ Expression = { [string]$_.name }; Descending = $false }
         )
-        $SelectedIndex = 0
+        $SelectedSeriesKey = $null
 
         if ($ResolvedCurrentPath) {
-            for ($Index = 0; $Index -lt $Models.Count; $Index++) {
-                $CandidatePath = Resolve-ModelPath -Path $Models[$Index].path
+            foreach ($Model in $Models) {
+                $CandidatePath = Resolve-ModelPath -Path $Model.path
                 if ([string]::Equals($CandidatePath, $ResolvedCurrentPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $SelectedIndex = $Index
+                    $SelectedSeriesKey = (Get-ModelSeriesLabel -ModelEntry $Model).ToLowerInvariant()
                     break
                 }
             }
         }
         elseif ($IndexData.default_model_id) {
-            for ($Index = 0; $Index -lt $Models.Count; $Index++) {
-                if ($Models[$Index].id -eq $IndexData.default_model_id) {
-                    $SelectedIndex = $Index
+            foreach ($Model in $Models) {
+                if ($Model.id -eq $IndexData.default_model_id) {
+                    $SelectedSeriesKey = (Get-ModelSeriesLabel -ModelEntry $Model).ToLowerInvariant()
                     break
                 }
             }
         }
 
+        $Series = @(Get-ModelSelectionSeries -Models $Models)
+        if ($Series.Count -eq 0) {
+            return $null
+        }
+
         while ($true) {
-            Show-MenuHeader -Title "Select Model" -Subtitle "Choose a model from the index. Press E to edit the index file."
+            $SeriesSelection = Show-ModelSeriesMenu -Series $Series -CurrentSeriesKey $SelectedSeriesKey
+            if ($SeriesSelection.Action -eq "Back") {
+                return $null
+            }
 
-            for ($Index = 0; $Index -lt $Models.Count; $Index++) {
-                $Model = $Models[$Index]
-                $IsSelected = $Index -eq $SelectedIndex
-                $ModelPathResolved = Resolve-ModelPath -Path $Model.path
-                $Exists = Test-Path -LiteralPath $ModelPathResolved
-                $SizeLabel = Get-ModelFileSizeLabel -Path $Model.path
-                $Prefix = if ($IsSelected) { ">" } else { " " }
-                $Foreground = if ($IsSelected) { "Black" } else { "Gray" }
-                $Background = if ($IsSelected) { "DarkCyan" } else { "Black" }
-                $StateText = if ($Exists) { "OK" } else { "Missing" }
-                $Summary = "{0} {1} [{2}] {3}" -f $SizeLabel, $Model.name, $StateText, (Format-ModelCapabilities -ModelEntry $Model)
-                Write-Host ("{0} {1}" -f $Prefix, (Get-FitText -Text $Summary -Width ([Math]::Max(30, (Get-ConsoleWidth) - 6)))) -ForegroundColor $Foreground -BackgroundColor $Background
-                if ($Model.notes) {
-                    Write-Host ("    {0}" -f $Model.notes) -ForegroundColor DarkGray
+            if ($SeriesSelection.Action -eq "Edit") {
+                Start-Process -FilePath "notepad.exe" -ArgumentList ('"{0}"' -f $IndexPath) -Wait
+                break
+            }
+
+            if ($SeriesSelection.Action -ne "Open" -or -not $SeriesSelection.Group) {
+                continue
+            }
+
+            $SelectedSeriesKey = [string]$SeriesSelection.Group.Key
+
+            $RefreshSeries = $false
+            while ($true) {
+                $VariantSelection = Show-ModelVariantMenu -SeriesEntry $SeriesSelection.Group -CurrentModelPath $CurrentModelPath
+                if ($VariantSelection.Action -eq "Select") {
+                    return $VariantSelection.Model
                 }
-                $SwitchSummary = Get-ModelSwitchTimingSummary -ModelEntry $Model
-                if ($SwitchSummary) {
-                    Write-Host ("    {0}" -f $SwitchSummary) -ForegroundColor DarkGray
+
+                if ($VariantSelection.Action -eq "Edit") {
+                    Start-Process -FilePath "notepad.exe" -ArgumentList ('"{0}"' -f $IndexPath) -Wait
+                    $RefreshSeries = $true
+                    break
+                }
+
+                if ($VariantSelection.Action -eq "Back") {
+                    break
                 }
             }
 
-            $SelectedModel = $Models[$SelectedIndex]
-            $SelectedModelPath = Resolve-ModelPath -Path $SelectedModel.path
-            Write-Host ""
-            Write-Host ("Name         : {0}" -f $SelectedModel.name) -ForegroundColor Cyan
-            Write-Host ("Path         : {0}" -f $SelectedModelPath)
-            Write-Host ("Size         : {0}" -f ((Get-ModelFileSizeLabel -Path $SelectedModel.path).TrimStart("[").TrimEnd("]")))
-            Write-Host ("Capabilities : {0}" -f (Format-ModelCapabilities -ModelEntry $SelectedModel))
-            foreach ($DetailLine in @(Get-ModelSwitchTimingDetailLines -ModelEntry $SelectedModel)) {
-                Write-Host $DetailLine
-            }
-            if ($SelectedModel.notes) {
-                Write-Host ("Notes        : {0}" -f $SelectedModel.notes) -ForegroundColor DarkGray
-            }
-            Write-Host ""
-            Write-Host "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns." -ForegroundColor Yellow
-
-            $Key = Read-ConsoleKey
-            switch ($Key.VirtualKeyCode) {
-                38 { $SelectedIndex = if ($SelectedIndex -le 0) { $Models.Count - 1 } else { $SelectedIndex - 1 } }
-                40 { $SelectedIndex = if ($SelectedIndex -ge ($Models.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
-                13 { return $SelectedModel }
-                32 { return $SelectedModel }
-                27 { return $null }
-                default {
-                    if ($Key.Character -match '^[Ee]$') {
-                        Start-Process -FilePath "notepad.exe" -ArgumentList ('"{0}"' -f $IndexPath) -Wait
-                        return Select-ModelEntry -IndexPath $IndexPath -CurrentModelPath $CurrentModelPath
-                    }
-                }
+            if ($RefreshSeries) {
+                break
             }
         }
     }
@@ -5054,6 +5457,113 @@ function Test-TcpPort {
     }
 }
 
+function Get-OpenClawManagedMediaProcesses {
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.CommandLine -and (
+                    $_.CommandLine -match 'workspace[\\/]+tts_server\.py' -or
+                    $_.CommandLine -match 'workspace[\\/]+stt_server\.py'
+                )
+            }
+    )
+}
+
+function Get-OpenClawManagedMediaHealth {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceHost,
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+
+    try {
+        return Invoke-RestMethod -Uri ("http://{0}:{1}/health" -f $ServiceHost, $Port) -TimeoutSec 2
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-OpenClawManagedMediaServiceStatus {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$ProcessPattern,
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+
+    $ServiceHost = "127.0.0.1"
+    $Processes = @(
+        Get-OpenClawManagedMediaProcesses |
+            Where-Object { $_.CommandLine -match $ProcessPattern }
+    )
+    $Listening = Test-TcpPort -TargetHost $ServiceHost -Port $Port
+    $Health = if ($Listening) { Get-OpenClawManagedMediaHealth -ServiceHost $ServiceHost -Port $Port } else { $null }
+
+    return [pscustomobject]@{
+        Name            = $Name
+        Host            = $ServiceHost
+        Port            = $Port
+        Url             = "http://{0}:{1}/" -f $ServiceHost, $Port
+        ProcessCount    = $Processes.Count
+        Listening       = $Listening
+        Model           = if ($Health -and $Health.PSObject.Properties["model"]) { [string]$Health.model } else { $null }
+        DefaultSpeaker  = if ($Health -and $Health.PSObject.Properties["defaultSpeaker"]) { [string]$Health.defaultSpeaker } else { $null }
+        DefaultLanguage = if ($Health -and $Health.PSObject.Properties["defaultLanguage"]) { [string]$Health.defaultLanguage } else { $null }
+        Device          = if ($Health -and $Health.PSObject.Properties["device"]) { [string]$Health.device } else { $null }
+    }
+}
+
+function Get-OpenClawManagedMediaRuntimeStatus {
+    return [pscustomobject]@{
+        Tts = Get-OpenClawManagedMediaServiceStatus -Name "TTS" -ProcessPattern 'workspace[\\/]+tts_server\.py' -Port 8000
+        Stt = Get-OpenClawManagedMediaServiceStatus -Name "STT" -ProcessPattern 'workspace[\\/]+stt_server\.py' -Port 8001
+    }
+}
+
+function Write-OpenClawManagedMediaStatusLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)]$ServiceStatus
+    )
+
+    $HostPortText = "{0}:{1}" -f $ServiceStatus.Host, $ServiceStatus.Port
+    $Parts = New-Object System.Collections.Generic.List[string]
+
+    if ($ServiceStatus.Listening) {
+        $Parts.Add("ready on $HostPortText")
+    }
+    elseif ($ServiceStatus.ProcessCount -gt 0) {
+        $Parts.Add("process detected, but $HostPortText is not listening yet")
+    }
+    else {
+        $Parts.Add("not running (expected $HostPortText)")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.Model)) {
+        $Parts.Add("model $($ServiceStatus.Model)")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.DefaultSpeaker)) {
+        $Parts.Add("speaker $($ServiceStatus.DefaultSpeaker)")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.DefaultLanguage)) {
+        $Parts.Add("default lang $($ServiceStatus.DefaultLanguage)")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.Device)) {
+        $Parts.Add("device $($ServiceStatus.Device)")
+    }
+
+    $ForegroundColor = if ($ServiceStatus.Listening) {
+        "Green"
+    }
+    elseif ($ServiceStatus.ProcessCount -gt 0) {
+        "Yellow"
+    }
+    else {
+        "DarkGray"
+    }
+
+    Write-Host ("{0,-7}: {1}" -f $Label, ($Parts -join " | ")) -ForegroundColor $ForegroundColor
+}
+
 function Get-OpenClawGatewayHostProcesses {
     return @(
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -5081,6 +5591,7 @@ function Get-OpenClawRuntimeStatus {
     $GatewayPort = 29644
     $GatewayProcesses = @()
     $NodeProcesses = @()
+    $ManagedMediaStatus = $null
     $GatewayListening = $false
 
     $Installed = Test-Path -LiteralPath $OpenClawConfigPath
@@ -5088,6 +5599,7 @@ function Get-OpenClawRuntimeStatus {
         $GatewayProcesses = @(Get-OpenClawGatewayHostProcesses)
         $NodeProcesses = @(Get-OpenClawNodeHostProcesses)
         $GatewayListening = Test-TcpPort -TargetHost $GatewayHost -Port $GatewayPort
+        $ManagedMediaStatus = Get-OpenClawManagedMediaRuntimeStatus
     }
 
     return [pscustomobject]@{
@@ -5099,6 +5611,7 @@ function Get-OpenClawRuntimeStatus {
         GatewayListening    = $GatewayListening
         GatewayProcessCount = $GatewayProcesses.Count
         NodeProcessCount    = $NodeProcesses.Count
+        ManagedMediaStatus  = $ManagedMediaStatus
         NeedsRuntimeStart   = $Installed -and ((-not $GatewayListening) -or $NodeProcesses.Count -eq 0)
     }
 }
@@ -5131,6 +5644,10 @@ function Write-OpenClawStatusLines {
     $StatusColor = if ($RuntimeStatus.GatewayListening -and $RuntimeStatus.NodeProcessCount -gt 0) { "Green" } else { "Yellow" }
     Write-Host "Claw   : $GatewayText | $NodeText" -ForegroundColor $StatusColor
     Write-Host "ClawURL: $($RuntimeStatus.GatewayUrl)"
+    if ($RuntimeStatus.ManagedMediaStatus) {
+        Write-OpenClawManagedMediaStatusLine -Label "TTS" -ServiceStatus $RuntimeStatus.ManagedMediaStatus.Tts
+        Write-OpenClawManagedMediaStatusLine -Label "STT" -ServiceStatus $RuntimeStatus.ManagedMediaStatus.Stt
+    }
 }
 
 function Invoke-OpenClawStatusSyncSilently {

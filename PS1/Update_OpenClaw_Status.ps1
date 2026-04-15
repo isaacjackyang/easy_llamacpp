@@ -16,6 +16,9 @@ $openClawRoot = Join-Path $env:USERPROFILE ".openclaw"
 $openClawConfigPath = Join-Path $openClawRoot "openclaw.json"
 $gatewayScriptPath = Join-Path $openClawRoot "gateway.cmd"
 $nodeScriptPath = Join-Path $openClawRoot "node.cmd"
+$managedGatewayScriptName = "run-openclaw-gateway-with-media.ps1"
+$managedTtsHealthPort = 8000
+$managedSttHealthPort = 8001
 $agentModelsPath = Join-Path $openClawRoot "agents\main\agent\models.json"
 $sessionPaths = @(
   (Join-Path $openClawRoot "agents\main\sessions\sessions.json"),
@@ -260,6 +263,21 @@ function Test-TcpPort {
   }
 }
 
+function Test-OpenClawGatewayUsesManagedMedia {
+  if (-not (Test-Path -LiteralPath $gatewayScriptPath)) {
+    return $false
+  }
+
+  try {
+    $gatewayText = Get-Content -LiteralPath $gatewayScriptPath -Raw -ErrorAction Stop
+  }
+  catch {
+    return $false
+  }
+
+  return ($gatewayText -match [regex]::Escape($managedGatewayScriptName))
+}
+
 function Get-OpenClawGatewayHostProcesses {
   return @(
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -279,6 +297,51 @@ function Get-OpenClawNodeHostProcesses {
         ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'node\.cmd')
       }
   )
+}
+
+function Get-OpenClawManagedMediaProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        $commandLine = $_.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) {
+          return $false
+        }
+
+        ($commandLine -match 'workspace[\\/]+tts_server\.py') -or
+        ($commandLine -match 'workspace[\\/]+stt_server\.py')
+      }
+  )
+}
+
+function Get-OpenClawManagedMediaStatusText {
+  if (-not (Test-OpenClawGatewayUsesManagedMedia)) {
+    return $null
+  }
+
+  $mediaProcesses = @(Get-OpenClawManagedMediaProcesses)
+  $ttsProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+tts_server\.py' }).Count -gt 0
+  $sttProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+stt_server\.py' }).Count -gt 0
+  $ttsListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedTtsHealthPort
+  $sttListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedSttHealthPort
+
+  $ttsStatus = if ($ttsListening) {
+    "TTS ready on 127.0.0.1:$managedTtsHealthPort"
+  } elseif ($ttsProcessDetected) {
+    "TTS process detected"
+  } else {
+    "TTS not detected"
+  }
+
+  $sttStatus = if ($sttListening) {
+    "STT ready on 127.0.0.1:$managedSttHealthPort"
+  } elseif ($sttProcessDetected) {
+    "STT process detected"
+  } else {
+    "STT not detected"
+  }
+
+  return "$ttsStatus; $sttStatus"
 }
 
 function Get-LlamaCppProviderNode {
@@ -406,8 +469,7 @@ function Update-LlamaCppSessionEntries {
     [Parameter(Mandatory = $true)][object]$Sessions,
     [Parameter(Mandatory = $true)][string]$ModelId,
     [string]$PreviousModelId,
-    [Parameter(Mandatory = $true)][int]$ContextWindow,
-    [Nullable[int]]$PromptTokens
+    [Parameter(Mandatory = $true)][int]$ContextWindow
   )
 
   $updated = $false
@@ -426,22 +488,21 @@ function Update-LlamaCppSessionEntries {
       continue
     }
 
-    Set-JsonNoteProperty -Node $entry -Name "modelProvider" -Value "llama-cpp"
-    Set-JsonNoteProperty -Node $entry -Name "model" -Value $ModelId
-    Set-JsonNoteProperty -Node $entry -Name "contextTokens" -Value $ContextWindow
-
-    if ($null -ne $PromptTokens) {
-      Set-JsonNoteProperty -Node $entry -Name "totalTokens" -Value ([int]$PromptTokens)
-      Set-JsonNoteProperty -Node $entry -Name "totalTokensFresh" -Value $true
-    }
-    else {
-      if ($entry.PSObject.Properties.Name -contains "totalTokens") {
-        $entry.totalTokens = $null
-      }
-      Set-JsonNoteProperty -Node $entry -Name "totalTokensFresh" -Value $false
+    if ($entryModelProvider -ne "llama-cpp") {
+      Set-JsonNoteProperty -Node $entry -Name "modelProvider" -Value "llama-cpp"
+      $updated = $true
     }
 
-    $updated = $true
+    if ($entryModel -ne $ModelId) {
+      Set-JsonNoteProperty -Node $entry -Name "model" -Value $ModelId
+      $updated = $true
+    }
+
+    $entryContextTokens = if ($entry.PSObject.Properties.Name -contains "contextTokens") { $entry.contextTokens } else { $null }
+    if ($entryContextTokens -ne $ContextWindow) {
+      Set-JsonNoteProperty -Node $entry -Name "contextTokens" -Value $ContextWindow
+      $updated = $true
+    }
   }
 
   return $updated
@@ -457,6 +518,63 @@ function Invoke-Checked {
   $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
   if ($exitCode -ne 0) {
     throw "Command failed with exit code ${exitCode}: $FilePath $($Arguments -join ' ')"
+  }
+}
+
+function Get-NodeExecutablePath {
+  $candidates = @(
+    "C:\Program Files\nodejs\node.exe",
+    "node.exe",
+    "node"
+  )
+
+  foreach ($candidate in $candidates) {
+    if (Test-Path -LiteralPath $candidate) {
+      return $candidate
+    }
+
+    $resolved = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($resolved) {
+      return $resolved.Source
+    }
+  }
+
+  throw "Cannot find Node.js in PATH or the default installation directory."
+}
+
+function Invoke-SessionTokenBackfill {
+  $backfillScriptPath = Join-Path $openClawRoot "scripts\backfill-session-token-cache.mjs"
+  if (-not (Test-Path -LiteralPath $backfillScriptPath)) {
+    Write-Warn "Skipping session token backfill because the script was not found: $backfillScriptPath"
+    return
+  }
+
+  $nodePath = Get-NodeExecutablePath
+  $output = & $nodePath $backfillScriptPath 2>&1
+  $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+  $text = ((@($output) | ForEach-Object { [string]$_.ToString().TrimEnd() }) -join [Environment]::NewLine).Trim()
+
+  if ($exitCode -ne 0) {
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+      Write-Warn "Session token backfill failed: $text"
+    } else {
+      Write-Warn "Session token backfill failed with exit code $exitCode."
+    }
+    return
+  }
+
+  if ([string]::IsNullOrWhiteSpace($text)) {
+    Write-Info "Session token backfill finished without output."
+    return
+  }
+
+  try {
+    $result = $text | ConvertFrom-Json
+    Write-Ok "Session token cache backfill complete"
+    Write-Info "Updated stores: $($result.updatedStores) | updated entries: $($result.updatedEntries) | already fresh: $($result.skippedAlreadyFresh) | skipped: $($result.skippedMissingTranscript)"
+  }
+  catch {
+    Write-Info $text
   }
 }
 
@@ -489,6 +607,8 @@ function Show-Summary {
   )
 
   $llamaPid = ""
+  $gatewayListening = Test-TcpPort -TargetHost "127.0.0.1" -Port 29644
+  $managedMediaStatus = Get-OpenClawManagedMediaStatusText
   if (Test-Path -LiteralPath $llamaPidPath) {
     $llamaPid = (Get-Content -LiteralPath $llamaPidPath -TotalCount 1 | Select-Object -First 1).Trim()
   }
@@ -505,7 +625,16 @@ function Show-Summary {
   Write-Host "Config    : $openClawConfigPath"
   Write-Host "Registry  : $agentModelsPath"
   Write-Host "Gateway   : http://127.0.0.1:29644/"
-  Write-Host ("Gateway TCP: {0}" -f $(if (Test-TcpPort -TargetHost "127.0.0.1" -Port 29644) { "listening" } else { "not listening" }))
+  if ($gatewayListening) {
+    Write-Host "Gateway TCP: listening"
+  } elseif ($null -ne $managedMediaStatus) {
+    Write-Host "Gateway TCP: warming up behind managed TTS/STT sidecars"
+  } else {
+    Write-Host "Gateway TCP: not listening"
+  }
+  if ($null -ne $managedMediaStatus) {
+    Write-Host "Media     : $managedMediaStatus"
+  }
 }
 
 function Pause-BeforeExit {
@@ -548,7 +677,7 @@ try {
   Write-Ok "Detected running llama.cpp model $targetModelId"
   Write-Info "Resolved context window $resolvedContextWindow"
   if ($null -ne $resolvedPromptTokens) {
-    Write-Info "Resolved last real prompt tokens $resolvedPromptTokens"
+    Write-Info "Observed last runtime prompt tokens $resolvedPromptTokens"
   }
 
   $config = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
@@ -594,7 +723,7 @@ try {
         $sessionChanged = $true
       }
 
-      if (Update-LlamaCppSessionEntries -Sessions $sessions -ModelId $targetModelId -PreviousModelId $previousLlamaModelId -ContextWindow $resolvedContextWindow -PromptTokens $resolvedPromptTokens) {
+      if (Update-LlamaCppSessionEntries -Sessions $sessions -ModelId $targetModelId -PreviousModelId $previousLlamaModelId -ContextWindow $resolvedContextWindow) {
         $sessionChanged = $true
       }
 
@@ -607,6 +736,8 @@ try {
       Write-Ok "Updated llama-cpp session runtime state in $sessionPath"
       Write-Info "Backup written to $sessionBackup"
     }
+
+    Invoke-SessionTokenBackfill
   } elseif ($SkipSessionUpdate) {
     Write-Info "Skipping session updates because -SkipSessionUpdate was provided."
   } else {
