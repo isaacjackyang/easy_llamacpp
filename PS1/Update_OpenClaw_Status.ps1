@@ -9,6 +9,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$openClawSupportPath = Join-Path $PSScriptRoot "OpenClawSupport.ps1"
 $llamaModelsUrl = "http://127.0.0.1:8080/v1/models"
 $llamaStdErrLogPath = Join-Path $projectRoot "logs\llama-server.stderr.log"
 $llamaPidPath = Join-Path $projectRoot "logs\llama-server.pid"
@@ -25,6 +26,10 @@ $sessionPaths = @(
   (Join-Path $openClawRoot "agents\worker1\sessions\sessions.json"),
   (Join-Path $openClawRoot "agents\worker2\sessions\sessions.json")
 )
+
+if (Test-Path -LiteralPath $openClawSupportPath) {
+  . $openClawSupportPath
+}
 
 function Write-Info {
   param([Parameter(Mandatory = $true)][string]$Message)
@@ -103,7 +108,47 @@ function Remove-DeprecatedOpenClawConfigKeys {
     }
   }
 
+  if (Get-Command Remove-OpenClawLegacyGraphitiPluginConfig -ErrorAction SilentlyContinue) {
+    foreach ($removedKey in @(Remove-OpenClawLegacyGraphitiPluginConfig -Config $Config)) {
+      $removedKeys.Add($removedKey)
+    }
+  }
+
   return @($removedKeys)
+}
+
+function Ensure-ManagedOpenClawStartupAssets {
+  if (-not (Get-Command Sync-OpenClawManagedStartupAssets -ErrorAction SilentlyContinue)) {
+    return
+  }
+
+  $syncResults = @(Sync-OpenClawManagedStartupAssets `
+    -ProjectRoot $projectRoot `
+    -OpenClawRoot $openClawRoot `
+    -OpenClawConfigPath $openClawConfigPath `
+    -GatewayPort 29644 `
+    -EasyLlamacppRoot $projectRoot)
+
+  foreach ($syncResult in $syncResults) {
+    if ($null -eq $syncResult) {
+      continue
+    }
+
+    switch ($syncResult.Status) {
+      "template-missing" {
+        Write-Warn "Skipping $($syncResult.Description) because the template was not found: $($syncResult.SourcePath)"
+      }
+      "created" {
+        Write-Info "Created $($syncResult.Description): $($syncResult.Path)"
+      }
+      "updated" {
+        Write-Info "Updated $($syncResult.Description): $($syncResult.Path)"
+        if (-not [string]::IsNullOrWhiteSpace([string]$syncResult.BackupPath)) {
+          Write-Info "Backup written to $($syncResult.BackupPath)"
+        }
+      }
+    }
+  }
 }
 
 function Get-OpenClawCommandPath {
@@ -654,6 +699,7 @@ function Pause-BeforeExit {
 
 try {
   $openClawCommandPath = Get-OpenClawCommandPath
+  Ensure-ManagedOpenClawStartupAssets
 
   if (-not (Test-Path -LiteralPath $openClawConfigPath)) {
     throw "Cannot find OpenClaw config: $openClawConfigPath"

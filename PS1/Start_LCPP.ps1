@@ -1131,7 +1131,11 @@ function Sync-LaunchConfigGpuFields {
 }
 
 function Get-GpuOffloadInfo {
-    $TrackedProcess = Get-TrackedServerProcess
+    param(
+        [System.Diagnostics.Process]$Process = $null
+    )
+
+    $TrackedProcess = if ($Process) { $Process } else { Get-TrackedServerProcess }
     $TrackedModelPath = Get-TrackedServerModelPath -Process $TrackedProcess
     $TrackedLogPaths = Get-TrackedLogPaths
     $TrackedStdErrLog = $TrackedLogPaths.StdErrLog
@@ -4183,6 +4187,29 @@ function Get-TrackedServerProcess {
     return $null
 }
 
+function Get-UntrackedWorkspaceServerProcess {
+    $TrackedProcess = Get-TrackedServerProcess
+    $TrackedProcessId = if ($TrackedProcess) { [int]$TrackedProcess.Id } else { $null }
+
+    $WorkspaceServerProcesses = @(
+        Get-WorkspaceServerProcesses |
+            Sort-Object -Property CreationDate -Descending
+    )
+
+    foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
+        if ($TrackedProcessId -and ([int]$WorkspaceServerProcess.ProcessId -eq $TrackedProcessId)) {
+            continue
+        }
+
+        $Process = Get-Process -Id ([int]$WorkspaceServerProcess.ProcessId) -ErrorAction SilentlyContinue
+        if ($Process) {
+            return $Process
+        }
+    }
+
+    return $null
+}
+
 function Get-TrackedServerModelPath {
     param(
         [System.Diagnostics.Process]$Process
@@ -5753,6 +5780,12 @@ function Invoke-OpenClawLauncherAfterStart {
 
 function Show-ServerStatus {
     $TrackedProcess = Get-TrackedServerProcess
+    $IsUntrackedWorkspaceServer = $false
+    if (-not $TrackedProcess) {
+        $TrackedProcess = Get-UntrackedWorkspaceServerProcess
+        $IsUntrackedWorkspaceServer = [bool]$TrackedProcess
+    }
+
     $Listener = Test-PortInUse
     $OpenClawStatus = Get-OpenClawRuntimeStatus
 
@@ -5766,10 +5799,13 @@ function Show-ServerStatus {
         $TrackedPort = if ($TrackedSettings -and $TrackedSettings.Port -match '^\d+$') { [int]$TrackedSettings.Port } else { $Port }
         $TrackedBaseUrl = "http://127.0.0.1:$TrackedPort"
         $TrackedRuntimeProperties = Get-TrackedServerRuntimeProperties -ServerBaseUrl $TrackedBaseUrl
-        $TrackedGpuOffloadInfo = Get-GpuOffloadInfo
+        $TrackedGpuOffloadInfo = Get-GpuOffloadInfo -Process $TrackedProcess
         $TrackedTokenSnapshot = Get-LlamaRuntimeTokenSnapshot -LogPath $TrackedLogPaths.StdErrLog
-        Write-Host "Status : running" -ForegroundColor Green
+        Write-Host "Status : running$(if ($IsUntrackedWorkspaceServer) { ' (untracked)' } else { '' })" -ForegroundColor Green
         Write-Host "PID    : $($TrackedProcess.Id)"
+        if ($IsUntrackedWorkspaceServer) {
+            Write-Host "Track  : PID file missing; discovered workspace llama-server.exe process."
+        }
         Write-Host "URL    : $TrackedBaseUrl"
         Write-Host "Port   : $TrackedPort"
         Write-Host "Server : $ServerExe"

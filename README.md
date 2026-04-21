@@ -182,6 +182,28 @@ If you only want to stop the TTS/STT voice services, use:
 .\stop_voice_service.cmd
 ```
 
+## OpenClaw 啟動維護 / OpenClaw Startup Maintenance
+
+`PS1\Start_OpenClaw.ps1` 與 `PS1\Update_OpenClaw_Status.ps1` 現在會先同步 `C:\Users\<user>\.openclaw\` 裡的 managed gateway 啟動資產，再進行 OpenClaw 重啟。  
+`PS1\Start_OpenClaw.ps1` and `PS1\Update_OpenClaw_Status.ps1` now sync the managed gateway startup assets in `C:\Users\<user>\.openclaw\` before restarting OpenClaw.
+
+這個同步流程會維持下面幾個新版原則：  
+This sync keeps the following newer OpenClaw startup assumptions in place:
+
+- Gateway 入口固定使用 `dist/index.js gateway --port ...`，不再沿用舊的 `dist/entry.js` 漂移入口。  
+- The gateway entrypoint stays on `dist/index.js gateway --port ...` instead of older drifting `dist/entry.js` wrappers.
+- TTS / STT sidecar 先啟動並回報 readiness，gateway 不會永久卡在等待 sidecar health。  
+- TTS / STT sidecars start first and report readiness, but the gateway no longer blocks indefinitely on sidecar health.
+- `gateway.cmd` 會改走 sidecar-aware 的 `run-openclaw-gateway-with-media.ps1` managed launcher。  
+- `gateway.cmd` is kept on the sidecar-aware `run-openclaw-gateway-with-media.ps1` managed launcher.
+- `openclaw.json` 會在同步模型前清掉舊的 graphiti / context-engine slot 註冊，但保留 install metadata。  
+- `openclaw.json` removes older graphiti / context-engine slot registrations before model sync while keeping install metadata.
+- Control UI patch 腳本會一起同步，讓前端在瀏覽器還留著舊 `gatewayUrl` 時能自動搬移到目前的 loopback websocket 位址。  
+- The Control UI patch script is synced too, so stale saved `gatewayUrl` values can be migrated to the current loopback websocket address.
+
+如果 Control UI 看起來像是「首頁開了，但就是連不上 gateway」，請先檢查瀏覽器裡記住的 websocket 位址是不是舊埠號，而不是只看 HTTP 首頁有沒有開。  
+If the Control UI looks alive but cannot connect to the gateway, check the browser's saved websocket URL first instead of relying only on the HTTP page being reachable.
+
 如果你想直接編譯並安裝最新版官方 `llama.cpp`，也可以用：
 If you want to build and install the latest official `llama.cpp` directly, you can also use:
 

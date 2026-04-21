@@ -11,6 +11,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$openClawSupportPath = Join-Path $PSScriptRoot "OpenClawSupport.ps1"
 $targetModelId = "gemma-4-31B-it-Q5_K_M.gguf"
 $targetPrimary = "llama-cpp/$targetModelId"
 $fallbackContextWindow = 41216
@@ -27,6 +28,10 @@ $sessionPaths = @(
   (Join-Path $openClawRoot "agents\worker1\sessions\sessions.json"),
   (Join-Path $openClawRoot "agents\worker2\sessions\sessions.json")
 )
+
+if (Test-Path -LiteralPath $openClawSupportPath) {
+  . $openClawSupportPath
+}
 
 function Write-Info {
   param([Parameter(Mandatory = $true)][string]$Message)
@@ -94,6 +99,12 @@ function Remove-DeprecatedOpenClawConfigKeys {
   if ($Config.PSObject.Properties.Name -contains "models" -and $Config.models -is [pscustomobject]) {
     if (Remove-JsonNoteProperty -Node $Config.models -Name "bedrockDiscovery") {
       $removedKeys.Add("models.bedrockDiscovery")
+    }
+  }
+
+  if (Get-Command Remove-OpenClawLegacyGraphitiPluginConfig -ErrorAction SilentlyContinue) {
+    foreach ($removedKey in @(Remove-OpenClawLegacyGraphitiPluginConfig -Config $Config)) {
+      $removedKeys.Add($removedKey)
     }
   }
 

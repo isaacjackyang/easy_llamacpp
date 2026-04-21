@@ -7,6 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$openClawSupportPath = Join-Path $PSScriptRoot "OpenClawSupport.ps1"
 $syncScriptPath = Join-Path $PSScriptRoot "Update_OpenClaw_Status.ps1"
 $llamaModelsUrl = "http://127.0.0.1:8080/v1/models"
 $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -19,6 +20,10 @@ $managedTtsHealthPort = 8000
 $managedSttHealthPort = 8001
 $defaultGatewayReadyTimeoutSeconds = 60
 $managedMediaGatewayReadyTimeoutSeconds = 480
+
+if (Test-Path -LiteralPath $openClawSupportPath) {
+  . $openClawSupportPath
+}
 
 function Write-Info {
   param([Parameter(Mandatory = $true)][string]$Message)
@@ -97,7 +102,47 @@ function Remove-DeprecatedOpenClawConfigKeys {
     }
   }
 
+  if (Get-Command Remove-OpenClawLegacyGraphitiPluginConfig -ErrorAction SilentlyContinue) {
+    foreach ($removedKey in @(Remove-OpenClawLegacyGraphitiPluginConfig -Config $Config)) {
+      $removedKeys.Add($removedKey)
+    }
+  }
+
   return @($removedKeys)
+}
+
+function Ensure-ManagedOpenClawStartupAssets {
+  if (-not (Get-Command Sync-OpenClawManagedStartupAssets -ErrorAction SilentlyContinue)) {
+    return
+  }
+
+  $syncResults = @(Sync-OpenClawManagedStartupAssets `
+    -ProjectRoot $projectRoot `
+    -OpenClawRoot $openClawRoot `
+    -OpenClawConfigPath $openClawConfigPath `
+    -GatewayPort 29644 `
+    -EasyLlamacppRoot $projectRoot)
+
+  foreach ($syncResult in $syncResults) {
+    if ($null -eq $syncResult) {
+      continue
+    }
+
+    switch ($syncResult.Status) {
+      "template-missing" {
+        Write-Warn "Skipping $($syncResult.Description) because the template was not found: $($syncResult.SourcePath)"
+      }
+      "created" {
+        Write-Info "Created $($syncResult.Description): $($syncResult.Path)"
+      }
+      "updated" {
+        Write-Info "Updated $($syncResult.Description): $($syncResult.Path)"
+        if (-not [string]::IsNullOrWhiteSpace([string]$syncResult.BackupPath)) {
+          Write-Info "Backup written to $($syncResult.BackupPath)"
+        }
+      }
+    }
+  }
 }
 
 function Repair-OpenClawConfigIfNeeded {
@@ -543,6 +588,7 @@ function Pause-BeforeExit {
 
 try {
   $openClawCommandPath = Get-OpenClawCommandPath
+  Ensure-ManagedOpenClawStartupAssets
   Repair-OpenClawConfigIfNeeded
   $hasRunningLlama = Test-LlamaServerAvailable -ModelsUrl $llamaModelsUrl
 
