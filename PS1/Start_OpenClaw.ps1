@@ -151,14 +151,25 @@ function Repair-OpenClawConfigIfNeeded {
   }
 
   $config = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
-  $removedKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
-  if ($removedKeys.Count -eq 0) {
+  [object[]]$removedKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
+  [object[]]$networkKeys = @(
+    if (Get-Command Ensure-OpenClawTelegramNetworkConfig -ErrorAction SilentlyContinue) {
+      Ensure-OpenClawTelegramNetworkConfig -Config $config
+    }
+  )
+
+  if ($removedKeys.Count -eq 0 -and $networkKeys.Count -eq 0) {
     return
   }
 
   $configBackup = Backup-File -Path $openClawConfigPath -Suffix "deprecated-config-cleanup"
   Save-JsonUtf8 -Path $openClawConfigPath -Payload $config
-  Write-Warn "Removed deprecated OpenClaw config keys: $($removedKeys -join ', ')"
+  if ($removedKeys.Count -gt 0) {
+    Write-Warn "Removed deprecated OpenClaw config keys: $($removedKeys -join ', ')"
+  }
+  if ($networkKeys.Count -gt 0) {
+    Write-Warn "Updated Telegram network config: $($networkKeys -join ', ')"
+  }
   Write-Info "Backup written to $configBackup"
 }
 

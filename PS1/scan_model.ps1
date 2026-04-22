@@ -197,8 +197,10 @@ function Get-ModelCapabilities {
     $Normalized = $SearchText.ToLowerInvariant()
     $NormalizedArchitecture = if ($Architecture) { $Architecture.ToLowerInvariant() } else { "" }
 
-    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
+    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen3vl|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
     $ReasoningPattern = '(?<![a-z0-9])(reason|reasoning|think|thinking|chain[\-_ ]?of[\-_ ]?thought|cot|qwq|r1)(?![a-z0-9])'
+    $VideoPattern = '(?<![a-z0-9])(video|movie|temporal|video[\-_ ]?chat|video[\-_ ]?llm|qwen[\-_ ]?omni|omni[\-_ ]?video)(?![a-z0-9])'
+    $VoicePattern = '(?<![a-z0-9])(voice|audio|speech|spoken|tts|stt|asr|whisper|wav2vec|bark|speecht5|qwen[\-_ ]?audio|qwen[\-_ ]?omni|omni[\-_ ]?audio)(?![a-z0-9])'
     $ToolsPattern = '(?<![a-z0-9])(tool|tools|function|functions|function[\-_ ]?call(?:ing)?|tool[\-_ ]?use|agent)(?![a-z0-9])'
     $RerankPattern = '(?<![a-z0-9])(rerank|reranker|re[\-_ ]?rank|cross[\-_ ]?encoder|bge[\-_ ]?reranker|jina[\-_ ]?reranker)(?![a-z0-9])'
     $EmbeddingPattern = '(?<![a-z0-9])(embed|embedding|embeddings|text[\-_ ]?embedding|nomic[\-_ ]?embed|jina[\-_ ]?embeddings?|bge|e5|gte)(?![a-z0-9])'
@@ -208,6 +210,8 @@ function Get-ModelCapabilities {
     $IsEmbedding = (-not $IsRerank) -and ($Normalized -match $EmbeddingPattern)
     $IsVision = ($Normalized -match $VisionPattern) -or ($NormalizedArchitecture -match $ArchitectureVisionPattern)
     $IsReasoning = $Normalized -match $ReasoningPattern
+    $IsVideo = $Normalized -match $VideoPattern
+    $IsVoice = $Normalized -match $VoicePattern
     $IsTools = $Normalized -match $ToolsPattern
     $IsChat = -not ($IsEmbedding -or $IsRerank)
 
@@ -215,6 +219,8 @@ function Get-ModelCapabilities {
         chat      = [bool]$IsChat
         reasoning = [bool]$IsReasoning
         vision    = [bool]$IsVision
+        video     = [bool]$IsVideo
+        voice     = [bool]$IsVoice
         tools     = [bool]$IsTools
         embedding = [bool]$IsEmbedding
         rerank    = [bool]$IsRerank

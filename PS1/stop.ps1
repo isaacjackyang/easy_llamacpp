@@ -2,7 +2,8 @@
 param(
     [switch]$LlamaCppOnly,
     [switch]$OpenClawOnly,
-    [switch]$VoiceServiceOnly
+    [switch]$VoiceServiceOnly,
+    [switch]$VisionServiceOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +17,7 @@ else {
 }
 
 $PidFile = Join-Path $ProjectRoot "logs\llama-server.pid"
+$VisionPidFile = Join-Path $ProjectRoot "logs\vision-server.pid"
 $LegacyPidFile = Join-Path $ProjectRoot "llama-server.pid"
 $PreferredServerExe = Join-Path $ProjectRoot "bin\llama-server.exe"
 $LegacyServerExe = Join-Path $ProjectRoot "llama-server.exe"
@@ -35,17 +37,18 @@ $TargetServerPaths = @(
 $TargetServerPatterns = @($TargetServerPaths | ForEach-Object { [regex]::Escape($_) })
 
 $requestedModes = @(
-    @($LlamaCppOnly, $OpenClawOnly, $VoiceServiceOnly) |
+    @($LlamaCppOnly, $OpenClawOnly, $VoiceServiceOnly, $VisionServiceOnly) |
         Where-Object { $_ }
 ).Count
 
 if ($requestedModes -gt 1) {
-    throw "Use only one of -LlamaCppOnly, -OpenClawOnly, or -VoiceServiceOnly."
+    throw "Use only one of -LlamaCppOnly, -OpenClawOnly, -VoiceServiceOnly, or -VisionServiceOnly."
 }
 
-$RunLlamaCpp = -not ($OpenClawOnly -or $VoiceServiceOnly)
-$RunOpenClaw = -not ($LlamaCppOnly -or $VoiceServiceOnly)
+$RunLlamaCpp = -not ($OpenClawOnly -or $VoiceServiceOnly -or $VisionServiceOnly)
+$RunOpenClaw = -not ($LlamaCppOnly -or $VoiceServiceOnly -or $VisionServiceOnly)
 $RunVoiceService = $VoiceServiceOnly
+$RunVisionService = $VisionServiceOnly -or ($requestedModes -eq 0)
 
 $StopTargetLabel = if ($LlamaCppOnly) {
     "workspace llama.cpp"
@@ -56,8 +59,11 @@ elseif ($OpenClawOnly) {
 elseif ($VoiceServiceOnly) {
     "voice service (TTS/STT)"
 }
+elseif ($VisionServiceOnly) {
+    "vision service"
+}
 else {
-    "workspace llama.cpp and OpenClaw"
+    "workspace llama.cpp, OpenClaw, and vision service"
 }
 
 $FailureScopeLabel = if ($LlamaCppOnly) {
@@ -69,8 +75,11 @@ elseif ($OpenClawOnly) {
 elseif ($VoiceServiceOnly) {
     "voice service"
 }
+elseif ($VisionServiceOnly) {
+    "vision service"
+}
 else {
-    "llama.cpp/OpenClaw"
+    "llama.cpp/OpenClaw/vision"
 }
 
 $CompletionMessage = if ($LlamaCppOnly) {
@@ -82,8 +91,11 @@ elseif ($OpenClawOnly) {
 elseif ($VoiceServiceOnly) {
     "Voice service cleanup complete."
 }
+elseif ($VisionServiceOnly) {
+    "Vision service cleanup complete."
+}
 else {
-    "Workspace llama.cpp and OpenClaw cleanup complete."
+    "Workspace llama.cpp, OpenClaw, and vision cleanup complete."
 }
 
 function Write-Info {
@@ -124,8 +136,10 @@ function Stop-LcppRuntime {
                 $WorkspaceProcess = $_
                 $MatchesExecutablePath = $WorkspaceProcess.ExecutablePath -and ($TargetServerPaths -contains $WorkspaceProcess.ExecutablePath)
                 $MatchesCommandLine = $false
+                $IsVisionSidecar = $false
 
                 if ($WorkspaceProcess.CommandLine) {
+                    $IsVisionSidecar = $WorkspaceProcess.CommandLine -match '(?i)--mmproj'
                     foreach ($TargetServerPattern in $TargetServerPatterns) {
                         if ($WorkspaceProcess.CommandLine -match $TargetServerPattern) {
                             $MatchesCommandLine = $true
@@ -134,7 +148,7 @@ function Stop-LcppRuntime {
                     }
                 }
 
-                $MatchesExecutablePath -or $MatchesCommandLine
+                ($MatchesExecutablePath -or $MatchesCommandLine) -and -not $IsVisionSidecar
             }
     )
 
@@ -256,6 +270,36 @@ function Get-ManagedMediaProcesses {
     )
 }
 
+function Get-VisionServiceProcesses {
+    $TrackedIds = New-Object System.Collections.Generic.HashSet[int]
+    if (Test-Path -LiteralPath $VisionPidFile) {
+        $TrackedPidText = ((Get-Content -LiteralPath $VisionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1) | Out-String).Trim()
+        if ($TrackedPidText -match '^\d+$') {
+            $null = $TrackedIds.Add([int]$TrackedPidText)
+        }
+    }
+
+    return @(
+        Get-CimInstance Win32_Process -Filter "Name = 'llama-server.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $CommandLine = [string]$_.CommandLine
+                $IsTracked = $TrackedIds.Contains([int]$_.ProcessId)
+                $IsWorkspaceVision = $false
+
+                if ($CommandLine) {
+                    foreach ($TargetServerPattern in $TargetServerPatterns) {
+                        if ($CommandLine -match $TargetServerPattern -and $CommandLine -match '(?i)--mmproj') {
+                            $IsWorkspaceVision = $true
+                            break
+                        }
+                    }
+                }
+
+                $IsTracked -or $IsWorkspaceVision
+            }
+    )
+}
+
 function Stop-VoiceServiceRuntime {
     $ProcessesToStop = @(Get-ManagedMediaProcesses) | Sort-Object ProcessId -Unique
 
@@ -281,6 +325,77 @@ function Stop-VoiceServiceRuntime {
                 $FailedIds.Add([int]$Process.ProcessId)
             }
         }
+    }
+
+    if ($WhatIfPreference) {
+        return [pscustomobject]@{
+            FoundAny     = $true
+            StoppedIds   = @($StoppedIds)
+            FailedIds    = @($FailedIds)
+            RemainingIds = @()
+        }
+    }
+
+    $StopDeadline = (Get-Date).AddSeconds(10)
+    $TargetIds = @($ProcessesToStop | ForEach-Object { [int]$_.ProcessId } | Select-Object -Unique)
+    $RemainingIds = @()
+    do {
+        $RemainingIds = @(
+            $TargetIds |
+                Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }
+        )
+
+        if ($RemainingIds.Count -eq 0) {
+            break
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+    while ((Get-Date) -lt $StopDeadline)
+
+    return [pscustomobject]@{
+        FoundAny     = $true
+        StoppedIds   = @($StoppedIds)
+        FailedIds    = @($FailedIds)
+        RemainingIds = @($RemainingIds)
+    }
+}
+
+function Stop-VisionServiceRuntime {
+    $ProcessesToStop = @(Get-VisionServiceProcesses) | Sort-Object ProcessId -Unique
+
+    if ($ProcessesToStop.Count -eq 0) {
+        if (Test-Path -LiteralPath $VisionPidFile) {
+            if ($PSCmdlet.ShouldProcess($VisionPidFile, "Remove stale vision PID file")) {
+                Remove-Item -LiteralPath $VisionPidFile -ErrorAction SilentlyContinue
+            }
+        }
+
+        return [pscustomobject]@{
+            FoundAny     = $false
+            StoppedIds   = @()
+            FailedIds    = @()
+            RemainingIds = @()
+        }
+    }
+
+    $StoppedIds = New-Object System.Collections.Generic.List[int]
+    $FailedIds = New-Object System.Collections.Generic.List[int]
+
+    foreach ($Process in $ProcessesToStop) {
+        if ($PSCmdlet.ShouldProcess("PID $($Process.ProcessId)", "Stop vision-service process")) {
+            try {
+                Stop-Process -Id $Process.ProcessId -Force -ErrorAction Stop
+                $StoppedIds.Add([int]$Process.ProcessId)
+            }
+            catch {
+                $FailedIds.Add([int]$Process.ProcessId)
+            }
+        }
+    }
+
+    if ($PSCmdlet.ShouldProcess($VisionPidFile, "Remove vision PID file")) {
+        Remove-Item -LiteralPath $VisionPidFile -ErrorAction SilentlyContinue
     }
 
     if ($WhatIfPreference) {
@@ -430,6 +545,18 @@ else {
     }
 }
 
+$VisionServiceResult = if ($RunVisionService) {
+    Stop-VisionServiceRuntime
+}
+else {
+    [pscustomobject]@{
+        FoundAny     = $false
+        StoppedIds   = @()
+        FailedIds    = @()
+        RemainingIds = @()
+    }
+}
+
 if ($WhatIfPreference) {
     Write-Host ""
     Write-Host "WhatIf cleanup plan complete." -ForegroundColor Cyan
@@ -466,13 +593,24 @@ if ($RunVoiceService) {
     }
 }
 
+if ($RunVisionService) {
+    if ($VisionServiceResult.StoppedIds.Count -gt 0) {
+        Write-Ok "Stopped vision-service process(es): $($VisionServiceResult.StoppedIds -join ', ')"
+    }
+    else {
+        Write-Info "No vision-service processes found."
+    }
+}
+
 $AllFailedIds = @(
     @($LcppResult.RemainingIds) +
     @($LcppResult.FailedIds) +
     @($OpenClawResult.RemainingIds) +
     @($OpenClawResult.FailedIds) +
     @($VoiceServiceResult.RemainingIds) +
-    @($VoiceServiceResult.FailedIds)
+    @($VoiceServiceResult.FailedIds) +
+    @($VisionServiceResult.RemainingIds) +
+    @($VisionServiceResult.FailedIds)
 ) | Select-Object -Unique
 
 if ($AllFailedIds.Count -gt 0) {
@@ -480,8 +618,8 @@ if ($AllFailedIds.Count -gt 0) {
 }
 
 if ($RunLlamaCpp -and $RunOpenClaw) {
-    if ($LcppResult.StoppedIds.Count -eq 0 -and -not $LcppResult.RemovedStalePid -and $OpenClawResult.StoppedIds.Count -eq 0) {
-        Write-WarnText "No workspace llama.cpp or OpenClaw processes found."
+    if ($LcppResult.StoppedIds.Count -eq 0 -and -not $LcppResult.RemovedStalePid -and $OpenClawResult.StoppedIds.Count -eq 0 -and $VisionServiceResult.StoppedIds.Count -eq 0) {
+        Write-WarnText "No workspace llama.cpp, OpenClaw, or vision processes found."
         return
     }
 }
@@ -497,6 +635,11 @@ elseif ($RunOpenClaw) {
 }
 elseif ($RunVoiceService) {
     if ($VoiceServiceResult.StoppedIds.Count -eq 0) {
+        return
+    }
+}
+elseif ($RunVisionService) {
+    if ($VisionServiceResult.StoppedIds.Count -eq 0) {
         return
     }
 }

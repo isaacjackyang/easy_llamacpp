@@ -1,7 +1,7 @@
 ﻿# llama.cpp Launcher / llama.cpp 啟動器
 
-這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop_all.cmd`、`stop_opencalw.cmd`、`stop_llamacpp.cmd`、`start_voice_service.cmd`、`stop_voice_service.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、全部停止、只停止 OpenClaw、只停止 `llama.cpp`、只啟動 TTS/STT、只停止 TTS/STT、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換、背景執行與 OpenClaw runtime。  
-This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop_all.cmd`, `stop_opencalw.cmd`, `stop_llamacpp.cmd`, `start_voice_service.cmd`, `stop_voice_service.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop everything, stop OpenClaw only, stop `llama.cpp` only, start TTS/STT only, stop TTS/STT only, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, background execution, and the OpenClaw runtime.
+這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop_all.cmd`、`stop_opencalw.cmd`、`stop_llamacpp.cmd`、`start_voice_service.cmd`、`stop_voice_service.cmd`、`start_vision.cmd`、`stop_vision.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、全部停止、只停止 OpenClaw、只停止 `llama.cpp`、只啟動 TTS/STT、只停止 TTS/STT、只啟動 vision sidecar、只停止 vision sidecar、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換、背景執行與 OpenClaw runtime。  
+This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop_all.cmd`, `stop_opencalw.cmd`, `stop_llamacpp.cmd`, `start_voice_service.cmd`, `stop_voice_service.cmd`, `start_vision.cmd`, `stop_vision.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop everything, stop OpenClaw only, stop `llama.cpp` only, start TTS/STT only, stop TTS/STT only, start the vision sidecar only, stop the vision sidecar only, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, background execution, and the OpenClaw runtime.
 
 ## 目錄結構 / Folder Layout
 
@@ -17,12 +17,15 @@ stop_opencalw.cmd
 stop_llamacpp.cmd
 start_voice_service.cmd
 stop_voice_service.cmd
+start_vision.cmd
+stop_vision.cmd
 README.md
 PS1\
   Install_LCPP_Prebuilt.ps1
   Install_LCPP.ps1
   Start_LCPP.ps1
   Start_Voice_Service.ps1
+  Start_Vision_Service.ps1
   stop.ps1
   scan_model.ps1
   Install_LCPP_Autostart.ps1
@@ -182,6 +185,20 @@ If you only want to stop the TTS/STT voice services, use:
 .\stop_voice_service.cmd
 ```
 
+若只想啟動 vision sidecar，可用；它會用 `llama-server` 載入 vision GGUF 與 `--mmproj`，預設服務在 `127.0.0.1:8081`：  
+If you only want to start the vision sidecar, use this; it runs `llama-server` with the vision GGUF and `--mmproj`, defaulting to `127.0.0.1:8081`:
+
+```bat
+.\start_vision.cmd
+```
+
+若只想停止 vision sidecar，可用：  
+If you only want to stop the vision sidecar, use:
+
+```bat
+.\stop_vision.cmd
+```
+
 ## OpenClaw 啟動維護 / OpenClaw Startup Maintenance
 
 `PS1\Start_OpenClaw.ps1` 與 `PS1\Update_OpenClaw_Status.ps1` 現在會先同步 `C:\Users\<user>\.openclaw\` 裡的 managed gateway 啟動資產，再進行 OpenClaw 重啟。  
@@ -200,6 +217,9 @@ This sync keeps the following newer OpenClaw startup assumptions in place:
 - `openclaw.json` removes older graphiti / context-engine slot registrations before model sync while keeping install metadata.
 - Control UI patch 腳本會一起同步，讓前端在瀏覽器還留著舊 `gatewayUrl` 時能自動搬移到目前的 loopback websocket 位址。  
 - The Control UI patch script is synced too, so stale saved `gatewayUrl` values can be migrated to the current loopback websocket address.
+
+OpenClaw 重新安裝或 npm 更新後，請先看 [`docs\OpenClaw-reinstall-notes.md`](docs/OpenClaw-reinstall-notes.md)；裡面記錄了 compact `TOOLS.md`、Telegram IPv4 env/config，以及必要時要補回 OpenClaw bundle 的手動 patch。  
+After reinstalling or updating OpenClaw through npm, see [`docs\OpenClaw-reinstall-notes.md`](docs/OpenClaw-reinstall-notes.md) for the compact `TOOLS.md`, Telegram IPv4 env/config, and the optional manual OpenClaw bundle patch.
 
 如果 Control UI 看起來像是「首頁開了，但就是連不上 gateway」，請先檢查瀏覽器裡記住的 websocket 位址是不是舊埠號，而不是只看 HTTP 首頁有沒有開。  
 If the Control UI looks alive but cannot connect to the gateway, check the browser's saved websocket URL first instead of relying only on the HTTP page being reachable.
@@ -526,8 +546,8 @@ Restart the background server with Extreme Mode:
 .\PS1\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause -ExtremeMode
 ```
 
-強制清理這個工作資料夾下舊的 `llama-server.exe`、OpenClaw、TTS、STT 進程：  
-Force-clean older `llama-server.exe`, OpenClaw, TTS, and STT processes that belong to this workspace:
+強制清理這個工作資料夾下舊的 `llama-server.exe`、OpenClaw、TTS、STT、vision sidecar 進程：  
+Force-clean older `llama-server.exe`, OpenClaw, TTS, STT, and vision sidecar processes that belong to this workspace:
 
 ```powershell
 .\PS1\stop.ps1
@@ -540,8 +560,8 @@ Stop the currently tracked server:
 .\PS1\Start_LCPP.ps1 -Stop
 ```
 
-`stop.ps1` 會比 `-Stop` 更激進一些。它不只會處理目前追蹤中的 PID，也會掃描這個工作資料夾對應的 `llama-server.exe` 路徑，並一起停止 OpenClaw、TTS、STT 的殘留進程，適合用在 VRAM / RAM 沒有正常釋放時。  
-`stop.ps1` is more aggressive than `-Stop`. It does not only stop the tracked PID, but also scans for `llama-server.exe` processes that belong to this workspace and clears lingering OpenClaw, TTS, and STT processes too. It is useful when VRAM / RAM has not been released cleanly.
+`stop.ps1` 會比 `-Stop` 更激進一些。它不只會處理目前追蹤中的 PID，也會掃描這個工作資料夾對應的 `llama-server.exe` 路徑，並一起停止 OpenClaw、TTS、STT、vision sidecar 的殘留進程，適合用在 VRAM / RAM 沒有正常釋放時。  
+`stop.ps1` is more aggressive than `-Stop`. It does not only stop the tracked PID, but also scans for `llama-server.exe` processes that belong to this workspace and clears lingering OpenClaw, TTS, STT, and vision sidecar processes too. It is useful when VRAM / RAM has not been released cleanly.
 
 查看底層 `llama-server.exe` 全部參數：  
 Show all underlying `llama-server.exe` parameters:

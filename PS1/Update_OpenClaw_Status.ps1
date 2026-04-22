@@ -727,7 +727,12 @@ try {
   }
 
   $config = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
-  $removedConfigKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
+  [object[]]$removedConfigKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
+  [object[]]$telegramNetworkKeys = @(
+    if (Get-Command Ensure-OpenClawTelegramNetworkConfig -ErrorAction SilentlyContinue) {
+      Ensure-OpenClawTelegramNetworkConfig -Config $config
+    }
+  )
   $currentPrimary = [string]$config.agents.defaults.model.primary
   $previousLlamaModelId = $null
 
@@ -746,6 +751,9 @@ try {
   if ($removedConfigKeys.Count -gt 0) {
     Write-Warn "Removed deprecated OpenClaw config keys: $($removedConfigKeys -join ', ')"
   }
+  if ($telegramNetworkKeys.Count -gt 0) {
+    Write-Warn "Updated Telegram network config: $($telegramNetworkKeys -join ', ')"
+  }
 
   $agentModels = Get-Content -LiteralPath $agentModelsPath -Raw | ConvertFrom-Json
   Ensure-LlamaCppModelEntry -Payload $agentModels -ModelId $targetModelId -ContextWindow $resolvedContextWindow
@@ -761,7 +769,13 @@ try {
         continue
       }
 
-      $sessions = Get-Content -LiteralPath $sessionPath -Raw | ConvertFrom-Json
+      try {
+        $sessions = Get-Content -LiteralPath $sessionPath -Raw | ConvertFrom-Json
+      } catch {
+        Write-Warn "Skipping invalid session registry JSON: $sessionPath"
+        continue
+      }
+
       $sessionChanged = $false
 
       if ($previousLlamaModelId -and $previousLlamaModelId -ne $targetModelId) {

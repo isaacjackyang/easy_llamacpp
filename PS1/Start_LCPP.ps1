@@ -1484,6 +1484,8 @@ function New-EmptyModelCapabilities {
         chat      = $false
         reasoning = $false
         vision    = $false
+        video     = $false
+        voice     = $false
         tools     = $false
         embedding = $false
         rerank    = $false
@@ -1501,7 +1503,7 @@ function ConvertTo-ModelCapabilities {
         return $Capabilities
     }
 
-    foreach ($CapabilityName in @("chat", "reasoning", "vision", "tools", "embedding", "rerank")) {
+    foreach ($CapabilityName in @("chat", "reasoning", "vision", "video", "voice", "tools", "embedding", "rerank")) {
         $Value = $null
 
         if ($Source -is [System.Collections.IDictionary] -and $Source.Contains($CapabilityName)) {
@@ -1677,8 +1679,10 @@ function Get-InferredModelCapabilities {
     $Normalized = $SearchText.ToLowerInvariant()
     $NormalizedArchitecture = if ($Architecture) { $Architecture.ToLowerInvariant() } else { "" }
 
-    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
+    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen3vl|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
     $ReasoningPattern = '(?<![a-z0-9])(reason|reasoning|think|thinking|chain[\-_ ]?of[\-_ ]?thought|cot|qwq|r1)(?![a-z0-9])'
+    $VideoPattern = '(?<![a-z0-9])(video|movie|temporal|video[\-_ ]?chat|video[\-_ ]?llm|qwen[\-_ ]?omni|omni[\-_ ]?video)(?![a-z0-9])'
+    $VoicePattern = '(?<![a-z0-9])(voice|audio|speech|spoken|tts|stt|asr|whisper|wav2vec|bark|speecht5|qwen[\-_ ]?audio|qwen[\-_ ]?omni|omni[\-_ ]?audio)(?![a-z0-9])'
     $ToolsPattern = '(?<![a-z0-9])(tool|tools|function|functions|function[\-_ ]?call(?:ing)?|tool[\-_ ]?use|agent)(?![a-z0-9])'
     $RerankPattern = '(?<![a-z0-9])(rerank|reranker|re[\-_ ]?rank|cross[\-_ ]?encoder|bge[\-_ ]?reranker|jina[\-_ ]?reranker)(?![a-z0-9])'
     $EmbeddingPattern = '(?<![a-z0-9])(embed|embedding|embeddings|text[\-_ ]?embedding|nomic[\-_ ]?embed|jina[\-_ ]?embeddings?|bge|e5|gte)(?![a-z0-9])'
@@ -1688,6 +1692,8 @@ function Get-InferredModelCapabilities {
     $IsEmbedding = (-not $IsRerank) -and ($Normalized -match $EmbeddingPattern)
     $IsVision = ($Normalized -match $VisionPattern) -or ($NormalizedArchitecture -match $ArchitectureVisionPattern)
     $IsReasoning = $Normalized -match $ReasoningPattern
+    $IsVideo = $Normalized -match $VideoPattern
+    $IsVoice = $Normalized -match $VoicePattern
     $IsTools = $Normalized -match $ToolsPattern
     $IsChat = -not ($IsEmbedding -or $IsRerank)
 
@@ -1695,6 +1701,8 @@ function Get-InferredModelCapabilities {
         chat      = [bool]$IsChat
         reasoning = [bool]$IsReasoning
         vision    = [bool]$IsVision
+        video     = [bool]$IsVideo
+        voice     = [bool]$IsVoice
         tools     = [bool]$IsTools
         embedding = [bool]$IsEmbedding
         rerank    = [bool]$IsRerank
@@ -1726,6 +1734,8 @@ function Resolve-ModelEntryCapabilities {
 
     $ResolvedCapabilities.reasoning = $ExplicitCapabilities.reasoning -or $InferredCapabilities.reasoning
     $ResolvedCapabilities.vision = $ExplicitCapabilities.vision -or $InferredCapabilities.vision
+    $ResolvedCapabilities.video = $ExplicitCapabilities.video -or $InferredCapabilities.video
+    $ResolvedCapabilities.voice = $ExplicitCapabilities.voice -or $InferredCapabilities.voice
     $ResolvedCapabilities.tools = $ExplicitCapabilities.tools -or $InferredCapabilities.tools
     $ResolvedCapabilities.embedding = $ExplicitCapabilities.embedding -or $InferredCapabilities.embedding
     $ResolvedCapabilities.rerank = $ExplicitCapabilities.rerank -or $InferredCapabilities.rerank
@@ -2523,20 +2533,70 @@ function Format-ModelCapabilities {
     )
 
     if (-not $ModelEntry) {
-        return "Chat:N | Reasoning:N | Vision:N | Tools:N | Embedding:N | Rerank:N"
+        return "Chat:N Vision:N Video:N Voice:N Reasoning:N Tools:N Embedding:N Rerank:N"
     }
 
     $Capabilities = Resolve-ModelEntryCapabilities -ModelEntry $ModelEntry
     $Flags = @(
         "Chat:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.chat) { "Y" } else { "N" }),
-        "Reasoning:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.reasoning) { "Y" } else { "N" }),
         "Vision:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.vision) { "Y" } else { "N" }),
+        "Video:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.video) { "Y" } else { "N" }),
+        "Voice:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.voice) { "Y" } else { "N" }),
+        "Reasoning:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.reasoning) { "Y" } else { "N" }),
         "Tools:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.tools) { "Y" } else { "N" }),
         "Embedding:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.embedding) { "Y" } else { "N" }),
         "Rerank:{0}" -f $(if (ConvertTo-BoolFlag $Capabilities.rerank) { "Y" } else { "N" })
     )
 
-    return ($Flags -join " | ")
+    return ($Flags -join " ")
+}
+
+function Write-HighlightedCapabilityText {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return
+    }
+
+    $Matches = [regex]::Matches($Text, '(?<prefix>(?:^|\s)[^:\s]+:)(?<value>[YN])')
+    if ($Matches.Count -eq 0) {
+        Write-Host $Text -NoNewline
+        return
+    }
+
+    $Cursor = 0
+    foreach ($Match in $Matches) {
+        if ($Match.Index -gt $Cursor) {
+            Write-Host ($Text.Substring($Cursor, $Match.Index - $Cursor)) -NoNewline
+        }
+
+        Write-Host ($Match.Groups["prefix"].Value) -NoNewline
+        $Value = $Match.Groups["value"].Value
+        if ($Value -eq "Y") {
+            Write-Host $Value -NoNewline -ForegroundColor Black -BackgroundColor White
+        }
+        else {
+            Write-Host $Value -NoNewline
+        }
+
+        $Cursor = $Match.Index + $Match.Length
+    }
+
+    if ($Cursor -lt $Text.Length) {
+        Write-Host ($Text.Substring($Cursor)) -NoNewline
+    }
+}
+
+function Write-ModelCapabilitiesLine {
+    param(
+        [string]$CapabilityText
+    )
+
+    Write-Host "Capabilities : " -NoNewline
+    Write-HighlightedCapabilityText -Text $CapabilityText
+    Write-Host ""
 }
 
 function Split-ArgumentLine {
@@ -3335,7 +3395,7 @@ function Show-ModelVariantMenu {
         Write-Host ("Name         : {0}" -f $SelectedModel.name) -ForegroundColor Cyan
         Write-Host ("Path         : {0}" -f $SelectedModelPath)
         Write-Host ("Size         : {0}" -f ((Get-ModelFileSizeLabel -Path $SelectedModel.path).TrimStart("[").TrimEnd("]")))
-        Write-Host ("Capabilities : {0}" -f (Format-ModelCapabilities -ModelEntry $SelectedModel))
+        Write-ModelCapabilitiesLine -CapabilityText (Format-ModelCapabilities -ModelEntry $SelectedModel)
         foreach ($DetailLine in @(Get-ModelSwitchTimingDetailLines -ModelEntry $SelectedModel)) {
             Write-Host $DetailLine
         }
@@ -3843,7 +3903,7 @@ function Show-LaunchConfigGrid {
 
         Write-Host ""
         Write-Host ("Model        : {0}" -f $Config.ModelName) -ForegroundColor Cyan
-        Write-Host ("Capabilities : {0}" -f $Config.ModelCapabilities)
+        Write-ModelCapabilitiesLine -CapabilityText $Config.ModelCapabilities
         Write-Host ("Model Path   : {0}" -f (Get-FitText -Text $Config.ModelPath -Width ([Math]::Max(40, $Width - 16))))
         Write-Host ""
         Write-Host "Esc returns to the main menu. Start Launch begins with the current settings." -ForegroundColor Yellow
@@ -5155,6 +5215,45 @@ function Format-BackgroundStartupStageSegment {
     return $Segment
 }
 
+function Get-BackgroundStartupProgressPrefix {
+    param(
+        [int]$Tick,
+        [switch]$Ready
+    )
+
+    $SpinnerFrames = @("|", "/", "-", "\")
+    if ($Ready) {
+        return "Ready     "
+    }
+
+    return "Loading {0}" -f $SpinnerFrames[$Tick % $SpinnerFrames.Count]
+}
+
+function Get-BackgroundStartupStageSegments {
+    param(
+        [psobject]$ProgressInfo
+    )
+
+    return @(
+        [pscustomobject]@{
+            Text      = Format-BackgroundStartupStageSegment -Label "Disk" -State $ProgressInfo.DiskState -Detail $ProgressInfo.DiskDetail
+            Highlight = $ProgressInfo.DiskState -eq "done"
+        },
+        [pscustomobject]@{
+            Text      = Format-BackgroundStartupStageSegment -Label "RAM" -State $ProgressInfo.MemoryState -Detail $ProgressInfo.MemoryDetail
+            Highlight = $ProgressInfo.MemoryState -eq "done"
+        },
+        [pscustomobject]@{
+            Text      = Format-BackgroundStartupStageSegment -Label "GPU" -State $ProgressInfo.GpuState -Detail $ProgressInfo.GpuDetail
+            Highlight = $ProgressInfo.GpuState -eq "done"
+        },
+        [pscustomobject]@{
+            Text      = Format-BackgroundStartupStageSegment -Label "Server" -State $ProgressInfo.ServiceState -Detail $ProgressInfo.ServiceDetail
+            Highlight = $ProgressInfo.ServiceState -eq "done"
+        }
+    )
+}
+
 function Format-BackgroundStartupProgressLine {
     param(
         [psobject]$ProgressInfo,
@@ -5162,16 +5261,94 @@ function Format-BackgroundStartupProgressLine {
         [switch]$Ready
     )
 
-    $SpinnerFrames = @("|", "/", "-", "\")
-    $Prefix = if ($Ready) { "Ready     " } else { "Loading {0}" -f $SpinnerFrames[$Tick % $SpinnerFrames.Count] }
-    $Segments = @(
-        (Format-BackgroundStartupStageSegment -Label "Disk" -State $ProgressInfo.DiskState -Detail $ProgressInfo.DiskDetail),
-        (Format-BackgroundStartupStageSegment -Label "RAM" -State $ProgressInfo.MemoryState -Detail $ProgressInfo.MemoryDetail),
-        (Format-BackgroundStartupStageSegment -Label "GPU" -State $ProgressInfo.GpuState -Detail $ProgressInfo.GpuDetail),
-        (Format-BackgroundStartupStageSegment -Label "Server" -State $ProgressInfo.ServiceState -Detail $ProgressInfo.ServiceDetail)
-    )
+    $Prefix = Get-BackgroundStartupProgressPrefix -Tick $Tick -Ready:$Ready
+    $Segments = @(Get-BackgroundStartupStageSegments -ProgressInfo $ProgressInfo | ForEach-Object { $_.Text })
 
     return "{0}  {1}" -f $Prefix, ($Segments -join " | ")
+}
+
+function Add-BackgroundStartupDisplayPart {
+    param(
+        [System.Collections.Generic.List[object]]$Parts,
+        [string]$Text,
+        [bool]$Highlight,
+        [ref]$Remaining
+    )
+
+    if ($Remaining.Value -le 0 -or [string]::IsNullOrEmpty($Text)) {
+        return
+    }
+
+    $FitText = Get-FitText -Text $Text -Width $Remaining.Value
+    if ([string]::IsNullOrEmpty($FitText)) {
+        return
+    }
+
+    $Parts.Add([pscustomobject]@{
+            Text      = $FitText
+            Highlight = $Highlight
+        }) | Out-Null
+    $Remaining.Value = [Math]::Max(0, $Remaining.Value - $FitText.Length)
+}
+
+function Write-BackgroundStartupProgress {
+    param(
+        [psobject]$ProgressInfo,
+        [int]$Tick,
+        [switch]$Ready,
+        [switch]$Complete
+    )
+
+    $Text = Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick -Ready:$Ready
+    if (-not (Test-InteractiveConsole)) {
+        Write-BackgroundStartupProgressLine -Text $Text -Complete:$Complete
+        return
+    }
+
+    $Width = [Math]::Max(40, (Get-ConsoleWidth) - 1)
+    $Parts = New-Object System.Collections.Generic.List[object]
+    $Remaining = $Width
+    $Prefix = Get-BackgroundStartupProgressPrefix -Tick $Tick -Ready:$Ready
+    $Segments = @(Get-BackgroundStartupStageSegments -ProgressInfo $ProgressInfo)
+
+    Add-BackgroundStartupDisplayPart -Parts $Parts -Text $Prefix -Highlight $false -Remaining ([ref]$Remaining)
+
+    for ($Index = 0; $Index -lt $Segments.Count; $Index++) {
+        Add-BackgroundStartupDisplayPart -Parts $Parts -Text $(if ($Index -eq 0) { "  " } else { " | " }) -Highlight $false -Remaining ([ref]$Remaining)
+        Add-BackgroundStartupDisplayPart -Parts $Parts -Text $Segments[$Index].Text -Highlight ([bool]$Segments[$Index].Highlight) -Remaining ([ref]$Remaining)
+
+        if ($Remaining -le 0) {
+            break
+        }
+    }
+
+    $DisplayText = ($Parts | ForEach-Object { $_.Text }) -join ""
+    $PaddingLength = [Math]::Max(0, $script:BackgroundStartupProgressLineLength - $DisplayText.Length)
+    if ($PaddingLength -gt 0) {
+        $Parts.Add([pscustomobject]@{
+                Text      = " " * $PaddingLength
+                Highlight = $false
+            }) | Out-Null
+    }
+
+    Write-Host "`r" -NoNewline
+    foreach ($Part in $Parts) {
+        if ($Part.Highlight) {
+            Write-Host $Part.Text -ForegroundColor Black -BackgroundColor White -NoNewline
+        }
+        else {
+            Write-Host $Part.Text -NoNewline
+        }
+    }
+
+    $script:BackgroundStartupProgressLineLength = [Math]::Max($script:BackgroundStartupProgressLineLength, $DisplayText.Length)
+    $script:BackgroundStartupProgressLastText = $DisplayText
+
+    if ($Complete) {
+        Write-Host ""
+        $script:BackgroundStartupProgressLineLength = 0
+        $script:BackgroundStartupProgressLastText = $null
+    }
 }
 
 function Write-BackgroundStartupProgressLine {
@@ -5236,14 +5413,14 @@ function Wait-ForBackgroundServerReadyWithProgress {
 
         if ($ServerReady) {
             $ProgressInfo = Get-BackgroundStartupProgressInfo -LogPath $StdErrLog -ServerReady
-            Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick -Ready) -Complete
+            Write-BackgroundStartupProgress -ProgressInfo $ProgressInfo -Tick $Tick -Ready -Complete
             return [pscustomobject]@{
                 State     = "Ready"
                 ProcessId = if ($CandidateProcess) { [int]$CandidateProcess.ProcessId } elseif ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }
             }
         }
 
-        Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick)
+        Write-BackgroundStartupProgress -ProgressInfo $ProgressInfo -Tick $Tick
 
         try {
             $Process.Refresh()
@@ -5252,7 +5429,7 @@ function Wait-ForBackgroundServerReadyWithProgress {
         }
 
         if (($Process -and $Process.HasExited) -and -not $CandidateProcess) {
-            Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick) -Complete
+            Write-BackgroundStartupProgress -ProgressInfo $ProgressInfo -Tick $Tick -Complete
 
             $FailureLog = Get-LogTailText -Path $StdErrLog
             if (-not $FailureLog) {
@@ -5268,7 +5445,7 @@ function Wait-ForBackgroundServerReadyWithProgress {
         }
 
         if ($Deadline -and (Get-Date) -ge $Deadline) {
-            Write-BackgroundStartupProgressLine -Text (Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick) -Complete
+            Write-BackgroundStartupProgress -ProgressInfo $ProgressInfo -Tick $Tick -Complete
             return [pscustomobject]@{
                 State     = "Loading"
                 ProcessId = if ($CandidateProcess) { [int]$CandidateProcess.ProcessId } elseif ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }

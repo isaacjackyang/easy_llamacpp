@@ -118,6 +118,9 @@ set "OPENCLAW_GATEWAY_PORT=$GatewayPort"
 set "OPENCLAW_WINDOWS_TASK_NAME=OpenClaw Gateway"
 set "OPENCLAW_SERVICE_MARKER=openclaw"
 set "OPENCLAW_SERVICE_KIND=gateway"
+set "OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY=1"
+set "OPENCLAW_TELEGRAM_DNS_RESULT_ORDER=ipv4first"
+set "OPENCLAW_TELEGRAM_FORCE_IPV4=1"
 set "EASY_LLAMACPP_ROOT=$EasyLlamacppRoot"
 set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
@@ -191,6 +194,70 @@ function Sync-OpenClawManagedGatewayCmd {
   }
 }
 
+function Sync-OpenClawManagedNodeCmdTelegramEnv {
+  param(
+    [Parameter(Mandatory = $true)][string]$NodeCmdPath,
+    [string]$BackupSuffix = "managed-node-telegram-env"
+  )
+
+  if (-not (Test-Path -LiteralPath $NodeCmdPath)) {
+    return [pscustomobject]@{
+      Description = "node launcher Telegram network env"
+      Path = $NodeCmdPath
+      Status = "template-missing"
+      Changed = $false
+      BackupPath = $null
+      SourcePath = $null
+    }
+  }
+
+  $originalText = Get-Content -LiteralPath $NodeCmdPath -Raw
+  $normalizedText = [regex]::Replace(
+    $originalText,
+    '(?m)^set "OPENCLAW_TELEGRAM_(?:DISABLE_AUTO_SELECT_FAMILY|DNS_RESULT_ORDER|FORCE_IPV4)=[^"]*"\r?\n',
+    ''
+  )
+  $envLines = @(
+    'set "OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY=1"',
+    'set "OPENCLAW_TELEGRAM_DNS_RESULT_ORDER=ipv4first"',
+    'set "OPENCLAW_TELEGRAM_FORCE_IPV4=1"'
+  ) -join [Environment]::NewLine
+
+  if ($normalizedText -match '(?m)^set "OPENCLAW_SERVICE_KIND=node"\r?$') {
+    $updatedText = [regex]::Replace(
+      $normalizedText,
+      '(?m)^set "OPENCLAW_SERVICE_KIND=node"\r?$',
+      "set `"OPENCLAW_SERVICE_KIND=node`"$([Environment]::NewLine)$envLines",
+      1
+    )
+  } else {
+    $updatedText = $normalizedText.TrimEnd() + [Environment]::NewLine + $envLines + [Environment]::NewLine
+  }
+
+  if ([string]::Equals($originalText, $updatedText, [System.StringComparison]::Ordinal)) {
+    return [pscustomobject]@{
+      Description = "node launcher Telegram network env"
+      Path = $NodeCmdPath
+      Status = "unchanged"
+      Changed = $false
+      BackupPath = $null
+      SourcePath = $null
+    }
+  }
+
+  $backupPath = Backup-OpenClawManagedTextFile -Path $NodeCmdPath -Suffix $BackupSuffix
+  Write-OpenClawManagedUtf8NoBom -Path $NodeCmdPath -Text $updatedText
+
+  return [pscustomobject]@{
+    Description = "node launcher Telegram network env"
+    Path = $NodeCmdPath
+    Status = "updated"
+    Changed = $true
+    BackupPath = $backupPath
+    SourcePath = $null
+  }
+}
+
 function Sync-OpenClawManagedStartupAssets {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -206,9 +273,16 @@ function Sync-OpenClawManagedStartupAssets {
   $sessionPatchScriptName = "patch-openclaw-session-display.mjs"
   $managedGatewayTemplatePath = Join-Path $templateDir $managedGatewayScriptName
   $sessionPatchTemplatePath = Join-Path $templateDir $sessionPatchScriptName
+  $workspaceToolsTemplatePath = Join-Path $templateDir "TOOLS.md"
   $managedGatewayScriptPath = Join-Path $scriptsDir $managedGatewayScriptName
   $sessionPatchScriptPath = Join-Path $scriptsDir $sessionPatchScriptName
   $gatewayCmdPath = Join-Path $OpenClawRoot "gateway.cmd"
+  $nodeCmdPath = Join-Path $OpenClawRoot "node.cmd"
+  $workspaceToolsPaths = @(
+    (Join-Path $OpenClawRoot "workspace\TOOLS.md"),
+    (Join-Path $OpenClawRoot "workspace-worker1\TOOLS.md"),
+    (Join-Path $OpenClawRoot "workspace-worker2\TOOLS.md")
+  )
 
   $results = New-Object System.Collections.Generic.List[object]
   $results.Add((Sync-OpenClawManagedTextFileFromTemplate `
@@ -221,6 +295,13 @@ function Sync-OpenClawManagedStartupAssets {
     -DestinationPath $sessionPatchScriptPath `
     -Description "control-ui session patch" `
     -BackupSuffix "control-ui-session-patch"))
+  foreach ($workspaceToolsPath in $workspaceToolsPaths) {
+    $results.Add((Sync-OpenClawManagedTextFileFromTemplate `
+      -SourcePath $workspaceToolsTemplatePath `
+      -DestinationPath $workspaceToolsPath `
+      -Description "compact workspace TOOLS.md" `
+      -BackupSuffix "compact-tools-bootstrap"))
+  }
   $results.Add((Sync-OpenClawManagedGatewayCmd `
     -GatewayCmdPath $gatewayCmdPath `
     -OpenClawRoot $OpenClawRoot `
@@ -228,6 +309,8 @@ function Sync-OpenClawManagedStartupAssets {
     -ManagedGatewayScriptPath $managedGatewayScriptPath `
     -EasyLlamacppRoot $EasyLlamacppRoot `
     -GatewayPort $GatewayPort))
+  $results.Add((Sync-OpenClawManagedNodeCmdTelegramEnv `
+    -NodeCmdPath $nodeCmdPath))
 
   return $results.ToArray()
 }
@@ -249,6 +332,62 @@ function Test-OpenClawNodeContainsGraphitiReference {
   } catch {
     return $false
   }
+}
+
+function Set-OpenClawJsonNoteProperty {
+  param(
+    [Parameter(Mandatory = $true)][object]$Node,
+    [Parameter(Mandatory = $true)][string]$Name,
+    [AllowNull()]$Value
+  )
+
+  if (-not ($Node -is [pscustomobject])) {
+    return $false
+  }
+
+  if ($Node.PSObject.Properties.Name -contains $Name) {
+    if ($Node.$Name -eq $Value) {
+      return $false
+    }
+
+    $Node.$Name = $Value
+    return $true
+  }
+
+  $Node | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+  return $true
+}
+
+function Ensure-OpenClawTelegramNetworkConfig {
+  param([Parameter(Mandatory = $true)][object]$Config)
+
+  $changedKeys = New-Object System.Collections.Generic.List[string]
+
+  if (-not ($Config.PSObject.Properties.Name -contains "channels") -or -not ($Config.channels -is [pscustomobject])) {
+    $Config | Add-Member -NotePropertyName channels -NotePropertyValue ([pscustomobject]@{})
+  }
+
+  if (-not ($Config.channels.PSObject.Properties.Name -contains "telegram") -or -not ($Config.channels.telegram -is [pscustomobject])) {
+    $Config.channels | Add-Member -NotePropertyName telegram -NotePropertyValue ([pscustomobject]@{})
+  }
+
+  if (-not ($Config.channels.telegram.PSObject.Properties.Name -contains "network") -or -not ($Config.channels.telegram.network -is [pscustomobject])) {
+    $Config.channels.telegram | Add-Member -NotePropertyName network -NotePropertyValue ([pscustomobject]@{})
+    $changedKeys.Add("channels.telegram.network")
+  }
+
+  if (Set-OpenClawJsonNoteProperty -Node $Config.channels.telegram.network -Name "autoSelectFamily" -Value $false) {
+    $changedKeys.Add("channels.telegram.network.autoSelectFamily")
+  }
+  if (Set-OpenClawJsonNoteProperty -Node $Config.channels.telegram.network -Name "dnsResultOrder" -Value "ipv4first") {
+    $changedKeys.Add("channels.telegram.network.dnsResultOrder")
+  }
+  if ($Config.channels.telegram.network.PSObject.Properties.Name -contains "forceIpv4") {
+    [void]$Config.channels.telegram.network.PSObject.Properties.Remove("forceIpv4")
+    $changedKeys.Add("channels.telegram.network.forceIpv4")
+  }
+
+  return $changedKeys.ToArray()
 }
 
 function Remove-OpenClawLegacyGraphitiPluginConfig {
