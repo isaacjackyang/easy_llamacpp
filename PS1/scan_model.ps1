@@ -183,6 +183,102 @@ function Get-GgufArchitectureHint {
     return $Architecture
 }
 
+function Test-MmprojFilePath {
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    $FileName = [System.IO.Path]::GetFileName($Path)
+    return ($FileName -match '(?i)(^|[-_.])mmproj([-_.]|$)')
+}
+
+function Get-MmprojNameTokens {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($Text).ToLowerInvariant()
+    $BaseName = $BaseName -replace 'mmproj', ' '
+    $Tokens = [regex]::Matches($BaseName, '[a-z0-9]+') | ForEach-Object { $_.Value }
+    $StopTokens = @(
+        "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9",
+        "k", "m", "s", "l", "xl", "xs", "p", "0", "1",
+        "f16", "fp16", "bf16", "gguf", "uncensored"
+    )
+
+    return @($Tokens | Where-Object { $_ -and ($StopTokens -notcontains $_) } | Select-Object -Unique)
+}
+
+function Get-MmprojTokenMatchScore {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModelPath,
+        [Parameter(Mandatory = $true)][string]$ProjectorPath
+    )
+
+    $ModelTokens = @(Get-MmprojNameTokens -Text $ModelPath)
+    $ProjectorTokens = @(Get-MmprojNameTokens -Text $ProjectorPath)
+    if ($ModelTokens.Count -eq 0 -or $ProjectorTokens.Count -eq 0) {
+        return 0
+    }
+
+    $Score = 0
+    foreach ($Token in $ModelTokens) {
+        if ($ProjectorTokens -contains $Token) {
+            $Score += 10
+        }
+    }
+
+    $ModelName = ([System.IO.Path]::GetFileNameWithoutExtension($ModelPath)).ToLowerInvariant()
+    $ProjectorName = ([System.IO.Path]::GetFileNameWithoutExtension($ProjectorPath)).ToLowerInvariant()
+    $ProjectorName = $ProjectorName -replace '^mmproj[-_. ]*', ''
+    $Limit = [Math]::Min($ModelName.Length, $ProjectorName.Length)
+    for ($Index = 0; $Index -lt $Limit; $Index++) {
+        if ($ModelName[$Index] -ne $ProjectorName[$Index]) {
+            break
+        }
+
+        $Score += 1
+    }
+
+    return $Score
+}
+
+function Find-MmprojForModel {
+    param([Parameter(Mandatory = $true)][string]$ModelPath)
+
+    if ([string]::IsNullOrWhiteSpace($ModelPath) -or -not (Test-Path -LiteralPath $ModelPath -PathType Leaf)) {
+        return $null
+    }
+    if (Test-MmprojFilePath -Path $ModelPath) {
+        return $null
+    }
+
+    $ModelDirectory = Split-Path -Parent $ModelPath
+    if ([string]::IsNullOrWhiteSpace($ModelDirectory) -or -not (Test-Path -LiteralPath $ModelDirectory -PathType Container)) {
+        return $null
+    }
+
+    $Projectors = @(Get-ChildItem -LiteralPath $ModelDirectory -File -Filter "*mmproj*.gguf" -ErrorAction SilentlyContinue)
+    if ($Projectors.Count -eq 0) {
+        return $null
+    }
+
+    $SelectedProjector = @(
+        foreach ($Projector in $Projectors) {
+            [pscustomobject]@{
+                Path  = $Projector.FullName
+                Score = Get-MmprojTokenMatchScore -ModelPath $ModelPath -ProjectorPath $Projector.FullName
+            }
+        }
+    ) | Sort-Object Score -Descending | Select-Object -First 1
+
+    if ($SelectedProjector -and $SelectedProjector.Score -gt 0) {
+        return [string]$SelectedProjector.Path
+    }
+
+    return $null
+}
+
 function Get-ModelCapabilities {
     param(
         [Parameter(Mandatory = $true)]
@@ -208,7 +304,7 @@ function Get-ModelCapabilities {
 
     $IsRerank = $Normalized -match $RerankPattern
     $IsEmbedding = (-not $IsRerank) -and ($Normalized -match $EmbeddingPattern)
-    $IsVision = ($Normalized -match $VisionPattern) -or ($NormalizedArchitecture -match $ArchitectureVisionPattern)
+    $IsVision = ($Normalized -match $VisionPattern) -or ($NormalizedArchitecture -match $ArchitectureVisionPattern) -or (-not [string]::IsNullOrWhiteSpace((Find-MmprojForModel -ModelPath $ModelPath)))
     $IsReasoning = $Normalized -match $ReasoningPattern
     $IsVideo = $Normalized -match $VideoPattern
     $IsVoice = $Normalized -match $VoicePattern
@@ -240,7 +336,25 @@ if (-not (Test-Path -LiteralPath $JsonRoot -PathType Container)) {
 }
 
 $IndexPath = Join-Path -Path $JsonRoot -ChildPath "model-index.json"
-$ModelFiles = @(Get-ChildItem -LiteralPath $ProjectRoot -Filter "*.gguf" -File | Sort-Object Name)
+$ExistingByPath = @{}
+if (Test-Path -LiteralPath $IndexPath -PathType Leaf) {
+    try {
+        $ExistingIndex = Get-Content -LiteralPath $IndexPath -Raw | ConvertFrom-Json
+        foreach ($ExistingModel in @($ExistingIndex.models)) {
+            if ($ExistingModel.PSObject.Properties["path"]) {
+                $ExistingByPath[[string]$ExistingModel.path.ToLowerInvariant()] = $ExistingModel
+            }
+        }
+    }
+    catch {
+    }
+}
+
+$ModelFiles = @(
+    Get-ChildItem -LiteralPath $ProjectRoot -Filter "*.gguf" -File |
+        Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) } |
+        Sort-Object Name
+)
 
 if ($ModelFiles.Count -eq 0) {
     Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f $ProjectRoot)
@@ -251,14 +365,27 @@ $UsedIds = @{}
 $Models = @(
     foreach ($File in $ModelFiles) {
         $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($File.Name)
+        $MmprojPath = Find-MmprojForModel -ModelPath $File.FullName
 
-        [ordered]@{
+        $Entry = [ordered]@{
             id           = New-ModelId -Name $BaseName -UsedIds $UsedIds
             name         = $BaseName
             path         = $File.FullName
-            capabilities = Get-ModelCapabilities -ModelName $BaseName -ModelPath $File.FullName
-            notes        = "Auto-generated by scan_model.ps1."
         }
+        if (-not [string]::IsNullOrWhiteSpace($MmprojPath)) {
+            $Entry["mmproj_path"] = $MmprojPath
+        }
+
+        $Entry["capabilities"] = Get-ModelCapabilities -ModelName $BaseName -ModelPath $File.FullName
+        $ExistingKey = $File.FullName.ToLowerInvariant()
+        if ($ExistingByPath.ContainsKey($ExistingKey)) {
+            $ExistingEntry = $ExistingByPath[$ExistingKey]
+            if ($ExistingEntry.PSObject.Properties["generation"]) {
+                $Entry["generation"] = $ExistingEntry.generation
+            }
+        }
+        $Entry["notes"] = "Auto-generated by scan_model.ps1."
+        $Entry
     }
 )
 

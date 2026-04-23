@@ -106,8 +106,6 @@ function Get-OpenClawManagedGatewayCmdTemplate {
     [int]$GatewayPort = 29644
   )
 
-  $agentMemoryCmdPath = Join-Path $OpenClawRoot "agentmemory.cmd"
-
   return @"
 @echo off
 setlocal
@@ -126,11 +124,6 @@ set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 if not exist "%POWERSHELL_EXE%" (
   set "POWERSHELL_EXE=powershell.exe"
-)
-
-if exist "$agentMemoryCmdPath" (
-  powershell.exe -NoProfile -Command "try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3111/agentmemory/health' -TimeoutSec 2 | Out-Null; exit 0 } catch { exit 1 }" >nul 2>&1
-  if errorlevel 1 cmd.exe /c start "" /min "$agentMemoryCmdPath"
 )
 
 "%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$ManagedGatewayScriptPath"
@@ -385,6 +378,84 @@ function Ensure-OpenClawTelegramNetworkConfig {
   if ($Config.channels.telegram.network.PSObject.Properties.Name -contains "forceIpv4") {
     [void]$Config.channels.telegram.network.PSObject.Properties.Remove("forceIpv4")
     $changedKeys.Add("channels.telegram.network.forceIpv4")
+  }
+
+  return $changedKeys.ToArray()
+}
+
+function Test-OpenClawTelegramConfigured {
+  param([Parameter(Mandatory = $true)][object]$Config)
+
+  if (-not ($Config.PSObject.Properties.Name -contains "channels") -or
+      -not ($Config.channels -is [pscustomobject]) -or
+      -not ($Config.channels.PSObject.Properties.Name -contains "telegram") -or
+      -not ($Config.channels.telegram -is [pscustomobject])) {
+    return $false
+  }
+
+  $telegram = $Config.channels.telegram
+  foreach ($propertyName in @("token", "botToken", "tokenFile")) {
+    if ($telegram.PSObject.Properties.Name -contains $propertyName -and
+        -not [string]::IsNullOrWhiteSpace([string]$telegram.$propertyName)) {
+      return $true
+    }
+  }
+
+  if ($telegram.PSObject.Properties.Name -contains "accounts" -and $telegram.accounts -is [pscustomobject]) {
+    foreach ($accountName in $telegram.accounts.PSObject.Properties.Name) {
+      $account = $telegram.accounts.$accountName
+      if (-not ($account -is [pscustomobject])) {
+        continue
+      }
+
+      foreach ($propertyName in @("token", "botToken", "tokenFile")) {
+        if ($account.PSObject.Properties.Name -contains $propertyName -and
+            -not [string]::IsNullOrWhiteSpace([string]$account.$propertyName)) {
+          return $true
+        }
+      }
+    }
+  }
+
+  return $false
+}
+
+function Ensure-OpenClawTelegramEnabledConfig {
+  param([Parameter(Mandatory = $true)][object]$Config)
+
+  $changedKeys = New-Object System.Collections.Generic.List[string]
+  if (-not (Test-OpenClawTelegramConfigured -Config $Config)) {
+    return $changedKeys.ToArray()
+  }
+
+  if (-not ($Config.channels.telegram.PSObject.Properties.Name -contains "enabled") -or
+      $Config.channels.telegram.enabled -ne $true) {
+    Set-OpenClawJsonNoteProperty -Node $Config.channels.telegram -Name "enabled" -Value $true | Out-Null
+    $changedKeys.Add("channels.telegram.enabled")
+  }
+
+  if ($Config.PSObject.Properties.Name -contains "plugins" -and $Config.plugins -is [pscustomobject]) {
+    if ($Config.plugins.PSObject.Properties.Name -contains "allow") {
+      $allowedPlugins = @($Config.plugins.allow | ForEach-Object { [string]$_ })
+      if ($allowedPlugins -notcontains "telegram") {
+        $Config.plugins.allow = @($allowedPlugins + "telegram")
+        $changedKeys.Add("plugins.allow")
+      }
+    }
+
+    if ($Config.plugins.PSObject.Properties.Name -contains "entries" -and $Config.plugins.entries -is [pscustomobject]) {
+      if (-not ($Config.plugins.entries.PSObject.Properties.Name -contains "telegram") -or
+          -not ($Config.plugins.entries.telegram -is [pscustomobject])) {
+        $Config.plugins.entries | Add-Member -NotePropertyName "telegram" -NotePropertyValue ([pscustomobject]@{}) -Force
+        $changedKeys.Add("plugins.entries.telegram")
+      }
+
+      if (-not ($Config.plugins.entries.telegram.PSObject.Properties.Name -contains "enabled") -or
+          $Config.plugins.entries.telegram.enabled -ne $true) {
+        Set-OpenClawJsonNoteProperty -Node $Config.plugins.entries.telegram -Name "enabled" -Value $true | Out-Null
+        $changedKeys.Add("plugins.entries.telegram.enabled")
+      }
+    }
   }
 
   return $changedKeys.ToArray()

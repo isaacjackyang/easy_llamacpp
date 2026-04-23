@@ -11,6 +11,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $openClawSupportPath = Join-Path $PSScriptRoot "OpenClawSupport.ps1"
 $llamaModelsUrl = "http://127.0.0.1:8080/v1/models"
+$modelIndexPath = Join-Path $projectRoot "json\model-index.json"
 $llamaStdErrLogPath = Join-Path $projectRoot "logs\llama-server.stderr.log"
 $llamaPidPath = Join-Path $projectRoot "logs\llama-server.pid"
 $openClawRoot = Join-Path $env:USERPROFILE ".openclaw"
@@ -115,6 +116,79 @@ function Remove-DeprecatedOpenClawConfigKeys {
   }
 
   return @($removedKeys)
+}
+
+function Disable-OpenClawHeavyStartupPlugins {
+  param([Parameter(Mandatory = $true)][object]$Config)
+
+  $changedKeys = New-Object System.Collections.Generic.List[string]
+  $heavyPlugins = @("agentmemory", "browser", "openclaw-web-search", "voice-call")
+
+  if ($Config.PSObject.Properties.Name -contains "browser" -and $Config.browser -is [pscustomobject]) {
+    if ($Config.browser.PSObject.Properties.Name -contains "enabled" -and $Config.browser.enabled -ne $false) {
+      $Config.browser.enabled = $false
+      $changedKeys.Add("browser.enabled")
+    }
+  }
+
+  if ($Config.PSObject.Properties.Name -contains "hooks" -and
+      $Config.hooks -is [pscustomobject] -and
+      $Config.hooks.PSObject.Properties.Name -contains "internal" -and
+      $Config.hooks.internal -is [pscustomobject] -and
+      $Config.hooks.internal.PSObject.Properties.Name -contains "enabled" -and
+      $Config.hooks.internal.enabled -ne $false) {
+    $Config.hooks.internal.enabled = $false
+    $changedKeys.Add("hooks.internal.enabled")
+  }
+
+  if (-not ($Config.PSObject.Properties.Name -contains "plugins") -or -not ($Config.plugins -is [pscustomobject])) {
+    return @($changedKeys)
+  }
+
+  if ($Config.plugins.PSObject.Properties.Name -contains "allow") {
+    $allowedPlugins = @($Config.plugins.allow | ForEach-Object { [string]$_ })
+    $updatedAllowedPlugins = @($allowedPlugins | Where-Object { $heavyPlugins -notcontains $_ })
+    if ($updatedAllowedPlugins.Count -ne $allowedPlugins.Count) {
+      $Config.plugins.allow = @($updatedAllowedPlugins)
+      $changedKeys.Add("plugins.allow")
+    }
+  }
+
+  if ($Config.plugins.PSObject.Properties.Name -contains "load" -and
+      $Config.plugins.load -is [pscustomobject] -and
+      $Config.plugins.load.PSObject.Properties.Name -contains "paths") {
+    $loadPaths = @($Config.plugins.load.paths | ForEach-Object { [string]$_ })
+    $updatedLoadPaths = @($loadPaths | Where-Object { $_ -notmatch '(?i)openclaw-web-search|voice-call|browser' })
+    if ($updatedLoadPaths.Count -ne $loadPaths.Count) {
+      $Config.plugins.load.paths = @($updatedLoadPaths)
+      $changedKeys.Add("plugins.load.paths")
+    }
+  }
+
+  if ($Config.plugins.PSObject.Properties.Name -contains "entries" -and $Config.plugins.entries -is [pscustomobject]) {
+    foreach ($pluginName in $heavyPlugins) {
+      if (-not ($Config.plugins.entries.PSObject.Properties.Name -contains $pluginName)) {
+        continue
+      }
+
+      $entry = $Config.plugins.entries.$pluginName
+      if (-not ($entry -is [pscustomobject])) {
+        continue
+      }
+
+      if ($entry.PSObject.Properties.Name -contains "enabled") {
+        if ($entry.enabled -ne $false) {
+          $entry.enabled = $false
+          $changedKeys.Add("plugins.entries.$pluginName.enabled")
+        }
+      } else {
+        $entry | Add-Member -NotePropertyName "enabled" -NotePropertyValue $false
+        $changedKeys.Add("plugins.entries.$pluginName.enabled")
+      }
+    }
+  }
+
+  return @($changedKeys)
 }
 
 function Ensure-ManagedOpenClawStartupAssets {
@@ -409,6 +483,300 @@ function Get-LlamaCppProviderNode {
   throw "Could not find a llama-cpp provider node in the JSON payload."
 }
 
+function Test-MmprojFilePath {
+  param([AllowNull()][string]$Path)
+
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    return $false
+  }
+
+  $fileName = [System.IO.Path]::GetFileName($Path)
+  return ($fileName -match '(?i)(^|[-_.])mmproj([-_.]|$)')
+}
+
+function Get-MmprojNameTokens {
+  param([Parameter(Mandatory = $true)][string]$Text)
+
+  $baseName = [System.IO.Path]::GetFileNameWithoutExtension($Text).ToLowerInvariant()
+  $baseName = $baseName -replace 'mmproj', ' '
+  $tokens = [regex]::Matches($baseName, '[a-z0-9]+') | ForEach-Object { $_.Value }
+  $stopTokens = @(
+    "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9",
+    "k", "m", "s", "l", "xl", "xs", "p", "0", "1",
+    "f16", "fp16", "bf16", "gguf", "uncensored"
+  )
+
+  return @($tokens | Where-Object { $_ -and ($stopTokens -notcontains $_) } | Select-Object -Unique)
+}
+
+function Get-MmprojTokenMatchScore {
+  param(
+    [Parameter(Mandatory = $true)][string]$ModelPath,
+    [Parameter(Mandatory = $true)][string]$ProjectorPath
+  )
+
+  $modelTokens = @(Get-MmprojNameTokens -Text $ModelPath)
+  $projectorTokens = @(Get-MmprojNameTokens -Text $ProjectorPath)
+  if ($modelTokens.Count -eq 0 -or $projectorTokens.Count -eq 0) {
+    return 0
+  }
+
+  $score = 0
+  foreach ($token in $modelTokens) {
+    if ($projectorTokens -contains $token) {
+      $score += 10
+    }
+  }
+
+  $modelName = ([System.IO.Path]::GetFileNameWithoutExtension($ModelPath)).ToLowerInvariant()
+  $projectorName = ([System.IO.Path]::GetFileNameWithoutExtension($ProjectorPath)).ToLowerInvariant()
+  $projectorName = $projectorName -replace '^mmproj[-_. ]*', ''
+  $limit = [Math]::Min($modelName.Length, $projectorName.Length)
+  for ($index = 0; $index -lt $limit; $index += 1) {
+    if ($modelName[$index] -ne $projectorName[$index]) {
+      break
+    }
+
+    $score += 1
+  }
+
+  return $score
+}
+
+function Find-MmprojForModel {
+  param([AllowNull()][string]$ModelPath)
+
+  if ([string]::IsNullOrWhiteSpace($ModelPath) -or -not (Test-Path -LiteralPath $ModelPath -PathType Leaf)) {
+    return $null
+  }
+  if (Test-MmprojFilePath -Path $ModelPath) {
+    return $null
+  }
+
+  $modelDirectory = Split-Path -Parent $ModelPath
+  if ([string]::IsNullOrWhiteSpace($modelDirectory) -or -not (Test-Path -LiteralPath $modelDirectory -PathType Container)) {
+    return $null
+  }
+
+  $projectors = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*mmproj*.gguf" -ErrorAction SilentlyContinue)
+  if ($projectors.Count -eq 0) {
+    return $null
+  }
+
+  $selectedProjector = @(
+    foreach ($projector in $projectors) {
+      [pscustomobject]@{
+        Path = $projector.FullName
+        Score = Get-MmprojTokenMatchScore -ModelPath $ModelPath -ProjectorPath $projector.FullName
+      }
+    }
+  ) | Sort-Object Score -Descending | Select-Object -First 1
+
+  if ($selectedProjector -and $selectedProjector.Score -gt 0) {
+    return [string]$selectedProjector.Path
+  }
+
+  return $null
+}
+
+function Split-ArgumentLine {
+  param([AllowNull()][string]$Line)
+
+  if ([string]::IsNullOrWhiteSpace($Line)) {
+    return @()
+  }
+
+  $matches = [regex]::Matches($Line, '(?:"((?:[^"\\]|\\.)*)"|(\S+))')
+  return @(
+    foreach ($match in $matches) {
+      if ($match.Groups[1].Success) {
+        $match.Groups[1].Value.Replace('\"', '"')
+      } else {
+        $match.Groups[2].Value
+      }
+    }
+  )
+}
+
+function Get-RunningPrimaryLlamaMmprojPath {
+  if (-not (Test-Path -LiteralPath $llamaPidPath -PathType Leaf)) {
+    return $null
+  }
+
+  $pidText = ((Get-Content -LiteralPath $llamaPidPath -ErrorAction SilentlyContinue | Select-Object -First 1) | Out-String).Trim()
+  if ($pidText -notmatch '^\d+$') {
+    return $null
+  }
+
+  $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $pidText" -ErrorAction SilentlyContinue
+  if (-not $processInfo -or [string]::IsNullOrWhiteSpace([string]$processInfo.CommandLine)) {
+    return $null
+  }
+
+  $tokens = @(Split-ArgumentLine -Line ([string]$processInfo.CommandLine))
+  for ($index = 0; $index -lt $tokens.Count; $index += 1) {
+    $argument = [string]$tokens[$index]
+    if ($argument -match '^--mmproj=(.+)$') {
+      return $Matches[1]
+    }
+    if ($argument -eq "--mmproj" -and ($index + 1) -lt $tokens.Count) {
+      return [string]$tokens[$index + 1]
+    }
+  }
+
+  return $null
+}
+
+function Resolve-ModelPathFromRuntimeId {
+  param([Parameter(Mandatory = $true)][string]$ModelId)
+
+  if (-not (Test-Path -LiteralPath $modelIndexPath -PathType Leaf)) {
+    return $null
+  }
+
+  try {
+    $index = Get-Content -LiteralPath $modelIndexPath -Raw | ConvertFrom-Json
+  }
+  catch {
+    return $null
+  }
+
+  foreach ($entry in @($index.models)) {
+    $entryPath = if ($entry.PSObject.Properties.Name -contains "path") { [string]$entry.path } else { "" }
+    if ([string]::IsNullOrWhiteSpace($entryPath) -or -not (Test-Path -LiteralPath $entryPath -PathType Leaf)) {
+      continue
+    }
+
+    $entryFile = [System.IO.Path]::GetFileName($entryPath)
+    $entryBase = [System.IO.Path]::GetFileNameWithoutExtension($entryPath)
+    $entryName = if ($entry.PSObject.Properties.Name -contains "name") { [string]$entry.name } else { "" }
+    $entryId = if ($entry.PSObject.Properties.Name -contains "id") { [string]$entry.id } else { "" }
+
+    if ([string]::Equals($ModelId, $entryFile, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($ModelId, $entryBase, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($ModelId, $entryName, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($ModelId, $entryId, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return $entryPath
+    }
+  }
+
+  return $null
+}
+
+function Get-OrCreateModelProvidersNode {
+  param([Parameter(Mandatory = $true)][object]$Payload)
+
+  if ($Payload.PSObject.Properties.Name -contains "models" -and $Payload.models -is [pscustomobject]) {
+    if (-not ($Payload.models.PSObject.Properties.Name -contains "providers") -or $null -eq $Payload.models.providers) {
+      $Payload.models | Add-Member -NotePropertyName "providers" -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+
+    return $Payload.models.providers
+  }
+
+  if ($Payload.PSObject.Properties.Name -contains "providers" -and $Payload.providers -is [pscustomobject]) {
+    return $Payload.providers
+  }
+
+  if (-not ($Payload.PSObject.Properties.Name -contains "models") -or $null -eq $Payload.models) {
+    $Payload | Add-Member -NotePropertyName "models" -NotePropertyValue ([pscustomobject]@{}) -Force
+  }
+  $Payload.models | Add-Member -NotePropertyName "providers" -NotePropertyValue ([pscustomobject]@{}) -Force
+  return $Payload.models.providers
+}
+
+function Ensure-LlamaCppVisionModelEntry {
+  param(
+    [Parameter(Mandatory = $true)][object]$Payload,
+    [Parameter(Mandatory = $true)][string]$ModelId,
+    [Parameter(Mandatory = $true)][int]$ContextWindow,
+    [string]$BaseUrl = "http://127.0.0.1:8081/v1"
+  )
+
+  $providers = Get-OrCreateModelProvidersNode -Payload $Payload
+  if (-not ($providers.PSObject.Properties.Name -contains "llama-cpp-vision") -or $null -eq $providers.'llama-cpp-vision') {
+    $providers | Add-Member -NotePropertyName "llama-cpp-vision" -NotePropertyValue ([pscustomobject]@{}) -Force
+  }
+
+  $visionProvider = $providers.'llama-cpp-vision'
+  $visionProvider | Add-Member -NotePropertyName "baseUrl" -NotePropertyValue $BaseUrl -Force
+  $visionProvider | Add-Member -NotePropertyName "apiKey" -NotePropertyValue "llama-cpp-local" -Force
+  $visionProvider | Add-Member -NotePropertyName "api" -NotePropertyValue "openai-completions" -Force
+  if (-not ($visionProvider.PSObject.Properties.Name -contains "models") -or $null -eq $visionProvider.models) {
+    $visionProvider | Add-Member -NotePropertyName "models" -NotePropertyValue @() -Force
+  }
+
+  $models = @($visionProvider.models)
+  $entry = $models | Where-Object { $_.id -eq $ModelId } | Select-Object -First 1
+  if ($null -eq $entry) {
+    $entry = [pscustomobject]@{
+      id = $ModelId
+      name = $ModelId
+      api = "openai-completions"
+      reasoning = $false
+      input = @("text", "image")
+      cost = [pscustomobject]@{
+        input = 0
+        output = 0
+        cacheRead = 0
+        cacheWrite = 0
+      }
+      contextWindow = $ContextWindow
+      maxTokens = 2048
+    }
+    $models = @($models + $entry)
+  } else {
+    $entry.name = $ModelId
+    $entry.api = "openai-completions"
+    $entry.reasoning = $false
+    $entry.input = @("text", "image")
+    $entry.contextWindow = $ContextWindow
+    $entry.maxTokens = 2048
+    if ($null -eq $entry.cost) {
+      $entry | Add-Member -NotePropertyName cost -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $entry.cost | Add-Member -NotePropertyName "input" -NotePropertyValue 0 -Force
+    $entry.cost | Add-Member -NotePropertyName "output" -NotePropertyValue 0 -Force
+    $entry.cost | Add-Member -NotePropertyName "cacheRead" -NotePropertyValue 0 -Force
+    $entry.cost | Add-Member -NotePropertyName "cacheWrite" -NotePropertyValue 0 -Force
+  }
+
+  $visionProvider.models = @($models)
+
+  if ($Payload.PSObject.Properties.Name -contains "agents" -and
+      $Payload.agents -is [pscustomobject] -and
+      $Payload.agents.PSObject.Properties.Name -contains "defaults" -and
+      $Payload.agents.defaults -is [pscustomobject]) {
+    if (-not ($Payload.agents.defaults.PSObject.Properties.Name -contains "imageModel") -or $null -eq $Payload.agents.defaults.imageModel) {
+      $Payload.agents.defaults | Add-Member -NotePropertyName "imageModel" -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $Payload.agents.defaults.imageModel | Add-Member -NotePropertyName "primary" -NotePropertyValue "llama-cpp-vision/$ModelId" -Force
+  }
+
+  if ($Payload.PSObject.Properties.Name -contains "tools" -and
+      $Payload.tools -is [pscustomobject] -and
+      $Payload.tools.PSObject.Properties.Name -contains "media" -and
+      $Payload.tools.media -is [pscustomobject]) {
+    if (-not ($Payload.tools.media.PSObject.Properties.Name -contains "image") -or $null -eq $Payload.tools.media.image) {
+      $Payload.tools.media | Add-Member -NotePropertyName "image" -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+
+    $imageTool = $Payload.tools.media.image
+    $imageTool | Add-Member -NotePropertyName "enabled" -NotePropertyValue $true -Force
+    $imageTool | Add-Member -NotePropertyName "timeoutSeconds" -NotePropertyValue 180 -Force
+    $imageTool | Add-Member -NotePropertyName "maxChars" -NotePropertyValue 1200 -Force
+    $imageTool | Add-Member -NotePropertyName "models" -NotePropertyValue @(
+      [pscustomobject]@{
+        provider = "llama-cpp-vision"
+        model = $ModelId
+        prompt = "Describe the image in detail. If there is text, transcribe it accurately."
+        timeoutSeconds = 180
+        maxChars = 1200
+      }
+    ) -Force
+  }
+}
+
 function Ensure-LlamaCppModelEntry {
   param(
     [Parameter(Mandatory = $true)][object]$Payload,
@@ -648,7 +1016,9 @@ function Restart-OpenClawServices {
 function Show-Summary {
   param(
     [Parameter(Mandatory = $true)][string]$ModelId,
-    [Parameter(Mandatory = $true)][int]$ContextWindow
+    [Parameter(Mandatory = $true)][int]$ContextWindow,
+    [AllowNull()][string]$MmprojPath,
+    [string]$VisionBaseUrl = "http://127.0.0.1:8081/v1"
   )
 
   $llamaPid = ""
@@ -662,6 +1032,11 @@ function Show-Summary {
   Write-Host "OpenClaw Sync Summary" -ForegroundColor Green
   Write-Host "Model     : $ModelId"
   Write-Host "Primary   : llama-cpp/$ModelId"
+  if (-not [string]::IsNullOrWhiteSpace($MmprojPath)) {
+    Write-Host "Vision    : llama-cpp-vision/$ModelId"
+    Write-Host "Mmproj    : $MmprojPath"
+    Write-Host "VisionAPI : $VisionBaseUrl"
+  }
   Write-Host "Context   : $ContextWindow"
   if (-not [string]::IsNullOrWhiteSpace($llamaPid)) {
   Write-Host "PID       : $llamaPid"
@@ -711,6 +1086,10 @@ try {
 
   $runtimeModel = Get-RunningLlamaModelInfo -ModelsUrl $llamaModelsUrl
   $targetModelId = $runtimeModel.ModelId
+  $targetModelPath = Resolve-ModelPathFromRuntimeId -ModelId $targetModelId
+  $targetMmprojPath = if (-not [string]::IsNullOrWhiteSpace($targetModelPath)) { Find-MmprojForModel -ModelPath $targetModelPath } else { $null }
+  $runtimeMmprojPath = Get-RunningPrimaryLlamaMmprojPath
+  $visionProviderBaseUrl = if (-not [string]::IsNullOrWhiteSpace($runtimeMmprojPath)) { "http://127.0.0.1:8080/v1" } else { "http://127.0.0.1:8081/v1" }
   $runtimeTokenSnapshot = Get-LlamaRuntimeTokenSnapshot -Path $llamaStdErrLogPath
   $resolvedContextWindow = if ($runtimeTokenSnapshot -and $runtimeTokenSnapshot.ContextTokens) {
     [int]$runtimeTokenSnapshot.ContextTokens
@@ -721,6 +1100,12 @@ try {
   $targetPrimary = "llama-cpp/$targetModelId"
 
   Write-Ok "Detected running llama.cpp model $targetModelId"
+  if (-not [string]::IsNullOrWhiteSpace($targetMmprojPath)) {
+    Write-Ok "Detected matching vision mmproj $targetMmprojPath"
+    if (-not [string]::IsNullOrWhiteSpace($runtimeMmprojPath)) {
+      Write-Ok "Primary llama.cpp server is running with --mmproj"
+    }
+  }
   Write-Info "Resolved context window $resolvedContextWindow"
   if ($null -ne $resolvedPromptTokens) {
     Write-Info "Observed last runtime prompt tokens $resolvedPromptTokens"
@@ -728,6 +1113,12 @@ try {
 
   $config = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
   [object[]]$removedConfigKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
+  [object[]]$disabledPluginKeys = @(Disable-OpenClawHeavyStartupPlugins -Config $config)
+  [object[]]$telegramEnabledKeys = @(
+    if (Get-Command Ensure-OpenClawTelegramEnabledConfig -ErrorAction SilentlyContinue) {
+      Ensure-OpenClawTelegramEnabledConfig -Config $config
+    }
+  )
   [object[]]$telegramNetworkKeys = @(
     if (Get-Command Ensure-OpenClawTelegramNetworkConfig -ErrorAction SilentlyContinue) {
       Ensure-OpenClawTelegramNetworkConfig -Config $config
@@ -741,6 +1132,9 @@ try {
   }
 
   Ensure-LlamaCppModelEntry -Payload $config -ModelId $targetModelId -ContextWindow $resolvedContextWindow
+  if (-not [string]::IsNullOrWhiteSpace($targetMmprojPath)) {
+    Ensure-LlamaCppVisionModelEntry -Payload $config -ModelId $targetModelId -ContextWindow $resolvedContextWindow -BaseUrl $visionProviderBaseUrl
+  }
   Set-JsonNoteProperty -Node $config.agents.defaults.model -Name "primary" -Value $targetPrimary
   Set-JsonNoteProperty -Node $config.agents.defaults -Name "contextTokens" -Value $resolvedContextWindow
 
@@ -751,12 +1145,21 @@ try {
   if ($removedConfigKeys.Count -gt 0) {
     Write-Warn "Removed deprecated OpenClaw config keys: $($removedConfigKeys -join ', ')"
   }
+  if ($disabledPluginKeys.Count -gt 0) {
+    Write-Warn "Disabled heavy OpenClaw startup plugins: $($disabledPluginKeys -join ', ')"
+  }
+  if ($telegramEnabledKeys.Count -gt 0) {
+    Write-Warn "Enabled Telegram config: $($telegramEnabledKeys -join ', ')"
+  }
   if ($telegramNetworkKeys.Count -gt 0) {
     Write-Warn "Updated Telegram network config: $($telegramNetworkKeys -join ', ')"
   }
 
   $agentModels = Get-Content -LiteralPath $agentModelsPath -Raw | ConvertFrom-Json
   Ensure-LlamaCppModelEntry -Payload $agentModels -ModelId $targetModelId -ContextWindow $resolvedContextWindow
+  if (-not [string]::IsNullOrWhiteSpace($targetMmprojPath)) {
+    Ensure-LlamaCppVisionModelEntry -Payload $agentModels -ModelId $targetModelId -ContextWindow $resolvedContextWindow -BaseUrl $visionProviderBaseUrl
+  }
 
   $agentModelsBackup = Backup-File -Path $agentModelsPath -Suffix $targetModelId
   Save-JsonUtf8 -Path $agentModelsPath -Payload $agentModels
@@ -813,7 +1216,7 @@ try {
   }
 
   Write-Ok "OpenClaw is now pointed at $targetPrimary"
-  Show-Summary -ModelId $targetModelId -ContextWindow $resolvedContextWindow
+  Show-Summary -ModelId $targetModelId -ContextWindow $resolvedContextWindow -MmprojPath $targetMmprojPath -VisionBaseUrl $visionProviderBaseUrl
 } catch {
   Write-Host ""
   Write-Host "Error:" -ForegroundColor Red

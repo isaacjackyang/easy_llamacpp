@@ -270,6 +270,19 @@ function Get-ManagedMediaProcesses {
     )
 }
 
+function Get-OpenClawAgentMemoryProcesses {
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ProcessId -ne $PID -and
+                $_.CommandLine -and (
+                    $_.CommandLine -match '\.openclaw[\\/]+agentmemory\.cmd' -or
+                    $_.CommandLine -match '\.openclaw[\\/]+tools[\\/]+agentmemory'
+                )
+            }
+    )
+}
+
 function Get-VisionServiceProcesses {
     $TrackedIds = New-Object System.Collections.Generic.HashSet[int]
     if (Test-Path -LiteralPath $VisionPidFile) {
@@ -442,7 +455,8 @@ function Stop-OpenClawRuntime {
     $ProcessesToStop = @(
         @(Get-OpenClawGatewayHostProcesses) +
         @(Get-OpenClawNodeHostProcesses) +
-        @(Get-ManagedMediaProcesses)
+        @(Get-ManagedMediaProcesses) +
+        @(Get-OpenClawAgentMemoryProcesses)
     ) | Sort-Object ProcessId -Unique
 
     if ($ProcessesToStop.Count -eq 0) {
@@ -577,10 +591,10 @@ if ($RunLlamaCpp) {
 
 if ($RunOpenClaw) {
     if ($OpenClawResult.StoppedIds.Count -gt 0) {
-        Write-Ok "Stopped OpenClaw/TTS/STT process(es): $($OpenClawResult.StoppedIds -join ', ')"
+        Write-Ok "Stopped OpenClaw/TTS/STT/agentmemory process(es): $($OpenClawResult.StoppedIds -join ', ')"
     }
     else {
-        Write-Info "No OpenClaw/TTS/STT processes found."
+        Write-Info "No OpenClaw/TTS/STT/agentmemory processes found."
     }
 }
 

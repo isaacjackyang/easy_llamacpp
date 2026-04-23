@@ -192,6 +192,9 @@ If you only want to start the vision sidecar, use this; it runs `llama-server` w
 .\start_vision.cmd
 ```
 
+一般模型啟動時，`Start_LCPP.ps1` 會自動在模型同資料夾尋找最相近的 `mmproj*.gguf`。找到時主 `llama-server` 會直接加上 `--mmproj <path>` 與 `--jinja`，狀態列會顯示 `Vision : enabled on primary server`；OpenClaw 的 `llama-cpp-vision` provider 也會同步指到目前主服務。`start_vision.cmd` 仍保留給需要獨立 `8081` sidecar 的情境。
+During normal model startup, `Start_LCPP.ps1` automatically looks for the closest matching `mmproj*.gguf` beside the selected model. When found, the primary `llama-server` is launched with `--mmproj <path>` and `--jinja`, the status view shows `Vision : enabled on primary server`, and OpenClaw's `llama-cpp-vision` provider is synced to the active primary server. `start_vision.cmd` remains available for a separate `8081` sidecar when needed.
+
 若只想停止 vision sidecar，可用：  
 If you only want to stop the vision sidecar, use:
 
@@ -213,6 +216,10 @@ This sync keeps the following newer OpenClaw startup assumptions in place:
 - TTS / STT sidecars start first and report readiness, but the gateway no longer blocks indefinitely on sidecar health.
 - `gateway.cmd` 會改走 sidecar-aware 的 `run-openclaw-gateway-with-media.ps1` managed launcher。  
 - `gateway.cmd` is kept on the sidecar-aware `run-openclaw-gateway-with-media.ps1` managed launcher.
+- `start_openclaw.cmd` 會以 `openclaw gateway probe` 的 RPC 結果作為 gateway readiness；HTTP 首頁與 `openclaw status` 在這台機器上可能 timeout，不能當唯一依據。
+- `start_openclaw.cmd` uses the RPC result from `openclaw gateway probe` as gateway readiness; the HTTP root page and `openclaw status` can time out on this machine and should not be the only signal.
+- 安全啟動會暫停容易拖慢或卡住 startup 的重型外掛與 hooks：`agentmemory`、`browser`、`openclaw-web-search`、`voice-call`、internal hooks；`gateway.cmd` 也不再自動先啟動 `agentmemory.cmd`。Telegram 若已有 token/config，會保持啟用並套用 IPv4 優先設定。
+- Safe startup temporarily disables heavy startup plugins and hooks that can stall the gateway: `agentmemory`, `browser`, `openclaw-web-search`, `voice-call`, and internal hooks; `gateway.cmd` also no longer auto-starts `agentmemory.cmd`. Telegram stays enabled when token/config exists and uses the IPv4-preferred transport settings.
 - `openclaw.json` 會在同步模型前清掉舊的 graphiti / context-engine slot 註冊，但保留 install metadata。  
 - `openclaw.json` removes older graphiti / context-engine slot registrations before model sync while keeping install metadata.
 - Control UI patch 腳本會一起同步，讓前端在瀏覽器還留著舊 `gatewayUrl` 時能自動搬移到目前的 loopback websocket 位址。  

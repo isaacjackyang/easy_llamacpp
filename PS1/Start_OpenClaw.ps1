@@ -111,6 +111,79 @@ function Remove-DeprecatedOpenClawConfigKeys {
   return @($removedKeys)
 }
 
+function Disable-OpenClawHeavyStartupPlugins {
+  param([Parameter(Mandatory = $true)][object]$Config)
+
+  $changedKeys = New-Object System.Collections.Generic.List[string]
+  $heavyPlugins = @("agentmemory", "browser", "openclaw-web-search", "voice-call")
+
+  if ($Config.PSObject.Properties.Name -contains "browser" -and $Config.browser -is [pscustomobject]) {
+    if ($Config.browser.PSObject.Properties.Name -contains "enabled" -and $Config.browser.enabled -ne $false) {
+      $Config.browser.enabled = $false
+      $changedKeys.Add("browser.enabled")
+    }
+  }
+
+  if ($Config.PSObject.Properties.Name -contains "hooks" -and
+      $Config.hooks -is [pscustomobject] -and
+      $Config.hooks.PSObject.Properties.Name -contains "internal" -and
+      $Config.hooks.internal -is [pscustomobject] -and
+      $Config.hooks.internal.PSObject.Properties.Name -contains "enabled" -and
+      $Config.hooks.internal.enabled -ne $false) {
+    $Config.hooks.internal.enabled = $false
+    $changedKeys.Add("hooks.internal.enabled")
+  }
+
+  if (-not ($Config.PSObject.Properties.Name -contains "plugins") -or -not ($Config.plugins -is [pscustomobject])) {
+    return @($changedKeys)
+  }
+
+  if ($Config.plugins.PSObject.Properties.Name -contains "allow") {
+    $allowedPlugins = @($Config.plugins.allow | ForEach-Object { [string]$_ })
+    $updatedAllowedPlugins = @($allowedPlugins | Where-Object { $heavyPlugins -notcontains $_ })
+    if ($updatedAllowedPlugins.Count -ne $allowedPlugins.Count) {
+      $Config.plugins.allow = @($updatedAllowedPlugins)
+      $changedKeys.Add("plugins.allow")
+    }
+  }
+
+  if ($Config.plugins.PSObject.Properties.Name -contains "load" -and
+      $Config.plugins.load -is [pscustomobject] -and
+      $Config.plugins.load.PSObject.Properties.Name -contains "paths") {
+    $loadPaths = @($Config.plugins.load.paths | ForEach-Object { [string]$_ })
+    $updatedLoadPaths = @($loadPaths | Where-Object { $_ -notmatch '(?i)openclaw-web-search|voice-call|browser' })
+    if ($updatedLoadPaths.Count -ne $loadPaths.Count) {
+      $Config.plugins.load.paths = @($updatedLoadPaths)
+      $changedKeys.Add("plugins.load.paths")
+    }
+  }
+
+  if ($Config.plugins.PSObject.Properties.Name -contains "entries" -and $Config.plugins.entries -is [pscustomobject]) {
+    foreach ($pluginName in $heavyPlugins) {
+      if (-not ($Config.plugins.entries.PSObject.Properties.Name -contains $pluginName)) {
+        continue
+      }
+
+      $entry = $Config.plugins.entries.$pluginName
+      if (-not ($entry -is [pscustomobject])) {
+        continue
+      }
+
+      if ($entry.PSObject.Properties.Name -contains "enabled") {
+        if ($entry.enabled -ne $false) {
+          $entry.enabled = $false
+          $changedKeys.Add("plugins.entries.$pluginName.enabled")
+        }
+      } else {
+        $entry | Add-Member -NotePropertyName "enabled" -NotePropertyValue $false
+        $changedKeys.Add("plugins.entries.$pluginName.enabled")
+      }
+    }
+  }
+
+  return @($changedKeys)
+}
+
 function Ensure-ManagedOpenClawStartupAssets {
   if (-not (Get-Command Sync-OpenClawManagedStartupAssets -ErrorAction SilentlyContinue)) {
     return
@@ -152,13 +225,19 @@ function Repair-OpenClawConfigIfNeeded {
 
   $config = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
   [object[]]$removedKeys = @(Remove-DeprecatedOpenClawConfigKeys -Config $config)
+  [object[]]$disabledPluginKeys = @(Disable-OpenClawHeavyStartupPlugins -Config $config)
+  [object[]]$telegramEnabledKeys = @(
+    if (Get-Command Ensure-OpenClawTelegramEnabledConfig -ErrorAction SilentlyContinue) {
+      Ensure-OpenClawTelegramEnabledConfig -Config $config
+    }
+  )
   [object[]]$networkKeys = @(
     if (Get-Command Ensure-OpenClawTelegramNetworkConfig -ErrorAction SilentlyContinue) {
       Ensure-OpenClawTelegramNetworkConfig -Config $config
     }
   )
 
-  if ($removedKeys.Count -eq 0 -and $networkKeys.Count -eq 0) {
+  if ($removedKeys.Count -eq 0 -and $disabledPluginKeys.Count -eq 0 -and $telegramEnabledKeys.Count -eq 0 -and $networkKeys.Count -eq 0) {
     return
   }
 
@@ -166,6 +245,12 @@ function Repair-OpenClawConfigIfNeeded {
   Save-JsonUtf8 -Path $openClawConfigPath -Payload $config
   if ($removedKeys.Count -gt 0) {
     Write-Warn "Removed deprecated OpenClaw config keys: $($removedKeys -join ', ')"
+  }
+  if ($disabledPluginKeys.Count -gt 0) {
+    Write-Warn "Disabled heavy OpenClaw startup plugins: $($disabledPluginKeys -join ', ')"
+  }
+  if ($telegramEnabledKeys.Count -gt 0) {
+    Write-Warn "Enabled Telegram config: $($telegramEnabledKeys -join ', ')"
   }
   if ($networkKeys.Count -gt 0) {
     Write-Warn "Updated Telegram network config: $($networkKeys -join ', ')"
@@ -269,6 +354,121 @@ function Wait-TcpPort {
     }
 
     Start-Sleep -Seconds $ProbeIntervalSeconds
+  }
+
+  return $false
+}
+
+function Test-OpenClawGatewayProbe {
+  param(
+    [Parameter(Mandatory = $true)][string]$OpenClawCommandPath,
+    [int]$TimeoutSeconds = 45
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $probeResult = Invoke-Capture -FilePath $OpenClawCommandPath -Arguments @("gateway", "probe")
+      if ($probeResult.ExitCode -eq 0 -and $probeResult.Output -match 'Reachable:\s+yes') {
+        return $true
+      }
+    }
+    catch {
+    }
+
+    Start-Sleep -Seconds 3
+  }
+
+  return $false
+}
+
+function Test-OpenClawGatewayHttp {
+  param(
+    [string]$Url = "http://127.0.0.1:29644/",
+    [int]$TimeoutSec = 5
+  )
+
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSec
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500)
+  } catch {
+    return $false
+  }
+}
+
+function Test-OpenClawGatewayWebSocket {
+  param(
+    [string]$Url = "ws://127.0.0.1:29644/",
+    [int]$TimeoutMs = 5000
+  )
+
+  $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+  if (-not $nodeCommand) {
+    return $false
+  }
+
+  $script = @'
+const url = process.argv[1];
+const timeoutMs = Number(process.argv[2] || 5000);
+
+if (typeof WebSocket !== "function") {
+  process.exit(3);
+}
+
+let done = false;
+let timer = null;
+let socket = null;
+
+function finish(code) {
+  if (done) {
+    return;
+  }
+  done = true;
+  if (timer) {
+    clearTimeout(timer);
+  }
+  try {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.close(1000, "readiness-ok");
+    }
+  } catch {
+  }
+  setTimeout(() => process.exit(code), 25);
+}
+
+try {
+  socket = new WebSocket(url);
+  timer = setTimeout(() => finish(2), timeoutMs);
+  socket.addEventListener("open", () => finish(0));
+  socket.addEventListener("error", () => finish(1));
+} catch {
+  finish(4);
+}
+'@
+
+  try {
+    & $nodeCommand.Source "-e" $script $Url ([string]$TimeoutMs) *> $null
+    $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    return ($exitCode -eq 0)
+  } catch {
+    return $false
+  }
+}
+
+function Test-OpenClawGatewayReachable {
+  param(
+    [Parameter(Mandatory = $true)][string]$OpenClawCommandPath,
+    [int]$TimeoutSeconds = 45
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+  while ((Get-Date) -lt $deadline) {
+    if (Test-OpenClawGatewayHttp) {
+      return $true
+    }
+
+    Start-Sleep -Seconds 5
   }
 
   return $false
@@ -409,6 +609,19 @@ function Get-OpenClawNodeHostProcesses {
   )
 }
 
+function Get-OpenClawAgentMemoryProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.ProcessId -ne $PID -and
+        $_.CommandLine -and (
+          $_.CommandLine -match '\.openclaw[\\/]+agentmemory\.cmd' -or
+          $_.CommandLine -match '\.openclaw[\\/]+tools[\\/]+agentmemory'
+        )
+      }
+  )
+}
+
 function Stop-OpenClawRuntime {
   foreach ($taskName in @("OpenClaw Gateway", "OpenClaw Node")) {
     & schtasks.exe /End /TN $taskName *> $null
@@ -416,7 +629,9 @@ function Stop-OpenClawRuntime {
 
   $processesToStop = @(
     @(Get-OpenClawGatewayHostProcesses) +
-    @(Get-OpenClawNodeHostProcesses)
+    @(Get-OpenClawNodeHostProcesses) +
+    @(Get-OpenClawManagedMediaProcesses) +
+    @(Get-OpenClawAgentMemoryProcesses)
   ) | Sort-Object ProcessId -Unique
 
   foreach ($process in $processesToStop) {
@@ -521,6 +736,8 @@ function Invoke-SyncCurrentModel {
 }
 
 function Ensure-OpenClawRuntime {
+  param([Parameter(Mandatory = $true)][string]$OpenClawCommandPath)
+
   $gatewayUsesManagedMedia = Test-OpenClawGatewayUsesManagedMedia
   $gatewayReadyTimeoutSeconds = Get-OpenClawGatewayReadyTimeoutSeconds
 
@@ -547,6 +764,12 @@ function Ensure-OpenClawRuntime {
   }
 
   Write-Ok "OpenClaw gateway is listening on 127.0.0.1:29644"
+
+  if (-not (Test-OpenClawGatewayProbe -OpenClawCommandPath $OpenClawCommandPath -TimeoutSeconds $gatewayReadyTimeoutSeconds)) {
+    throw "OpenClaw gateway is listening on 127.0.0.1:29644, but the gateway RPC probe still fails."
+  }
+
+  Write-Ok "OpenClaw gateway RPC probe is reachable"
 
   if (-not (Wait-OpenClawNodeHost -TimeoutSeconds 45)) {
     Write-Warn "Node host was not detected after the service restart. Launching node.cmd directly."
@@ -611,7 +834,7 @@ try {
     Invoke-OpenClawRestart -OpenClawCommandPath $openClawCommandPath
   }
 
-  Ensure-OpenClawRuntime
+  Ensure-OpenClawRuntime -OpenClawCommandPath $openClawCommandPath
   Show-Summary -ModelSyncPerformed:$hasRunningLlama
 } catch {
   Write-Host ""

@@ -176,6 +176,7 @@ param(
     [switch]$LlamaHelp,
     [switch]$BypassMenu,
     [switch]$NoBrowser,
+    [switch]$NoAutoVision,
     [switch]$NoPause,
     [switch]$ReturnNonZeroOnError,
     [switch]$WrapperControlsPause,
@@ -221,6 +222,10 @@ $LegacyModelSwitchTimingFile = Join-Path $ScriptRoot "model-switch-times.json"
 $PidFile = Join-Path $LogRoot "llama-server.pid"
 $StdOutLog = Join-Path $LogRoot "llama-server.stdout.log"
 $StdErrLog = Join-Path $LogRoot "llama-server.stderr.log"
+$VisionStartScript = Join-Path $Ps1Root "Start_Vision_Service.ps1"
+$VisionPidFile = Join-Path $LogRoot "vision-server.pid"
+$VisionStdOutLog = Join-Path $LogRoot "vision-server.stdout.log"
+$VisionStdErrLog = Join-Path $LogRoot "vision-server.stderr.log"
 $TuningProfileFile = Join-Path $JsonRoot "model-tuning.json"
 $ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
 # Edit this line to force model scanning from a specific GGUF folder on each interactive launch.
@@ -235,6 +240,9 @@ $RawThreadsBatch = $ThreadsBatch
 $script:ModelFileSizeBytesCache = @{}
 $script:ModelFileSizeLabelCache = @{}
 $script:ModelRepeatingLayerCountCache = @{}
+$script:MmprojPathCache = @{}
+$script:LaunchMmprojPath = $null
+$script:ModelGenerationArgs = @()
 $script:LastAutoTuneProfile = $null
 $script:BackgroundStartupProgressLineLength = 0
 $script:BackgroundStartupProgressLastText = $null
@@ -292,6 +300,13 @@ function Get-ServerArgs {
     $Arguments.Add("--port")
     $Arguments.Add([string]$Port)
 
+    $script:LaunchMmprojPath = Find-MmprojForModel -ModelPath $ModelPath
+    if (-not [string]::IsNullOrWhiteSpace($script:LaunchMmprojPath)) {
+        $Arguments.Add("--mmproj")
+        $Arguments.Add($script:LaunchMmprojPath)
+        $Arguments.Add("--jinja")
+    }
+
     if (-not $AutoTuning -or -not $AutoTuning.UseManagedGpuLayers) {
         $Arguments.Add("--gpu-layers")
         $Arguments.Add($EffectiveGpuLayers)
@@ -317,6 +332,10 @@ function Get-ServerArgs {
             $Arguments.Add("--parallel")
             $Arguments.Add([string]$AutoTuning.ParallelSlots)
         }
+    }
+
+    foreach ($Argument in $script:ModelGenerationArgs) {
+        $Arguments.Add($Argument)
     }
 
     foreach ($Argument in $LlamaArgs) {
@@ -355,7 +374,10 @@ function Test-LlamaArgConflict {
         '^--n-gpu-layers$',
         '^-ngl=',
         '^--gpu-layers=',
-        '^--n-gpu-layers='
+        '^--n-gpu-layers=',
+        '^--mmproj$',
+        '^--mmproj=',
+        '^--jinja$'
     )
 
     foreach ($Argument in $Arguments) {
@@ -847,7 +869,10 @@ function Get-DefaultModelScanDirectory {
             continue
         }
 
-        $ModelFiles = @(Get-ChildItem -LiteralPath $Candidate -Filter "*.gguf" -File -ErrorAction SilentlyContinue)
+        $ModelFiles = @(
+            Get-ChildItem -LiteralPath $Candidate -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+                Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) }
+        )
         if ($ModelFiles.Count -gt 0) {
             return $Candidate
         }
@@ -878,7 +903,11 @@ function Refresh-ModelIndexFromDefaultScanPath {
         return $false
     }
 
-    $ModelFiles = @(Get-ChildItem -LiteralPath $ScanDirectory -Filter "*.gguf" -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    $ModelFiles = @(
+        Get-ChildItem -LiteralPath $ScanDirectory -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+            Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) } |
+            Sort-Object Name
+    )
     if ($ModelFiles.Count -eq 0) {
         if (-not $Quiet) {
             Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f $ScanDirectory)
@@ -888,22 +917,52 @@ function Refresh-ModelIndexFromDefaultScanPath {
     }
 
     $PreferredDefaultModelPath = Get-PreferredDefaultModelPath -IndexPath $Path -PrimaryModelPath $PrimaryModelPath
+    $ExistingByPath = @{}
+    $ExistingPayload = Get-ExistingModelIndexPayload -Path $Path
+    if ($ExistingPayload -and $ExistingPayload.models) {
+        foreach ($ExistingModel in @($ExistingPayload.models)) {
+            if (-not ($ExistingModel.PSObject.Properties["path"])) {
+                continue
+            }
+
+            $ExistingModelPath = Resolve-ModelPath -Path ([string]$ExistingModel.path)
+            if (-not [string]::IsNullOrWhiteSpace($ExistingModelPath)) {
+                $ExistingByPath[$ExistingModelPath.ToLowerInvariant()] = $ExistingModel
+            }
+        }
+    }
+
     $UsedIds = @{}
     $Models = @(
         foreach ($File in $ModelFiles) {
             $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($File.Name)
+            $MmprojPath = Find-MmprojForModel -ModelPath $File.FullName
+            $ExistingEntry = $null
+            $ExistingKey = $File.FullName.ToLowerInvariant()
+            if ($ExistingByPath.ContainsKey($ExistingKey)) {
+                $ExistingEntry = $ExistingByPath[$ExistingKey]
+            }
             $ModelEntry = [pscustomobject]@{
                 name = $BaseName
                 path = $File.FullName
             }
 
-            [ordered]@{
+            $GeneratedEntry = [ordered]@{
                 id           = New-ModelId -Name $BaseName -UsedIds $UsedIds
                 name         = $BaseName
                 path         = $File.FullName
-                capabilities = Resolve-ModelEntryCapabilities -ModelEntry $ModelEntry
-                notes        = "Auto-generated by Start_LCPP.ps1 scan."
             }
+            if (-not [string]::IsNullOrWhiteSpace($MmprojPath)) {
+                $GeneratedEntry["mmproj_path"] = $MmprojPath
+                $ModelEntry | Add-Member -NotePropertyName "mmproj_path" -NotePropertyValue $MmprojPath
+            }
+
+            $GeneratedEntry["capabilities"] = Resolve-ModelEntryCapabilities -ModelEntry $ModelEntry
+            if ($ExistingEntry -and $ExistingEntry.PSObject.Properties["generation"]) {
+                $GeneratedEntry["generation"] = $ExistingEntry.generation
+            }
+            $GeneratedEntry["notes"] = "Auto-generated by Start_LCPP.ps1 scan."
+            $GeneratedEntry
         }
     )
 
@@ -1668,6 +1727,123 @@ function Get-GgufArchitectureHint {
     return $Architecture
 }
 
+function Test-MmprojFilePath {
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    $FileName = [System.IO.Path]::GetFileName($Path)
+    return ($FileName -match '(?i)(^|[-_.])mmproj([-_.]|$)')
+}
+
+function Get-MmprojNameTokens {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($Text).ToLowerInvariant()
+    $BaseName = $BaseName -replace 'mmproj', ' '
+    $Tokens = [regex]::Matches($BaseName, '[a-z0-9]+') | ForEach-Object { $_.Value }
+    $StopTokens = @(
+        "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9",
+        "k", "m", "s", "l", "xl", "xs", "p", "0", "1",
+        "f16", "fp16", "bf16", "gguf", "uncensored"
+    )
+
+    return @($Tokens | Where-Object { $_ -and ($StopTokens -notcontains $_) } | Select-Object -Unique)
+}
+
+function Get-MmprojTokenMatchScore {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModelPath,
+        [Parameter(Mandatory = $true)][string]$ProjectorPath
+    )
+
+    $ModelTokens = @(Get-MmprojNameTokens -Text $ModelPath)
+    $ProjectorTokens = @(Get-MmprojNameTokens -Text $ProjectorPath)
+    if ($ModelTokens.Count -eq 0 -or $ProjectorTokens.Count -eq 0) {
+        return 0
+    }
+
+    $Score = 0
+    foreach ($Token in $ModelTokens) {
+        if ($ProjectorTokens -contains $Token) {
+            $Score += 10
+        }
+    }
+
+    $ModelName = ([System.IO.Path]::GetFileNameWithoutExtension($ModelPath)).ToLowerInvariant()
+    $ProjectorName = ([System.IO.Path]::GetFileNameWithoutExtension($ProjectorPath)).ToLowerInvariant()
+    $ProjectorName = $ProjectorName -replace '^mmproj[-_. ]*', ''
+    $Limit = [Math]::Min($ModelName.Length, $ProjectorName.Length)
+    for ($Index = 0; $Index -lt $Limit; $Index++) {
+        if ($ModelName[$Index] -ne $ProjectorName[$Index]) {
+            break
+        }
+
+        $Score += 1
+    }
+
+    return $Score
+}
+
+function Find-MmprojForModel {
+    param([AllowNull()][string]$ModelPath)
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $ModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath) -or -not (Test-Path -LiteralPath $ResolvedModelPath -PathType Leaf)) {
+        return $null
+    }
+    if (Test-MmprojFilePath -Path $ResolvedModelPath) {
+        return $null
+    }
+
+    if ($script:MmprojPathCache.ContainsKey($ResolvedModelPath)) {
+        return $script:MmprojPathCache[$ResolvedModelPath]
+    }
+
+    $ModelDirectory = Split-Path -Parent $ResolvedModelPath
+    if ([string]::IsNullOrWhiteSpace($ModelDirectory) -or -not (Test-Path -LiteralPath $ModelDirectory -PathType Container)) {
+        $script:MmprojPathCache[$ResolvedModelPath] = $null
+        return $null
+    }
+
+    $Projectors = @(Get-ChildItem -LiteralPath $ModelDirectory -File -Filter "*mmproj*.gguf" -ErrorAction SilentlyContinue)
+    if ($Projectors.Count -eq 0) {
+        $script:MmprojPathCache[$ResolvedModelPath] = $null
+        return $null
+    }
+
+    $SelectedProjector = @(
+        foreach ($Projector in $Projectors) {
+            [pscustomobject]@{
+                Path  = $Projector.FullName
+                Score = Get-MmprojTokenMatchScore -ModelPath $ResolvedModelPath -ProjectorPath $Projector.FullName
+            }
+        }
+    ) | Sort-Object Score -Descending | Select-Object -First 1
+
+    $SelectedPath = if ($SelectedProjector -and $SelectedProjector.Score -gt 0) { [string]$SelectedProjector.Path } else { $null }
+    $script:MmprojPathCache[$ResolvedModelPath] = $SelectedPath
+    return $SelectedPath
+}
+
+function Get-ModelEntryMmprojPath {
+    param(
+        $ModelEntry,
+        [AllowNull()][string]$ModelPath
+    )
+
+    if ($ModelEntry -and $ModelEntry.PSObject.Properties["mmproj_path"]) {
+        $ExplicitPath = Resolve-ModelPath -Path ([string]$ModelEntry.mmproj_path)
+        if (-not [string]::IsNullOrWhiteSpace($ExplicitPath) -and (Test-Path -LiteralPath $ExplicitPath -PathType Leaf)) {
+            return $ExplicitPath
+        }
+    }
+
+    return Find-MmprojForModel -ModelPath $ModelPath
+}
+
 function Get-InferredModelCapabilities {
     param(
         [string]$ModelName,
@@ -1721,8 +1897,9 @@ function Resolve-ModelEntryCapabilities {
     $ModelName = if ($ModelEntry.PSObject.Properties["name"]) { [string]$ModelEntry.name } else { "" }
     $ModelPath = if ($ModelEntry.PSObject.Properties["path"]) { [string]$ModelEntry.path } else { "" }
     $ExplicitCapabilities = ConvertTo-ModelCapabilities -Source $(if ($ModelEntry.PSObject.Properties["capabilities"]) { $ModelEntry.capabilities } else { $null })
+    $MmprojPath = Get-ModelEntryMmprojPath -ModelEntry $ModelEntry -ModelPath $ModelPath
     $CapabilitySignature = ($ExplicitCapabilities.GetEnumerator() | ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }) -join ";"
-    $CacheKey = "{0}|{1}|{2}" -f $ModelName, $ModelPath, $CapabilitySignature
+    $CacheKey = "{0}|{1}|{2}|{3}" -f $ModelName, $ModelPath, $MmprojPath, $CapabilitySignature
 
     if ($script:ResolvedModelCapabilityCache.ContainsKey($CacheKey)) {
         return $script:ResolvedModelCapabilityCache[$CacheKey]
@@ -1733,7 +1910,7 @@ function Resolve-ModelEntryCapabilities {
     $ResolvedCapabilities = New-EmptyModelCapabilities
 
     $ResolvedCapabilities.reasoning = $ExplicitCapabilities.reasoning -or $InferredCapabilities.reasoning
-    $ResolvedCapabilities.vision = $ExplicitCapabilities.vision -or $InferredCapabilities.vision
+    $ResolvedCapabilities.vision = $ExplicitCapabilities.vision -or $InferredCapabilities.vision -or (-not [string]::IsNullOrWhiteSpace($MmprojPath))
     $ResolvedCapabilities.video = $ExplicitCapabilities.video -or $InferredCapabilities.video
     $ResolvedCapabilities.voice = $ExplicitCapabilities.voice -or $InferredCapabilities.voice
     $ResolvedCapabilities.tools = $ExplicitCapabilities.tools -or $InferredCapabilities.tools
@@ -2525,6 +2702,108 @@ function Resolve-LaunchModelPath {
     }
 
     throw "Could not determine a default model from $IndexPath. Set -ModelPath or update json\model-index.json."
+}
+
+function Get-ModelIndexEntryByPath {
+    param(
+        [string]$IndexPath,
+        [string]$ResolvedModelPath
+    )
+
+    $ResolvedTargetPath = Resolve-ModelPath -Path $ResolvedModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedTargetPath)) {
+        return $null
+    }
+
+    $IndexData = Get-ModelIndexData -Path $IndexPath
+    foreach ($ModelEntry in @($IndexData.models)) {
+        if (-not ($ModelEntry.PSObject.Properties["path"])) {
+            continue
+        }
+
+        $EntryPath = Resolve-ModelPath -Path ([string]$ModelEntry.path)
+        if ([string]::Equals($EntryPath, $ResolvedTargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $ModelEntry
+        }
+    }
+
+    return $null
+}
+
+function Test-LlamaArgumentProvided {
+    param(
+        [AllowNull()][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string[]]$Patterns
+    )
+
+    foreach ($Argument in @($Arguments)) {
+        foreach ($Pattern in $Patterns) {
+            if ([string]$Argument -match $Pattern) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function ConvertTo-LlamaScalarArgumentValue {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [float] -or $Value -is [double] -or $Value -is [decimal]) {
+        return ([Math]::Round([double]$Value, 6)).ToString("0.######", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    $Text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    return $Text
+}
+
+function Get-ModelGenerationArgs {
+    param(
+        $ModelEntry,
+        [AllowNull()][string[]]$UserArguments
+    )
+
+    if (-not $ModelEntry -or -not ($ModelEntry.PSObject.Properties["generation"]) -or $null -eq $ModelEntry.generation) {
+        return @()
+    }
+
+    $Generation = $ModelEntry.generation
+    $Arguments = New-Object System.Collections.Generic.List[string]
+
+    if ($Generation.PSObject.Properties["temperature"] -and -not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--temp(?:erature)?(?:=|$)'))) {
+        $Value = ConvertTo-LlamaScalarArgumentValue -Value $Generation.temperature
+        if ($null -ne $Value) {
+            $Arguments.Add("--temp")
+            $Arguments.Add($Value)
+        }
+    }
+
+    $PresencePenaltyValue = $null
+    if ($Generation.PSObject.Properties["presence_penalty"]) {
+        $PresencePenaltyValue = $Generation.presence_penalty
+    }
+    elseif ($Generation.PSObject.Properties["presencePenalty"]) {
+        $PresencePenaltyValue = $Generation.presencePenalty
+    }
+
+    if ($null -ne $PresencePenaltyValue -and -not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--presence-penalty(?:=|$)'))) {
+        $Value = ConvertTo-LlamaScalarArgumentValue -Value $PresencePenaltyValue
+        if ($null -ne $Value) {
+            $Arguments.Add("--presence-penalty")
+            $Arguments.Add($Value)
+        }
+    }
+
+    return @($Arguments)
 }
 
 function Format-ModelCapabilities {
@@ -4324,6 +4603,7 @@ function Get-TrackedServerLaunchSettings {
         $Settings = [ordered]@{
             CommandLine      = [string]$ProcessInfo.CommandLine
             ModelPath        = ""
+            MmprojPath       = ""
             Port             = ""
             ContextSize      = ""
             Host             = ""
@@ -4358,6 +4638,9 @@ function Get-TrackedServerLaunchSettings {
             switch -Regex ($Argument) {
                 '^(?:-m|--model)(?:=(.+))?$' {
                     $Settings.ModelPath = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--mmproj(?:=(.+))?$' {
+                    $Settings.MmprojPath = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
                 }
                 '^--port(?:=(.+))?$' {
                     $Settings.Port = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
@@ -5661,6 +5944,208 @@ function Test-TcpPort {
     }
 }
 
+function Resolve-VisionServicePort {
+    if ($env:LCPP_VISION_PORT -match '^\d+$') {
+        return [int]$env:LCPP_VISION_PORT
+    }
+
+    return 8081
+}
+
+function Get-PowerShellExecutablePath {
+    $PowerShellExe = $null
+    try {
+        $PowerShellExe = (Get-Process -Id $PID).Path
+    }
+    catch {
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+        $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    }
+    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+        $PowerShellExe = "powershell.exe"
+    }
+
+    return $PowerShellExe
+}
+
+function Test-AutoVisionDisabled {
+    if ($NoAutoVision) {
+        return $true
+    }
+
+    $Flag = [string]$env:LCPP_DISABLE_AUTO_VISION
+    return ($Flag.Trim().ToLowerInvariant() -in @("1", "true", "yes", "y", "on"))
+}
+
+function Invoke-VisionSidecarAfterStart {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetModelPath,
+        [int]$TimeoutSec = 360
+    )
+
+    if (Test-AutoVisionDisabled) {
+        Write-Host "Vision : auto-start disabled" -ForegroundColor DarkGray
+        return
+    }
+    if (-not (Test-Path -LiteralPath $VisionStartScript -PathType Leaf)) {
+        Write-Host "Vision : start script missing: $VisionStartScript" -ForegroundColor Yellow
+        return
+    }
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $TargetModelPath
+    $MmprojPath = Find-MmprojForModel -ModelPath $ResolvedModelPath
+    if ([string]::IsNullOrWhiteSpace($MmprojPath)) {
+        Write-Host "Vision : no matching mmproj found for this model" -ForegroundColor DarkGray
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:LaunchMmprojPath)) {
+        Write-Host "Vision : enabled on primary llama-server via --mmproj" -ForegroundColor Green
+        return
+    }
+
+    $VisionPort = Resolve-VisionServicePort
+    $VisionTimeoutSec = [Math]::Max(60, [Math]::Max($TimeoutSec, 360))
+    $PowerShellExe = Get-PowerShellExecutablePath
+    $VisionArgs = @(
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $VisionStartScript,
+        "-ModelPath",
+        $ResolvedModelPath,
+        "-MmprojPath",
+        $MmprojPath,
+        "-Port",
+        [string]$VisionPort,
+        "-ReadyTimeoutSec",
+        [string]$VisionTimeoutSec,
+        "-NoPause"
+    )
+
+    Write-Host "Vision : enabling sidecar on 127.0.0.1:$VisionPort" -ForegroundColor Cyan
+    Write-Host "Mmproj : $MmprojPath"
+
+    & $PowerShellExe @VisionArgs
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Vision : ready on 127.0.0.1:$VisionPort" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Vision : sidecar failed to start; llama.cpp text server remains running. See $VisionStdErrLog" -ForegroundColor Yellow
+    }
+}
+
+function Get-VisionServiceProcesses {
+    $VisionPort = Resolve-VisionServicePort
+    $TrackedIds = New-Object System.Collections.Generic.HashSet[int]
+    if (Test-Path -LiteralPath $VisionPidFile) {
+        $PidText = ((Get-Content -LiteralPath $VisionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1) | Out-String).Trim()
+        if ($PidText -match '^\d+$') {
+            [void]$TrackedIds.Add([int]$PidText)
+        }
+    }
+
+    $ServerPathPatterns = @($ServerExeCandidates | ForEach-Object { [regex]::Escape($_) })
+    $PortPattern = "(?i)(?:--port(?:\s+|=)$VisionPort\b|-p(?:\s+|=)$VisionPort\b)"
+
+    return @(
+        Get-CimInstance Win32_Process -Filter "Name = 'llama-server.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $CommandLine = [string]$_.CommandLine
+                $IsTracked = $TrackedIds.Contains([int]$_.ProcessId)
+                $IsWorkspaceVision = $false
+
+                if ($CommandLine) {
+                    foreach ($PathPattern in $ServerPathPatterns) {
+                        if ($CommandLine -match $PathPattern -and $CommandLine -match '(?i)--mmproj' -and $CommandLine -match $PortPattern) {
+                            $IsWorkspaceVision = $true
+                            break
+                        }
+                    }
+                }
+
+                $IsTracked -or $IsWorkspaceVision
+            }
+    ) | Sort-Object ProcessId -Unique
+}
+
+function Get-OpenAiModelIdsFromPayload {
+    param([AllowNull()]$Payload)
+
+    if ($null -eq $Payload) {
+        return @()
+    }
+
+    if ($Payload.PSObject.Properties["data"] -and $null -ne $Payload.data) {
+        return @($Payload.data | ForEach-Object { if ($_.PSObject.Properties["id"]) { [string]$_.id } } | Where-Object { $_ })
+    }
+    if ($Payload.PSObject.Properties["models"] -and $null -ne $Payload.models) {
+        return @(
+            $Payload.models | ForEach-Object {
+                if ($_.PSObject.Properties["id"]) {
+                    [string]$_.id
+                }
+                elseif ($_.PSObject.Properties["model"]) {
+                    [string]$_.model
+                }
+                elseif ($_.PSObject.Properties["name"]) {
+                    [string]$_.name
+                }
+            } | Where-Object { $_ }
+        )
+    }
+
+    return @()
+}
+
+function Get-VisionRuntimeStatus {
+    $VisionHost = "127.0.0.1"
+    $VisionPort = Resolve-VisionServicePort
+    $VisionUrl = "http://{0}:{1}" -f $VisionHost, $VisionPort
+    $Processes = @(Get-VisionServiceProcesses)
+    $Listening = Test-TcpPort -TargetHost $VisionHost -Port $VisionPort
+    $Health = $null
+    if ($Listening) {
+        try {
+            $Health = Invoke-RestMethod -Uri "$VisionUrl/v1/models" -TimeoutSec 3
+        }
+        catch {
+            $Health = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        Host         = $VisionHost
+        Port         = $VisionPort
+        Url          = $VisionUrl
+        Listening    = $Listening
+        ProcessCount = $Processes.Count
+        ModelIds     = @(Get-OpenAiModelIdsFromPayload -Payload $Health)
+    }
+}
+
+function Write-VisionStatusLine {
+    param([Parameter(Mandatory = $true)]$RuntimeStatus)
+
+    if ($RuntimeStatus.Listening -and $RuntimeStatus.ModelIds.Count -gt 0) {
+        Write-Host "Vision : ready on $($RuntimeStatus.Host):$($RuntimeStatus.Port) | model $($RuntimeStatus.ModelIds[0])" -ForegroundColor Green
+        return
+    }
+    if ($RuntimeStatus.Listening) {
+        Write-Host "Vision : listening on $($RuntimeStatus.Host):$($RuntimeStatus.Port), model list not ready" -ForegroundColor Yellow
+        return
+    }
+    if ($RuntimeStatus.ProcessCount -gt 0) {
+        Write-Host "Vision : process exists, but $($RuntimeStatus.Host):$($RuntimeStatus.Port) is not listening yet" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Vision : not running" -ForegroundColor DarkGray
+}
+
 function Get-OpenClawManagedMediaProcesses {
     return @(
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -5965,6 +6450,7 @@ function Show-ServerStatus {
 
     $Listener = Test-PortInUse
     $OpenClawStatus = Get-OpenClawRuntimeStatus
+    $VisionStatus = Get-VisionRuntimeStatus
 
     if ($TrackedProcess) {
         $TrackedSettings = Get-TrackedServerLaunchSettings -Process $TrackedProcess
@@ -6009,6 +6495,9 @@ function Show-ServerStatus {
             Write-Host "Batch  : $(Format-TrackedServerSettingValue -Value $TrackedSettings.ThreadsBatch -WhenMissing 'server default') CPU threads for batch/prefill (--threads-batch)"
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.Host)) {
                 Write-Host "Host   : $($TrackedSettings.Host) bind address (--host)"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.MmprojPath)) {
+                Write-Host "Mmproj : $($TrackedSettings.MmprojPath) vision projector (--mmproj)"
             }
             $SlotsSummary = Format-TrackedServerSlotsValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties
             if (-not [string]::IsNullOrWhiteSpace($SlotsSummary)) {
@@ -6101,6 +6590,12 @@ function Show-ServerStatus {
                 Write-Host "Build  : $($TrackedRuntimeProperties.build_info) (llama.cpp build)"
             }
         }
+        if ($TrackedSettings -and -not [string]::IsNullOrWhiteSpace($TrackedSettings.MmprojPath)) {
+            Write-Host "Vision : enabled on primary server | mmproj $($TrackedSettings.MmprojPath)" -ForegroundColor Green
+        }
+        else {
+            Write-VisionStatusLine -RuntimeStatus $VisionStatus
+        }
         Write-OpenClawStatusLines -RuntimeStatus $OpenClawStatus
         Write-Host "Logs   : $($TrackedLogPaths.StdOutLog)"
         Write-Host "Error  : $($TrackedLogPaths.StdErrLog)"
@@ -6114,6 +6609,7 @@ function Show-ServerStatus {
     }
 
     Write-Host "Status : stopped" -ForegroundColor Yellow
+    Write-VisionStatusLine -RuntimeStatus $VisionStatus
     Write-OpenClawStatusLines -RuntimeStatus $OpenClawStatus
 }
 
@@ -6168,6 +6664,8 @@ try {
     }
 
     $ModelPath = Resolve-LaunchModelPath -IndexPath $ModelIndexPath -RequestedModelPath $ModelPath
+    $LaunchModelEntry = Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $ModelPath
+    $script:ModelGenerationArgs = @(Get-ModelGenerationArgs -ModelEntry $LaunchModelEntry -UserArguments $LlamaArgs)
 
     $ResolvedThreads = Resolve-RequestedThreads -RequestedThreads $RawThreads -RequestedThreadsBatch $RawThreadsBatch
     $Threads = $ResolvedThreads.Threads
@@ -6198,6 +6696,10 @@ try {
     Write-Host "Starting llama.cpp server..." -ForegroundColor Green
     Write-Host "Server : $ServerExe"
     Write-Host "Model  : $ModelPath"
+    $LaunchMmprojPath = Find-MmprojForModel -ModelPath $ModelPath
+    if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
+        Write-Host "Mmproj : $LaunchMmprojPath"
+    }
     Write-Host "Port   : $Port"
     Write-Host "Mode   : $(if ($ExtremeMode) { 'extreme' } else { 'standard' })"
     Write-Host "Tune   : $($AutoLaunchTuning.SourceLabel)"
@@ -6229,6 +6731,9 @@ try {
     }
     if ($null -ne $AutoLaunchTuning.ParallelSlots) {
         Write-Host "Slots  : $($AutoLaunchTuning.ParallelSlots)"
+    }
+    if ($script:ModelGenerationArgs.Count -gt 0) {
+        Write-Host "Sample : $($script:ModelGenerationArgs -join ' ')"
     }
     if ($LlamaArgs) {
         Write-Host "Extra  : $($LlamaArgs -join ' ')"
@@ -6359,6 +6864,7 @@ try {
             }
         }
         if ($StartupState -eq "Ready") {
+            Invoke-VisionSidecarAfterStart -TargetModelPath $ModelPath -TimeoutSec ([Math]::Max(1, $ReadyTimeoutSec))
             if ($OpenClawAfterStart) {
                 Invoke-OpenClawLauncherAfterStart -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max(1, $ReadyTimeoutSec))
             }

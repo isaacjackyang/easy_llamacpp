@@ -213,6 +213,8 @@ $sttScript = Join-Path $workspaceDir "stt_server.py"
 $sttStdoutLog = Join-Path $logDir "stt-server.stdout.log"
 $sttStderrLog = Join-Path $logDir "stt-server.stderr.log"
 $sttHealthUrl = "http://127.0.0.1:8001/health"
+$gatewayStdoutLog = Join-Path $logDir "gateway.stdout.log"
+$gatewayStderrLog = Join-Path $logDir "gateway.stderr.log"
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
@@ -272,11 +274,14 @@ try {
   Report-ManagedServiceReadiness -Name "STT" -HealthUrl $sttHealthUrl
 
   Write-Step "Starting OpenClaw gateway"
+  Set-Content -LiteralPath $gatewayStdoutLog -Value "" -Encoding utf8
+  Set-Content -LiteralPath $gatewayStderrLog -Value "" -Encoding utf8
   $gatewayProcess = Start-Process `
     -FilePath $nodeExe `
     -ArgumentList @($gatewayCli, "gateway", "--port", "$gatewayPort") `
     -WorkingDirectory $rootDir `
-    -NoNewWindow `
+    -RedirectStandardOutput $gatewayStdoutLog `
+    -RedirectStandardError $gatewayStderrLog `
     -PassThru
   $managedProcesses.Add($gatewayProcess)
 

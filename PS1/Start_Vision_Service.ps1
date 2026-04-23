@@ -2,7 +2,8 @@
 param(
     [string]$ModelPath,
     [string]$MmprojPath,
-    [string]$Host = "127.0.0.1",
+    [Alias("Host")]
+    [string]$ListenHost = "127.0.0.1",
     [int]$Port = 8081,
     [int]$ContextSize = 8192,
     [int]$GpuLayers = 99,
@@ -116,6 +117,17 @@ function Test-VisionModelName {
     return ($Text -match '(?i)(qwen3vl|qwen[\-_ ]?(?:2(?:\.5)?|3)?[\-_ ]?vl|vision|vlm|multimodal|multi[\-_ ]?modal|image|llava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|mllama|smolvlm|molmo|moondream|janus|omni|gemma[\-_ ]?[34])')
 }
 
+function Test-MmprojFilePath {
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    $fileName = [System.IO.Path]::GetFileName($Path)
+    return ($fileName -match '(?i)(^|[-_.])mmproj([-_.]|$)')
+}
+
 function Get-NameTokens {
     param([Parameter(Mandatory = $true)][string]$Text)
 
@@ -166,6 +178,10 @@ function Get-TokenMatchScore {
 function Find-MmprojForModel {
     param([Parameter(Mandatory = $true)][string]$ResolvedModelPath)
 
+    if (Test-MmprojFilePath -Path $ResolvedModelPath) {
+        return $null
+    }
+
     $modelDirectory = Split-Path -Parent $ResolvedModelPath
     if ([string]::IsNullOrWhiteSpace($modelDirectory) -or -not (Test-Path -LiteralPath $modelDirectory -PathType Container)) {
         return $null
@@ -178,14 +194,73 @@ function Find-MmprojForModel {
         return $null
     }
 
-    return @(
+    $selectedScore = @(
         foreach ($projector in $projectors) {
             [pscustomobject]@{
                 Path = $projector.FullName
                 Score = Get-TokenMatchScore -ModelPath $ResolvedModelPath -ProjectorPath $projector.FullName
             }
         }
-    ) | Sort-Object Score -Descending | Select-Object -First 1 -ExpandProperty Path
+    ) | Sort-Object Score -Descending | Select-Object -First 1
+
+    if ($selectedScore -and $selectedScore.Score -gt 0) {
+        return [string]$selectedScore.Path
+    }
+
+    return $null
+}
+
+function Get-OpenAiModelIdsFromPayload {
+    param([AllowNull()]$Payload)
+
+    if ($null -eq $Payload) {
+        return @()
+    }
+
+    if ($Payload.PSObject.Properties["data"] -and $null -ne $Payload.data) {
+        return @($Payload.data | ForEach-Object { if ($_.PSObject.Properties["id"]) { [string]$_.id } } | Where-Object { $_ })
+    }
+    if ($Payload.PSObject.Properties["models"] -and $null -ne $Payload.models) {
+        return @(
+            $Payload.models | ForEach-Object {
+                if ($_.PSObject.Properties["id"]) {
+                    [string]$_.id
+                }
+                elseif ($_.PSObject.Properties["model"]) {
+                    [string]$_.model
+                }
+                elseif ($_.PSObject.Properties["name"]) {
+                    [string]$_.name
+                }
+            } | Where-Object { $_ }
+        )
+    }
+
+    return @()
+}
+
+function Test-VisionHealthMatchesSelection {
+    param(
+        [AllowNull()]$Health,
+        [Parameter(Mandatory = $true)][string]$SelectedModelPath
+    )
+
+    $ModelIds = @(Get-OpenAiModelIdsFromPayload -Payload $Health)
+    if ($ModelIds.Count -eq 0) {
+        return $false
+    }
+
+    $TargetFileName = [System.IO.Path]::GetFileName($SelectedModelPath)
+    $TargetBaseName = [System.IO.Path]::GetFileNameWithoutExtension($SelectedModelPath)
+    foreach ($ModelId in $ModelIds) {
+        if ([string]::Equals($ModelId, $SelectedModelPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($ModelId, $TargetFileName, [System.StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($ModelId, $TargetBaseName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Get-ModelIndexEntries {
@@ -215,17 +290,28 @@ function Resolve-VisionModelSelection {
     if ([string]::IsNullOrWhiteSpace($resolvedModelPath)) {
         $candidates = @(
             foreach ($entry in Get-ModelIndexEntries) {
-                $entryPath = Resolve-ExistingPath -Path ([string]$entry.path)
+                $entryPathRaw = if ($entry.PSObject.Properties["path"]) { [string]$entry.path } else { "" }
+                $entryPath = Resolve-ExistingPath -Path $entryPathRaw
                 if ([string]::IsNullOrWhiteSpace($entryPath) -or -not (Test-Path -LiteralPath $entryPath -PathType Leaf)) {
                     continue
                 }
-
-                $nameText = "{0} {1}" -f [string]$entry.name, $entryPath
-                if (-not (Test-VisionModelName -Text $nameText)) {
+                if (Test-MmprojFilePath -Path $entryPath) {
                     continue
                 }
 
-                $projectorPath = Find-MmprojForModel -ResolvedModelPath $entryPath
+                $explicitProjectorPath = if ($entry.PSObject.Properties["mmproj_path"]) { Resolve-ExistingPath -Path ([string]$entry.mmproj_path) } else { $null }
+                $projectorPath = if (-not [string]::IsNullOrWhiteSpace($explicitProjectorPath) -and (Test-Path -LiteralPath $explicitProjectorPath -PathType Leaf)) {
+                    $explicitProjectorPath
+                }
+                else {
+                    Find-MmprojForModel -ResolvedModelPath $entryPath
+                }
+                $entryName = if ($entry.PSObject.Properties["name"]) { [string]$entry.name } else { "" }
+                $nameText = "{0} {1}" -f $entryName, $entryPath
+                if (-not $projectorPath -and -not (Test-VisionModelName -Text $nameText)) {
+                    continue
+                }
+
                 $score = 0
                 if ($entry.PSObject.Properties["capabilities"] -and $null -ne $entry.capabilities -and $entry.capabilities.PSObject.Properties["vision"] -and $entry.capabilities.vision) {
                     $score += 100
@@ -408,14 +494,23 @@ try {
     New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
 
     $selection = Resolve-VisionModelSelection -RequestedModelPath $ModelPath -RequestedMmprojPath $MmprojPath
-    $baseUrl = "http://$Host`:$Port"
+    if ($PSBoundParameters.ContainsKey("ListenHost") -eq $false -and -not [string]::IsNullOrWhiteSpace($env:LCPP_VISION_HOST)) {
+        $ListenHost = $env:LCPP_VISION_HOST
+    }
+
+    $baseUrl = "http://$ListenHost`:$Port"
     $existingHealth = Invoke-HealthRequest -Url "$baseUrl/v1/models" -TimeoutSec 3
     if ($null -ne $existingHealth) {
-        Write-Ok "Vision llama-server is already reachable at $baseUrl"
-        Write-Host "Model : $($selection.ModelPath)"
-        Write-Host "Mmproj: $($selection.MmprojPath)"
-        Write-Host "Logs  : $LogRoot"
-        return
+        if (Test-VisionHealthMatchesSelection -Health $existingHealth -SelectedModelPath $selection.ModelPath) {
+            Write-Ok "Vision llama-server is already reachable at $baseUrl"
+            Write-Host "Model : $($selection.ModelPath)"
+            Write-Host "Mmproj: $($selection.MmprojPath)"
+            Write-Host "Logs  : $LogRoot"
+            return
+        }
+
+        $existingModels = @(Get-OpenAiModelIdsFromPayload -Payload $existingHealth)
+        Write-Warn "Vision llama-server at $baseUrl is serving a different model: $($existingModels -join ', '). Restarting it."
     }
 
     Stop-StaleVisionServers -VisionPort $Port
@@ -425,7 +520,7 @@ try {
     $serverArgs = @(
         "-m", $selection.ModelPath,
         "--mmproj", $selection.MmprojPath,
-        "--host", $Host,
+        "--host", $ListenHost,
         "--port", [string]$Port,
         "-c", [string]$ContextSize,
         "-ngl", [string]$GpuLayers

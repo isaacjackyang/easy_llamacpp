@@ -34,9 +34,14 @@ OpenClaw can inject it without truncation.
   `C:\Users\JackYang\.openclaw\workspace-worker1`
   `C:\Users\JackYang\.openclaw\workspace-worker2`
 - Gateway URL: `http://127.0.0.1:29644/`
+- Gateway health: `openclaw gateway probe`; trust `Connect: ok` and `RPC: ok`.
+- `openclaw status` or the HTTP root page may time out even when gateway RPC is healthy.
 - OpenClaw config: `C:\Users\JackYang\.openclaw\openclaw.json`
 - Managed gateway script:
   `C:\Users\JackYang\.openclaw\scripts\run-openclaw-gateway-with-media.ps1`
+- Safe startup disables `agentmemory`, `browser`, `openclaw-web-search`,
+  `voice-call`, and internal hooks; re-enable them one at a time. Telegram stays
+  enabled when token/config exists and uses IPv4-preferred transport settings.
 - Reinstall notes:
   `F:\Documents\GitHub\easy_llamacpp\docs\OpenClaw-reinstall-notes.md`
 
@@ -53,7 +58,9 @@ The managed gateway starts TTS and STT sidecars before OpenClaw.
 
 ## Vision Sidecar
 
-- Start: `start_vision.cmd`
+- Normal model startup auto-detects a matching `mmproj*.gguf` and launches the
+  primary `llama-server` with `--mmproj`; check `Start_LCPP.ps1 -Status`.
+- Start a separate sidecar only when needed: `start_vision.cmd`
 - Stop: `stop_vision.cmd`
 - Default URL: `http://127.0.0.1:8081/v1/chat/completions`
 - PID/logs:
