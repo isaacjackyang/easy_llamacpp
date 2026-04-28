@@ -1,7 +1,7 @@
 ﻿# llama.cpp Launcher / llama.cpp 啟動器
 
-這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop_all.cmd`、`stop_opencalw.cmd`、`stop_llamacpp.cmd`、`start_voice_service.cmd`、`stop_voice_service.cmd`、`start_vision.cmd`、`stop_vision.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、全部停止、只停止 OpenClaw、只停止 `llama.cpp`、只啟動 TTS/STT、只停止 TTS/STT、只啟動 vision sidecar、只停止 vision sidecar、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換、背景執行與 OpenClaw runtime。  
-This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop_all.cmd`, `stop_opencalw.cmd`, `stop_llamacpp.cmd`, `start_voice_service.cmd`, `stop_voice_service.cmd`, `start_vision.cmd`, `stop_vision.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop everything, stop OpenClaw only, stop `llama.cpp` only, start TTS/STT only, stop TTS/STT only, start the vision sidecar only, stop the vision sidecar only, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, background execution, and the OpenClaw runtime.
+這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop_all.cmd`、`start_openclaw.cmd`、`stop_openclaw.cmd`、`show_status.cmd`、`start_watchdog.cmd`、`stop_watchdog.cmd`、`start_codex_telegram_worker1.cmd`、`stop_codex_telegram_worker1.cmd`、`stop_llamacpp.cmd`、`start_voice_service.cmd`、`stop_voice_service.cmd`、`start_vision.cmd`、`stop_vision.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、全部停止、啟動/停止 OpenClaw、查看 OpenClaw stack 狀態、啟用/停用 watchdog、啟用/停用 Codex Telegram worker1 bridge、只停止 `llama.cpp`、只啟動 TTS/STT、只停止 TTS/STT、只啟動 vision sidecar、只停止 vision sidecar、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換、背景執行與 OpenClaw runtime。
+This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop_all.cmd`, `start_openclaw.cmd`, `stop_openclaw.cmd`, `show_status.cmd`, `start_watchdog.cmd`, `stop_watchdog.cmd`, `start_codex_telegram_worker1.cmd`, `stop_codex_telegram_worker1.cmd`, `stop_llamacpp.cmd`, `start_voice_service.cmd`, `stop_voice_service.cmd`, `start_vision.cmd`, `stop_vision.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop everything, start/stop OpenClaw, show the OpenClaw stack status, enable/disable the watchdog, enable/disable the Codex Telegram worker1 bridge, stop `llama.cpp` only, start TTS/STT only, stop TTS/STT only, start the vision sidecar only, stop the vision sidecar only, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, background execution, and the OpenClaw runtime.
 
 ## 目錄結構 / Folder Layout
 
@@ -13,7 +13,13 @@ Start.cmd
 install.cmd
 install_latest.cmd
 stop_all.cmd
-stop_opencalw.cmd
+start_openclaw.cmd
+stop_openclaw.cmd
+show_status.cmd
+start_watchdog.cmd
+stop_watchdog.cmd
+start_codex_telegram_worker1.cmd
+stop_codex_telegram_worker1.cmd
 stop_llamacpp.cmd
 start_voice_service.cmd
 stop_voice_service.cmd
@@ -161,7 +167,7 @@ If you only want to quickly clear old processes, you can also use:
 If you only want to stop OpenClaw, use:
 
 ```bat
-.\stop_opencalw.cmd
+.\stop_openclaw.cmd
 ```
 
 若只想關閉 `llama.cpp`，可用：  
@@ -204,32 +210,96 @@ If you only want to stop the vision sidecar, use:
 
 ## OpenClaw 啟動維護 / OpenClaw Startup Maintenance
 
-`PS1\Start_OpenClaw.ps1` 與 `PS1\Update_OpenClaw_Status.ps1` 現在會先同步 `C:\Users\<user>\.openclaw\` 裡的 managed gateway 啟動資產，再進行 OpenClaw 重啟。  
-`PS1\Start_OpenClaw.ps1` and `PS1\Update_OpenClaw_Status.ps1` now sync the managed gateway startup assets in `C:\Users\<user>\.openclaw\` before restarting OpenClaw.
+完整啟動流程、watchdog 原理、狀態檢查與本機踩坑紀錄，請見 [`docs/OpenClaw-startup-watchdog-runbook.md`](docs/OpenClaw-startup-watchdog-runbook.md)。
 
-這個同步流程會維持下面幾個新版原則：  
-This sync keeps the following newer OpenClaw startup assumptions in place:
+這套流程把 OpenClaw 當成一組常駐服務管理，而不是只啟動單一 gateway。核心目標是：重開機或手動重啟後，primary `llama.cpp` 由 launcher/autostart 維持，OpenClaw Gateway/WebUI、Node、TTS、STT、Vision、Telegram 與 watchdog 也能回到可用狀態，且 OpenClaw 相關視窗預設隱藏。
 
-- Gateway 入口固定使用 `dist/index.js gateway --port ...`，不再沿用舊的 `dist/entry.js` 漂移入口。  
-- The gateway entrypoint stays on `dist/index.js gateway --port ...` instead of older drifting `dist/entry.js` wrappers.
-- TTS / STT sidecar 先啟動並回報 readiness，gateway 不會永久卡在等待 sidecar health。  
-- TTS / STT sidecars start first and report readiness, but the gateway no longer blocks indefinitely on sidecar health.
-- `gateway.cmd` 會改走 sidecar-aware 的 `run-openclaw-gateway-with-media.ps1` managed launcher。  
-- `gateway.cmd` is kept on the sidecar-aware `run-openclaw-gateway-with-media.ps1` managed launcher.
-- `start_openclaw.cmd` 會以 `openclaw gateway probe` 的 RPC 結果作為 gateway readiness；HTTP 首頁與 `openclaw status` 在這台機器上可能 timeout，不能當唯一依據。
-- `start_openclaw.cmd` uses the RPC result from `openclaw gateway probe` as gateway readiness; the HTTP root page and `openclaw status` can time out on this machine and should not be the only signal.
-- 安全啟動會暫停容易拖慢或卡住 startup 的重型外掛與 hooks：`agentmemory`、`browser`、`openclaw-web-search`、`voice-call`、internal hooks；`gateway.cmd` 也不再自動先啟動 `agentmemory.cmd`。Telegram 若已有 token/config，會保持啟用並套用 IPv4 優先設定。
-- Safe startup temporarily disables heavy startup plugins and hooks that can stall the gateway: `agentmemory`, `browser`, `openclaw-web-search`, `voice-call`, and internal hooks; `gateway.cmd` also no longer auto-starts `agentmemory.cmd`. Telegram stays enabled when token/config exists and uses the IPv4-preferred transport settings.
-- `openclaw.json` 會在同步模型前清掉舊的 graphiti / context-engine slot 註冊，但保留 install metadata。  
-- `openclaw.json` removes older graphiti / context-engine slot registrations before model sync while keeping install metadata.
-- Control UI patch 腳本會一起同步，讓前端在瀏覽器還留著舊 `gatewayUrl` 時能自動搬移到目前的 loopback websocket 位址。  
-- The Control UI patch script is synced too, so stale saved `gatewayUrl` values can be migrated to the current loopback websocket address.
+### 入口 / Entry Points
 
-OpenClaw 重新安裝或 npm 更新後，請先看 [`docs\OpenClaw-reinstall-notes.md`](docs/OpenClaw-reinstall-notes.md)；裡面記錄了 compact `TOOLS.md`、Telegram IPv4 env/config，以及必要時要補回 OpenClaw bundle 的手動 patch。  
-After reinstalling or updating OpenClaw through npm, see [`docs\OpenClaw-reinstall-notes.md`](docs/OpenClaw-reinstall-notes.md) for the compact `TOOLS.md`, Telegram IPv4 env/config, and the optional manual OpenClaw bundle patch.
+從這個 repo 啟動與停止 OpenClaw：
 
-如果 Control UI 看起來像是「首頁開了，但就是連不上 gateway」，請先檢查瀏覽器裡記住的 websocket 位址是不是舊埠號，而不是只看 HTTP 首頁有沒有開。  
-If the Control UI looks alive but cannot connect to the gateway, check the browser's saved websocket URL first instead of relying only on the HTTP page being reachable.
+```bat
+.\start_openclaw.cmd -NoPause
+.\stop_openclaw.cmd
+.\show_status.cmd
+.\start_watchdog.cmd
+.\stop_watchdog.cmd
+.\start_codex_telegram_worker1.cmd
+.\stop_codex_telegram_worker1.cmd
+```
+
+同步到 OpenClaw runtime 後，也可以直接用：
+
+```bat
+%USERPROFILE%\.openclaw\start.cmd
+%USERPROFILE%\.openclaw\stop.cmd
+```
+
+`start_openclaw.cmd` 會用 hidden PowerShell 執行 `PS1\Start_OpenClaw.ps1`。`stop_openclaw.cmd` 會轉呼叫 `%USERPROFILE%\.openclaw\stop.cmd`，建立 `openclaw.stop` 停止標記、停用/結束 watchdog，並停止 Gateway、Node、TTS、STT、Vision sidecar 與相關 OpenClaw 進程。`start_watchdog.cmd` 只會啟用 `\OpenClaw Watchdog` 並要求它立即跑一次；`stop_watchdog.cmd` 只會停用 watchdog 排程，不會停止 OpenClaw 服務，也不會預設強殺正在跑的 watchdog pass，避免切半進行中的重啟。需要硬停目前那輪時可用 `stop_watchdog.cmd -ForceEnd`。`start_codex_telegram_worker1.cmd` / `stop_codex_telegram_worker1.cmd` 管理已移出 OpenClaw 的 `worker1` Telegram bot；目前 worker1 bridge/autostart/automation 預設暫停，避免消耗 Codex 帳戶額度。
+
+### 啟動流程 / Startup Flow
+
+1. `PS1\Start_OpenClaw.ps1` 先同步 managed 啟動資產到 `%USERPROFILE%\.openclaw\scripts\`，來源在 `PS1\OpenClaw\`。
+2. 同步內容包含 `run-openclaw-gateway-with-media.ps1`、`start-llama-cpp-vision.ps1`、hidden Gateway/Node launcher、Control UI patch 與 workspace `TOOLS.md`。
+3. 腳本會修復 `openclaw.json`：同步目前模型資訊、清掉舊 graphiti/context-engine slot、保留 install metadata，並在 Telegram token/config 存在時保持 Telegram 啟用。
+4. 如果 `127.0.0.1:8080/v1/models` 上已有 primary `llama.cpp` server，OpenClaw provider 會同步到目前正在跑的模型；模型同步只改 config/session，不再在 `Update_OpenClaw_Status.ps1` 裡巢狀重啟，避免外層 starter 卡住。
+5. Gateway 重啟走 `%USERPROFILE%\.openclaw\scripts\restart-openclaw-gateway.ps1`。`Start_OpenClaw.ps1` 只 dispatch restart pass，接著用自己的 health checks 等待服務恢復；不要用 `Start-Process -Wait` 等 restart script，因為它會留下長駐 Gateway/Node descendants。
+6. Hidden Gateway launcher 執行 `run-openclaw-gateway-with-media.ps1`：先把 `browser.enabled=true`、heavy plugin/MCP 殘留壓回關閉，避免啟動時 stage/install browser runtime deps，再啟動 TTS `127.0.0.1:8000/health` 與 STT `127.0.0.1:8001/health`，最後確保 Vision sidecar `127.0.0.1:8081/v1/models`。
+7. Vision 一律走 `llama-server`，使用 vision GGUF 搭配 `--mmproj`，不走 `llama-cli --mmproj`。managed Vision sidecar 與一般模型啟動的預設 sampling temperature 都是 `--temp 0.35`。
+8. TTS/STT/Vision 準備好後，Gateway 用 `node ...\openclaw\dist\index.js gateway run --port 29644` 在隱藏視窗中啟動，WebUI/health 入口是 `http://127.0.0.1:29644/` 與 `http://127.0.0.1:29644/health`。
+9. Gateway health 連續穩定後，再啟動 hidden Node launcher；Node wrapper 會等 Gateway ready，然後執行 `node ...\openclaw\dist\index.js node run --host 127.0.0.1 --port 29644`。`gateway.cmd` 目前只指向 hidden VBS launcher，但仍視為 managed media 啟動路徑，所以 starter 會給 TTS/STT/Vision/Gateway 最多 480 秒 warmup。
+10. Gateway 啟動 channels 後，Telegram 以 polling 模式連線；OpenClaw 只管理 `default`、`worker2`。`worker1` bot token 已移到 Codex Telegram bridge。
+
+### 服務與健康訊號 / Services
+
+| 服務 | 預設位置 / 檢查方式 | 管理方式 |
+| --- | --- | --- |
+| Primary `llama.cpp` | `http://127.0.0.1:8080/v1/models` | 由 `Start.cmd` / `PS1\Start_LCPP.ps1` 或其 autostart 管理；OpenClaw 啟動時會偵測並同步 |
+| Vision sidecar | `http://127.0.0.1:8081/v1/models` | OpenClaw Gateway launcher 與 watchdog 管理，使用 `llama-server --mmproj --parallel 2 --temp 0.35` |
+| TTS | `http://127.0.0.1:8000/health` | OpenClaw Gateway launcher 與 watchdog 管理 |
+| STT | `http://127.0.0.1:8001/health` | OpenClaw Gateway launcher 與 watchdog 管理 |
+| Gateway / WebUI | `http://127.0.0.1:29644/health`、`http://127.0.0.1:29644/` | hidden Gateway launcher 與 watchdog 管理 |
+| Node | `node ... dist\index.js node run ...` 進程 | hidden Node launcher 與 watchdog 管理 |
+| Telegram | `openclaw channels status --channel telegram --json` | Gateway channel 管理；OpenClaw 只管理 `default`、`worker2`，啟動時保留 enabled 設定並套用 IPv4-first 網路設定 |
+| Codex Telegram worker1 | `show_status.cmd` 的 `Codex Telegram worker1` 行 | `worker1` bot 不屬於 OpenClaw；目前 bridge/autostart/automation 暫停，需要時手動啟用 |
+| Watchdog | Windows 工作排程 `\OpenClaw Watchdog` | 每 1 分鐘檢查一次 OpenClaw stack；核心服務連續失敗才自動重啟 |
+
+### Watchdog 原理 / Watchdog Behavior
+
+Watchdog 是 Windows 工作排程 `\OpenClaw Watchdog`，作為開機/登入後自動恢復 OpenClaw stack 的保險，目前設定為每 1 分鐘執行 `%USERPROFILE%\.openclaw\scripts\watch-openclaw-stack-hidden.vbs`，再由 VBS 隱藏呼叫 `watch-openclaw-stack.ps1`。它只做很小的判斷，避免自己變成新的不穩定來源：
+
+- 先檢查 `%USERPROFILE%\.openclaw\openclaw.stop`。只要 stop marker 存在，就直接退出，避免你手動 stop 後又被排程拉起來。
+- 使用 mutex `Local\OpenClawStackWatchdog`，避免上一輪還在重啟時下一輪又重疊執行。
+- 每輪檢查 primary `llama.cpp`、TTS、STT、Vision、Gateway 的 health，並檢查 OpenClaw Node 進程是否存在。
+- 如果 `%USERPROFILE%\.openclaw\openclaw.restart` 殘留，但沒有任何 restart process 還在跑，而且健康檢查仍失敗，watchdog 會把它視為 stale marker、清掉後重新修復。
+- 全部通過就安靜結束；失敗會先寫入 `%USERPROFILE%\.openclaw\logs\openclaw-watchdog.log`。為了避開短暫 health timeout 造成的重啟循環，核心服務需連續 2 次失敗才重啟。
+- `restart-openclaw-gateway.ps1` 會重新啟用 watchdog、停止殘留 Gateway/Node、透過 `\OpenClaw Gateway` / `\OpenClaw Node` 工作排程重啟 hidden Gateway/Node，並等 TTS/STT/Vision/Gateway/Node ready 後才結束。Telegram 會等一段時間；如果 Telegram 還沒 ready，流程不再永久卡住，改交給下一輪 watchdog 繼續修復。
+- Telegram 是 watchdog 的檢查項目之一，使用輕量 helper 直接問 Gateway `channels.status`；正常狀態是 enabled/configured accounts 具備 `running=true`、`connected=true`。watchdog 會把 `running/connected` 寫入 cache 供 `show_status.cmd` 顯示，但只有 provider 明確 `running=False` 且連續 2 次失敗才重啟。`connected=False`、Telegram API/網路抖動、Gateway 忙碌或 probe timeout 只記錄與顯示，不會直接重啟整套 OpenClaw。
+
+Watchdog 的排程 action 應該是 `wscript.exe %USERPROFILE%\.openclaw\scripts\watch-openclaw-stack-hidden.vbs`，不是直接跑 `powershell.exe`。這是為了避免 Windows 每分鐘建立 console 視窗，造成像 cmd 視窗短暫跳出又縮到工作列。Codex Telegram worker1 bridge 的登入自啟也同樣走 `wscript.exe ...run-codex-telegram-worker1-bridge.vbs`。
+
+`OPENCLAW_SKIP_PLUGIN_SERVICES=1` 與 `OPENCLAW_SKIP_BUNDLED_RUNTIME_DEPS=1` 會保留，用來避免重型 plugin service 或 provider bundled dependency install 在 startup 卡住；但不要設定 `OPENCLAW_SKIP_CHANNELS`，否則 Telegram channel 不會啟動。Telegram 相關 launcher/env 會套用 IPv4-first 設定，以避開 Windows/Node DNS family 選擇造成的 Telegram 連線問題。`OPENCLAW_TELEGRAM_SKIP_NATIVE_COMMANDS=1` 也會在 Gateway launcher 裡設定，讓 Telegram 啟動時不同步 native command menu，避免 command catalog 掃描把 Gateway 卡住；bot polling/接收訊息仍會啟動。2026-04-28 追加：如果 OpenClaw WebUI/tool 曾把 `browser.enabled` 改成 `true`，Gateway launcher 會在每次啟動前自動寫回 `false`，避免 browser plugin 重新安裝 `playwright-core` 之類 runtime deps，拖到 Telegram probe timeout。
+
+2026-04-28 另修正：`start_openclaw.cmd` 曾因兩個啟動器問題誤判 Telegram/Gateway 掛掉。第一，外層不再呼叫 `Update_OpenClaw_Status.ps1 -RestartOpenClaw`，避免同步模型時巢狀 restart。第二，restart wrapper 不再同步等待 restart script 的輸出管線，因為 hidden Gateway/Node 是長駐 descendants，會讓 `Start-Process -Wait` 或 stdout/stderr pipe 等不到結束。
+
+### 常用檢查指令 / Diagnostics
+
+```powershell
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8080/v1/models
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/v1/models
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:29644/health
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/health
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8001/health
+openclaw channels status --channel telegram --json
+.\show_status.cmd -DeepTelegram
+schtasks.exe /Query /TN "\OpenClaw Watchdog" /V /FO LIST
+Get-Content "$env:USERPROFILE\.openclaw\logs\openclaw-watchdog.log" -Tail 40
+Get-Content "$env:USERPROFILE\.openclaw\logs\gateway.stdout.log" -Tail 120
+```
+
+OpenClaw 重新安裝或 npm 更新後，請先看 [`docs\OpenClaw-reinstall-notes.md`](docs/OpenClaw-reinstall-notes.md)；裡面記錄了 compact `TOOLS.md`、Telegram IPv4 env/config，以及必要時要補回 OpenClaw bundle 的手動 patch。
+
+如果 Control UI 看起來像是「首頁開了，但就是連不上 gateway」，請先檢查瀏覽器裡記住的 websocket 位址是不是舊埠號，而不是只看 HTTP 首頁有沒有開。
 
 如果你想直接編譯並安裝最新版官方 `llama.cpp`，也可以用：
 If you want to build and install the latest official `llama.cpp` directly, you can also use:
@@ -386,8 +456,8 @@ Purpose: Passed to `--gpu-layers`. Allowed values are `auto`, `all`, or a non-ne
 
 ### `-ExtremeMode`
 
-用途：啟用更激進的自動 fitting，優先把 VRAM 往上推。這個模式主要搭配 `-GpuLayers auto` 使用；它會改用更小的 `--fit-target`，並在沒有手動覆寫時把 `--parallel` 壓得更低、把 prompt cache 壓得更小。  
-Purpose: Enables a more aggressive auto-fit profile that prioritizes pushing VRAM usage higher. This mode is mainly intended for use with `-GpuLayers auto`; it uses a smaller `--fit-target` and, unless you override them yourself, reduces `--parallel` and prompt cache size.
+用途：啟用更激進的自動 fitting，優先把 VRAM 往上推。這個模式主要搭配 `-GpuLayers auto` 使用；它會改用更小的 `--fit-target`，並在沒有手動覆寫時把 prompt cache 壓得更小。`llama.cpp` server slot 固定為 `--parallel 2`。  
+Purpose: Enables a more aggressive auto-fit profile that prioritizes pushing VRAM usage higher. This mode is mainly intended for use with `-GpuLayers auto`; it uses a smaller `--fit-target` and, unless you override it yourself, reduces prompt cache size. The `llama.cpp` server slot count is fixed at `--parallel 2`.
 
 範例 / Example:
 
@@ -397,8 +467,8 @@ Purpose: Enables a more aggressive auto-fit profile that prioritizes pushing VRA
 
 ### `-AutoTune`
 
-用途：啟用 per-model 的學習模式。當 `-GpuLayers auto` 這次啟動成功、模型完整放進 GPU、而且整體 GPU 使用率接近 95% 時，腳本會把 `GPU Layers`、`--fit-target`、`--cache-ram`、`--parallel` 等結果存到 [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json)。之後同一個模型、同一組顯卡配置、同一組 llama 參數再啟動時，會優先重用那組已學到的設定。  
-Purpose: Enables per-model learning. When a `-GpuLayers auto` launch succeeds, fully fits on GPU, and lands near 95% aggregate GPU usage, the script stores the learned `GPU Layers`, `--fit-target`, `--cache-ram`, and `--parallel` values in [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json). Later launches of the same model with the same GPU layout and llama arguments reuse that learned profile first.
+用途：啟用 per-model 的學習模式。當 `-GpuLayers auto` 這次啟動成功、模型完整放進 GPU、而且整體 GPU 使用率接近 95% 時，腳本會把 `GPU Layers`、`--fit-target`、`--cache-ram` 等結果存到 [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json)。之後同一個模型、同一組顯卡配置、同一組 llama 參數再啟動時，會優先重用那組已學到的設定；server slot 仍固定為 `--parallel 2`。  
+Purpose: Enables per-model learning. When a `-GpuLayers auto` launch succeeds, fully fits on GPU, and lands near 95% aggregate GPU usage, the script stores the learned `GPU Layers`, `--fit-target`, and `--cache-ram` values in [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json). Later launches of the same model with the same GPU layout and llama arguments reuse that learned profile first; server slots remain fixed at `--parallel 2`.
 
 範例 / Example:
 
@@ -592,11 +662,11 @@ If no tracked server is running, the script starts a new one.
 每次進入實際啟動流程前，腳本都會先清理這個工作資料夾下舊的 `llama-server.exe` 進程，再啟動新的 server。  
 Before each actual launch, the script clears older `llama-server.exe` processes started from this workspace, then starts a fresh server.
 
-如果 `-GpuLayers` 保持 `auto`，腳本還會在啟動時偵測目前可用的 GPU VRAM 與系統 RAM，動態調整 `--fit-target`、`--cache-ram`、`--parallel`，目標是盡量吃滿 VRAM，但減少把壓力打到 pagefile / SSD 的機率。  
-If `-GpuLayers` stays at `auto`, the script also detects currently available GPU VRAM and system RAM at launch time and adjusts `--fit-target`, `--cache-ram`, and `--parallel` dynamically, aiming to fill VRAM while reducing the chance of spilling pressure into the pagefile / SSD.
+如果 `-GpuLayers` 保持 `auto`，腳本還會在啟動時偵測目前可用的 GPU VRAM 與系統 RAM，動態調整 `--fit-target`、`--cache-ram`，目標是盡量吃滿 VRAM，但減少把壓力打到 pagefile / SSD 的機率。`llama.cpp` server slot 會固定帶 `--parallel 2`。  
+If `-GpuLayers` stays at `auto`, the script also detects currently available GPU VRAM and system RAM at launch time and adjusts `--fit-target` and `--cache-ram`, aiming to fill VRAM while reducing the chance of spilling pressure into the pagefile / SSD. The `llama.cpp` server always uses `--parallel 2`.
 
-如果再加上 `-ExtremeMode`，這套自動調整會更激進，通常會換成更小的 VRAM 保留空間，並把 slots 與 prompt cache 壓得更低。  
-If you also add `-ExtremeMode`, the auto-tuning becomes more aggressive, usually with a smaller VRAM margin and lower slot / prompt-cache overhead.
+如果再加上 `-ExtremeMode`，這套自動調整會更激進，通常會換成更小的 VRAM 保留空間，並把 prompt cache 壓得更低；slots 仍固定為 2。  
+If you also add `-ExtremeMode`, the auto-tuning becomes more aggressive, usually with a smaller VRAM margin and lower prompt-cache overhead; slots remain fixed at 2.
 
 如果你開啟 `-AutoTune`，而這次載入最終完整塞進 GPU 並落在目標 VRAM 區間，腳本會把這次驗證成功的組合記下來；之後再啟動同一模型時，就會優先套用該 profile。若目前可用 VRAM 比當初學到時更少，腳本會自動退回即時自動 fitting，不會硬套舊設定。  
 If you enable `-AutoTune` and a launch fully fits on GPU within the target VRAM window, the script remembers that validated combination and prefers it on later launches of the same model. If current free VRAM is lower than when the profile was learned, the script automatically falls back to live adaptive fitting instead of forcing the old settings.
@@ -1003,7 +1073,7 @@ Below is a practical Traditional Chinese reference for the most useful options.
 | `-ctv, --cache-type-v TYPE` | 列舉 | 設定 KV cache 的 V 型別 | `f16`, `q8_0`, `q4_0` |
 | `--mmap`, `--no-mmap` | 開關 | 控制是否 memory-map 模型 | 預設通常開啟 |
 | `--mlock` | 開關 | 盡量把模型留在 RAM，不讓系統換出 | 視 RAM 是否足夠 |
-| `-np, --parallel N` | 整數 | server slot 數量，可同時處理多請求 | `1`, `2`, `4` |
+| `-np, --parallel N` | 整數 | server slot 數量，可同時處理多請求；本 launcher 管理的 primary/vision server 固定使用 `2` | `2` |
 | `-cb, --cont-batching` | 開關 | 啟用 continuous batching | 預設通常開啟 |
 | `--threads-http N` | 整數 | HTTP request 處理執行緒數 | `-1`, `4` |
 | `--api-key KEY` | 字串 | 設定 API 金鑰驗證 | `my-secret-key` |

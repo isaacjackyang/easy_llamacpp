@@ -65,13 +65,13 @@ but GPU offload details now appear inside the main status view.
 
 .PARAMETER ExtremeMode
 Applies a more aggressive auto-fit strategy intended to push GPU VRAM harder.
-This mainly matters when GpuLayers is auto. It uses a smaller fit target, fewer slots,
+This mainly matters when GpuLayers is auto. It uses a smaller fit target
 and a smaller prompt cache unless you override those options yourself.
 
 .PARAMETER AutoTune
 Learns a reusable per-model GPU tuning profile after a successful near-full-VRAM launch.
 When a saved profile matches the same model, accelerator layout, and VRAM-relevant launch
-arguments, later launches reuse the saved GPU layers, fit target, cache limit, and slots automatically.
+arguments, later launches reuse the saved GPU layers, fit target, and cache limit automatically.
 
 .PARAMETER Stop
 Stops the tracked llama.cpp server process and removes the PID file.
@@ -142,7 +142,7 @@ Starts the server directly without opening the menu.
 Before each launch, the script automatically stops older llama-server.exe processes
 started from this workspace so stale GPU allocations do not linger.
 When GpuLayers is left at auto, the script also detects available GPU VRAM and system RAM
-to apply a smaller fit target, a bounded prompt cache, and fewer server slots on tighter systems.
+to apply a smaller fit target and a bounded prompt cache. Server slots are fixed at 2.
 ExtremeMode makes that auto-fit behavior more aggressive for users who want to push VRAM harder.
 AutoTune can learn and reuse a per-model tuning profile when a launch fits fully in GPU memory
 and lands near the target VRAM usage range.
@@ -257,6 +257,7 @@ $AutoTuneTargetUsagePercent = 95.0
 $AutoTuneMinUsagePercent = 93.0
 $AutoTuneMaxUsagePercent = 98.5
 $AutoTuneReuseHeadroomMiB = 128
+$FixedLlamaServerParallelSlots = 2
 
 foreach ($DirectoryPath in @($LogRoot, $JsonRoot)) {
     if (-not (Test-Path -LiteralPath $DirectoryPath -PathType Container)) {
@@ -418,6 +419,31 @@ function Get-ArgumentSearchText {
     return " " + (($Arguments | ForEach-Object { $_.Trim() }) -join " ") + " "
 }
 
+function Remove-LlamaParallelArgs {
+    param(
+        [string[]]$Arguments
+    )
+
+    $FilteredArguments = New-Object System.Collections.Generic.List[string]
+    if (-not $Arguments) {
+        return @()
+    }
+
+    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
+        $Argument = [string]$Arguments[$Index]
+        if ($Argument -match '^(?:--parallel|-np)(?:=.*)?$') {
+            if ($Argument -notmatch '=' -and ($Index + 1) -lt $Arguments.Count) {
+                $Index++
+            }
+            continue
+        }
+
+        $FilteredArguments.Add($Argument)
+    }
+
+    return $FilteredArguments.ToArray()
+}
+
 function Normalize-TuningText {
     param(
         [string]$Text
@@ -531,7 +557,6 @@ function Get-AutoLaunchTuning {
     $ArgumentText = Get-ArgumentSearchText -Arguments $Arguments
     $UserProvidedFitTarget = $ArgumentText -match '(?:^|\s)(?:--fit-target|-fitt)(?:=|\s+)'
     $UserProvidedCacheRam = $ArgumentText -match '(?:^|\s)(?:--cache-ram|-cram)(?:=|\s+)'
-    $UserProvidedParallel = $ArgumentText -match '(?:^|\s)(?:--parallel|-np)(?:=|\s+)'
     $UserDisabledFit = $ArgumentText -match '(?:^|\s)(?:--fit|-fit)(?:=|\s+)off(?:\s|$)'
     $UseManagedGpuLayers = ([string]::IsNullOrWhiteSpace($RequestedGpuLayers) -or $RequestedGpuLayers.Trim().ToLowerInvariant() -eq 'auto')
 
@@ -548,7 +573,7 @@ function Get-AutoLaunchTuning {
     }
     $MemoryInfo = Get-SystemMemoryInfo
     $TuningContext = Get-LaunchTuningContext -ResolvedModelPath $ResolvedModelPath -Arguments $Arguments -UseExtremeMode $UseExtremeMode -AcceleratorInventory $AcceleratorInventory
-    $CanApplySavedProfile = $UseManagedGpuLayers -and -not $UserDisabledFit -and -not $UserProvidedFitTarget -and -not $UserProvidedCacheRam -and -not $UserProvidedParallel
+    $CanApplySavedProfile = $UseManagedGpuLayers -and -not $UserDisabledFit -and -not $UserProvidedFitTarget -and -not $UserProvidedCacheRam
     $SavedProfileResult = if ($CanApplySavedProfile) {
         Get-SavedAutoTuneProfile -TuningContext $TuningContext
     }
@@ -570,7 +595,7 @@ function Get-AutoLaunchTuning {
             MemoryInfo          = $MemoryInfo
             FitTargetMiB        = if ($null -ne $SavedProfile.fit_target_mib) { [int]$SavedProfile.fit_target_mib } else { $null }
             CacheRamMiB         = if ($null -ne $SavedProfile.cache_ram_mib) { [int]$SavedProfile.cache_ram_mib } else { $null }
-            ParallelSlots       = if ($null -ne $SavedProfile.parallel_slots) { 1 } else { 1 }
+            ParallelSlots       = $FixedLlamaServerParallelSlots
             Source              = "saved-profile"
             SourceLabel         = "saved auto-tune profile"
             AutoTuneEnabled     = [bool]$EnableAutoTune
@@ -649,18 +674,7 @@ function Get-AutoLaunchTuning {
         }
     }
 
-    $ParallelSlots = $null
-    if (-not $UserProvidedParallel) {
-        if ($UseExtremeMode) {
-            $ParallelSlots = 1
-        }
-        elseif (($AcceleratorInfo -and ($AcceleratorInfo.TotalMiB -le 6144 -or $AcceleratorInfo.FreeMiB -lt 4096)) -or ($MemoryInfo -and $MemoryInfo.FreeMiB -lt 8192)) {
-            $ParallelSlots = 1
-        }
-        else {
-            $ParallelSlots = 1
-        }
-    }
+    $ParallelSlots = $FixedLlamaServerParallelSlots
 
     return [pscustomobject]@{
         UseManagedGpuLayers = $UseManagedGpuLayers
@@ -675,7 +689,7 @@ function Get-AutoLaunchTuning {
         Source              = "adaptive"
         SourceLabel         = "adaptive auto-fit"
         AutoTuneEnabled     = [bool]$EnableAutoTune
-        AutoTuneEligible    = [bool]($EnableAutoTune -and $UseManagedGpuLayers -and -not $UserDisabledFit -and -not $UserProvidedFitTarget -and -not $UserProvidedCacheRam -and -not $UserProvidedParallel)
+        AutoTuneEligible    = [bool]($EnableAutoTune -and $UseManagedGpuLayers -and -not $UserDisabledFit -and -not $UserProvidedFitTarget -and -not $UserProvidedCacheRam)
         TuningContext       = $TuningContext
         TuningProfile       = $null
         ProfileSkipReason   = [string]$SavedProfileResult.SkipReason
@@ -2772,15 +2786,21 @@ function Get-ModelGenerationArgs {
         [AllowNull()][string[]]$UserArguments
     )
 
-    if (-not $ModelEntry -or -not ($ModelEntry.PSObject.Properties["generation"]) -or $null -eq $ModelEntry.generation) {
-        return @()
+    $DefaultTemperature = "0.35"
+    $Generation = $null
+    if ($ModelEntry -and $ModelEntry.PSObject.Properties["generation"] -and $null -ne $ModelEntry.generation) {
+        $Generation = $ModelEntry.generation
     }
-
-    $Generation = $ModelEntry.generation
     $Arguments = New-Object System.Collections.Generic.List[string]
 
-    if ($Generation.PSObject.Properties["temperature"] -and -not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--temp(?:erature)?(?:=|$)'))) {
-        $Value = ConvertTo-LlamaScalarArgumentValue -Value $Generation.temperature
+    if (-not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--temp(?:erature)?(?:=|$)'))) {
+        $Value = $DefaultTemperature
+        if ($Generation -and $Generation.PSObject.Properties["temperature"]) {
+            $ConfiguredValue = ConvertTo-LlamaScalarArgumentValue -Value $Generation.temperature
+            if ($null -ne $ConfiguredValue) {
+                $Value = $ConfiguredValue
+            }
+        }
         if ($null -ne $Value) {
             $Arguments.Add("--temp")
             $Arguments.Add($Value)
@@ -2788,10 +2808,10 @@ function Get-ModelGenerationArgs {
     }
 
     $PresencePenaltyValue = $null
-    if ($Generation.PSObject.Properties["presence_penalty"]) {
+    if ($Generation -and $Generation.PSObject.Properties["presence_penalty"]) {
         $PresencePenaltyValue = $Generation.presence_penalty
     }
-    elseif ($Generation.PSObject.Properties["presencePenalty"]) {
+    elseif ($Generation -and $Generation.PSObject.Properties["presencePenalty"]) {
         $PresencePenaltyValue = $Generation.presencePenalty
     }
 
@@ -3225,6 +3245,34 @@ function Get-FitText {
 
 function Read-ConsoleKey {
     return $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
+
+function Wait-StatusViewAction {
+    param(
+        [int]$RefreshIntervalSec = 10
+    )
+
+    $RefreshIntervalSec = [Math]::Max(1, $RefreshIntervalSec)
+    $Deadline = (Get-Date).AddSeconds($RefreshIntervalSec)
+
+    while ((Get-Date) -lt $Deadline) {
+        try {
+            if ((Test-InteractiveConsole) -and [Console]::KeyAvailable) {
+                $Key = Read-ConsoleKey
+                switch ($Key.VirtualKeyCode) {
+                    13 { return "Exit" }
+                    27 { return "Exit" }
+                    default { }
+                }
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
+
+    return "Refresh"
 }
 
 function Show-MenuHeader {
@@ -4299,6 +4347,27 @@ function Wait-MenuContinue {
     Read-Host | Out-Null
 }
 
+function Show-LiveServerStatusView {
+    param(
+        [int]$RefreshIntervalSec = 10
+    )
+
+    $RefreshIntervalSec = [Math]::Max(1, $RefreshIntervalSec)
+
+    while ($true) {
+        $UpdatedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Show-MenuHeader -Title "Server Status" -Subtitle ("Current tracked server state. Auto-refresh every {0}s. Updated {1}." -f $RefreshIntervalSec, $UpdatedAt)
+        Show-ServerStatus
+        Write-Host ""
+        Write-Host ("Auto-refresh every {0} seconds. Press Enter or Esc to return." -f $RefreshIntervalSec) -ForegroundColor Yellow
+
+        $Action = Wait-StatusViewAction -RefreshIntervalSec $RefreshIntervalSec
+        if ($Action -eq "Exit") {
+            return
+        }
+    }
+}
+
 function Stop-TrackedServer {
     $TrackedProcess = Get-TrackedServerProcess
     if (-not $TrackedProcess) {
@@ -4392,9 +4461,7 @@ function Invoke-InteractiveLauncher {
                 return $true
             }
             "Status" {
-                Show-MenuHeader -Title "Server Status" -Subtitle "Current tracked server state."
-                Show-ServerStatus
-                Wait-MenuContinue
+                Show-LiveServerStatusView -RefreshIntervalSec 10
             }
             "Stop" {
                 Show-MenuHeader -Title "Stop Running Server" -Subtitle "Stopping the tracked llama.cpp server if one exists."
@@ -6324,14 +6391,31 @@ function Write-OpenClawStatusLines {
     }
 
     $NodeText = if ($RuntimeStatus.NodeProcessCount -gt 0) {
-        "node running ($($RuntimeStatus.NodeProcessCount) process entry/entries)"
+        "running ($($RuntimeStatus.NodeProcessCount) process entry/entries)"
     }
     else {
-        "node not running"
+        "not running"
     }
 
-    $StatusColor = if ($RuntimeStatus.GatewayListening -and $RuntimeStatus.NodeProcessCount -gt 0) { "Green" } else { "Yellow" }
-    Write-Host "Claw   : $GatewayText | $NodeText" -ForegroundColor $StatusColor
+    $GatewayColor = if ($RuntimeStatus.GatewayListening) {
+        "Green"
+    }
+    elseif ($RuntimeStatus.GatewayProcessCount -gt 0) {
+        "Yellow"
+    }
+    else {
+        "DarkGray"
+    }
+
+    $NodeColor = if ($RuntimeStatus.NodeProcessCount -gt 0) {
+        "Green"
+    }
+    else {
+        "Yellow"
+    }
+
+    Write-Host "Claw   : $GatewayText" -ForegroundColor $GatewayColor
+    Write-Host "Node   : $NodeText" -ForegroundColor $NodeColor
     Write-Host "ClawURL: $($RuntimeStatus.GatewayUrl)"
     if ($RuntimeStatus.ManagedMediaStatus) {
         Write-OpenClawManagedMediaStatusLine -Label "TTS" -ServiceStatus $RuntimeStatus.ManagedMediaStatus.Tts
@@ -6623,6 +6707,8 @@ try {
         $ModelPath = Resolve-ModelPath -Path $ModelPath
     }
     Initialize-JsonWorkspaceFiles -IndexPath $ModelIndexPath
+    $LlamaArgs = @(Remove-LlamaParallelArgs -Arguments $LlamaArgs)
+    $script:LlamaArgs = $LlamaArgs
     Test-LlamaArgConflict -Arguments $LlamaArgs
 
     if (-not (Test-Path -LiteralPath $ServerExe)) {
@@ -6662,6 +6748,9 @@ try {
     if ($GpuLayers -notmatch '^(auto|all|\d+)$') {
         throw "GpuLayers must be auto, all, or a non-negative integer."
     }
+
+    $LlamaArgs = @(Remove-LlamaParallelArgs -Arguments $LlamaArgs)
+    $script:LlamaArgs = $LlamaArgs
 
     $ModelPath = Resolve-LaunchModelPath -IndexPath $ModelIndexPath -RequestedModelPath $ModelPath
     $LaunchModelEntry = Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $ModelPath

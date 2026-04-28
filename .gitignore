@@ -31,3 +31,9 @@
 !/install.cmd
 !/install_latest.cmd
 !/commit_github.cmd
+
+# Local OpenClaw repair/staging/runtime artifacts
+/.openclaw-plugin-stage/
+/.tmp-openclaw-repair/
+/.codex-telegram-worker1/
+/PS1/logs/

@@ -16,8 +16,14 @@ $llamaStdErrLogPath = Join-Path $projectRoot "logs\llama-server.stderr.log"
 $llamaPidPath = Join-Path $projectRoot "logs\llama-server.pid"
 $openClawRoot = Join-Path $env:USERPROFILE ".openclaw"
 $openClawConfigPath = Join-Path $openClawRoot "openclaw.json"
+$openClawStartPath = Join-Path $openClawRoot "start.cmd"
+$openClawRestartPath = Join-Path $openClawRoot "scripts\restart-openclaw-gateway.ps1"
 $gatewayScriptPath = Join-Path $openClawRoot "gateway.cmd"
 $nodeScriptPath = Join-Path $openClawRoot "node.cmd"
+$powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+if (-not (Test-Path -LiteralPath $powershellExe)) {
+  $powershellExe = "powershell.exe"
+}
 $managedGatewayScriptName = "run-openclaw-gateway-with-media.ps1"
 $managedTtsHealthPort = 8000
 $managedSttHealthPort = 8001
@@ -382,8 +388,27 @@ function Test-TcpPort {
   }
 }
 
+function Test-HttpReady {
+  param(
+    [Parameter(Mandatory = $true)][string]$Url,
+    [int]$TimeoutSec = 5
+  )
+
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSec
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300)
+  } catch {
+    return $false
+  }
+}
+
 function Test-OpenClawGatewayUsesManagedMedia {
   if (-not (Test-Path -LiteralPath $gatewayScriptPath)) {
+    return $false
+  }
+
+  $managedGatewayScriptPath = Join-Path $openClawRoot "scripts\$managedGatewayScriptName"
+  if (-not (Test-Path -LiteralPath $managedGatewayScriptPath)) {
     return $false
   }
 
@@ -394,7 +419,11 @@ function Test-OpenClawGatewayUsesManagedMedia {
     return $false
   }
 
-  return ($gatewayText -match [regex]::Escape($managedGatewayScriptName))
+  return (
+    ($gatewayText -match [regex]::Escape($managedGatewayScriptName)) -or
+    ($gatewayText -match 'start-openclaw-gateway-hidden\.vbs') -or
+    ($gatewayText -match 'OPENCLAW_GATEWAY_LAUNCHER')
+  )
 }
 
 function Get-OpenClawGatewayHostProcesses {
@@ -411,7 +440,15 @@ function Get-OpenClawNodeHostProcesses {
   return @(
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
       Where-Object {
-        ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bnode\s+run\b') -or
+        ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bnode\s+run\b')
+      }
+  )
+}
+
+function Get-OpenClawNodeStartupProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
         ($_.Name -like "powershell*.exe" -and $_.CommandLine -match 'start-openclaw-node\.ps1') -or
         ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'node\.cmd')
       }
@@ -441,8 +478,8 @@ function Get-OpenClawManagedMediaStatusText {
   $mediaProcesses = @(Get-OpenClawManagedMediaProcesses)
   $ttsProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+tts_server\.py' }).Count -gt 0
   $sttProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+stt_server\.py' }).Count -gt 0
-  $ttsListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedTtsHealthPort
-  $sttListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedSttHealthPort
+  $ttsListening = Test-HttpReady -Url "http://127.0.0.1:$managedTtsHealthPort/health"
+  $sttListening = Test-HttpReady -Url "http://127.0.0.1:$managedSttHealthPort/health"
 
   $ttsStatus = if ($ttsListening) {
     "TTS ready on 127.0.0.1:$managedTtsHealthPort"
@@ -934,6 +971,47 @@ function Invoke-Checked {
   }
 }
 
+function Invoke-ManagedOpenClawRestartScript {
+  param([string]$Reason = "model-sync")
+
+  if (-not (Test-Path -LiteralPath $openClawRestartPath)) {
+    throw "Cannot find managed restart script: $openClawRestartPath"
+  }
+
+  $logDir = Join-Path $openClawRoot "logs"
+  if (-not (Test-Path -LiteralPath $logDir)) {
+    [void](New-Item -ItemType Directory -Path $logDir -Force)
+  }
+
+  $stamp = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ([guid]::NewGuid().ToString("N").Substring(0, 8))
+  $safeReason = ([regex]::Replace($Reason, '[^A-Za-z0-9._-]+', '-')).Trim('-')
+  if ([string]::IsNullOrWhiteSpace($safeReason)) {
+    $safeReason = "model-sync"
+  }
+
+  $stdoutPath = Join-Path $logDir ("update-openclaw-restart.{0}.{1}.stdout.log" -f $safeReason, $stamp)
+  $stderrPath = Join-Path $logDir ("update-openclaw-restart.{0}.{1}.stderr.log" -f $safeReason, $stamp)
+  $arguments = @(
+    "-NoLogo",
+    "-NoProfile",
+    "-WindowStyle", "Hidden",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $openClawRestartPath
+  )
+
+  $process = Start-Process `
+    -FilePath $powershellExe `
+    -ArgumentList $arguments `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath `
+    -WindowStyle Hidden `
+    -PassThru
+
+  Write-Info "Managed OpenClaw restart launched with PID $($process.Id); runtime health will be verified by start_openclaw/watchdog."
+  Write-Info "Restart logs: $stdoutPath ; $stderrPath"
+  return $true
+}
+
 function Get-NodeExecutablePath {
   $candidates = @(
     "C:\Program Files\nodejs\node.exe",
@@ -994,13 +1072,28 @@ function Invoke-SessionTokenBackfill {
 function Restart-OpenClawServices {
   param([Parameter(Mandatory = $true)][string]$OpenClawCommandPath)
 
+  if (Test-Path -LiteralPath $openClawRestartPath) {
+    [void](Invoke-ManagedOpenClawRestartScript -Reason "model-sync")
+    return
+  }
+
+  if (Test-Path -LiteralPath $openClawStartPath) {
+    & $openClawStartPath
+    $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    if ($exitCode -ne 0) {
+      throw "OpenClaw managed startup failed with exit code $exitCode."
+    }
+    return
+  }
+
   foreach ($taskName in @("OpenClaw Gateway", "OpenClaw Node")) {
     & schtasks.exe /End /TN $taskName *> $null
   }
 
   $processesToStop = @(
     @(Get-OpenClawGatewayHostProcesses) +
-    @(Get-OpenClawNodeHostProcesses)
+    @(Get-OpenClawNodeHostProcesses) +
+    @(Get-OpenClawNodeStartupProcesses)
   ) | Sort-Object ProcessId -Unique
 
   foreach ($process in $processesToStop) {
@@ -1022,7 +1115,7 @@ function Show-Summary {
   )
 
   $llamaPid = ""
-  $gatewayListening = Test-TcpPort -TargetHost "127.0.0.1" -Port 29644
+  $gatewayListening = Test-HttpReady -Url "http://127.0.0.1:29644/health"
   $managedMediaStatus = Get-OpenClawManagedMediaStatusText
   if (Test-Path -LiteralPath $llamaPidPath) {
     $llamaPid = (Get-Content -LiteralPath $llamaPidPath -TotalCount 1 | Select-Object -First 1).Trim()

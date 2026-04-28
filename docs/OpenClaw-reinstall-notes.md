@@ -3,6 +3,9 @@
 這份文件記錄本機 OpenClaw 修補點。OpenClaw 透過 npm 重新安裝或更新後，
 安裝目錄裡的 bundle 可能會被覆蓋；照這裡可以把修補補回來。
 
+日常啟動流程、watchdog 運作、狀態檢查與本機踩坑紀錄請看
+[`OpenClaw-startup-watchdog-runbook.md`](OpenClaw-startup-watchdog-runbook.md)。
+
 ## 快速恢復
 
 在 `easy_llamacpp` 專案根目錄執行：

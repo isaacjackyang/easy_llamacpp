@@ -13,11 +13,17 @@ $llamaModelsUrl = "http://127.0.0.1:8080/v1/models"
 $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $openClawRoot = Join-Path $env:USERPROFILE ".openclaw"
 $openClawConfigPath = Join-Path $openClawRoot "openclaw.json"
+$openClawStopMarker = Join-Path $openClawRoot "openclaw.stop"
+$openClawStartPath = Join-Path $openClawRoot "start.cmd"
+$openClawRestartPath = Join-Path $openClawRoot "scripts\restart-openclaw-gateway.ps1"
+$openClawWatchdogStartPath = Join-Path $PSScriptRoot "Start_OpenClaw_Watchdog.ps1"
 $gatewayScriptPath = Join-Path $openClawRoot "gateway.cmd"
 $nodeScriptPath = Join-Path $openClawRoot "node.cmd"
+$gatewayStdoutLog = Join-Path $openClawRoot "logs\gateway.stdout.log"
 $managedGatewayScriptName = "run-openclaw-gateway-with-media.ps1"
 $managedTtsHealthPort = 8000
 $managedSttHealthPort = 8001
+$managedVisionHealthUrl = "http://127.0.0.1:8081/v1/models"
 $defaultGatewayReadyTimeoutSeconds = 60
 $managedMediaGatewayReadyTimeoutSeconds = 480
 
@@ -151,7 +157,7 @@ function Disable-OpenClawHeavyStartupPlugins {
       $Config.plugins.load -is [pscustomobject] -and
       $Config.plugins.load.PSObject.Properties.Name -contains "paths") {
     $loadPaths = @($Config.plugins.load.paths | ForEach-Object { [string]$_ })
-    $updatedLoadPaths = @($loadPaths | Where-Object { $_ -notmatch '(?i)openclaw-web-search|voice-call|browser' })
+    $updatedLoadPaths = @($loadPaths | Where-Object { $_ -notmatch '(?i)agentmemory|openclaw-web-search|voice-call|browser' })
     if ($updatedLoadPaths.Count -ne $loadPaths.Count) {
       $Config.plugins.load.paths = @($updatedLoadPaths)
       $changedKeys.Add("plugins.load.paths")
@@ -164,19 +170,37 @@ function Disable-OpenClawHeavyStartupPlugins {
         continue
       }
 
-      $entry = $Config.plugins.entries.$pluginName
-      if (-not ($entry -is [pscustomobject])) {
-        continue
+      if (Remove-JsonNoteProperty -Node $Config.plugins.entries -Name $pluginName) {
+        $changedKeys.Add("plugins.entries.$pluginName")
+      }
+    }
+
+    if (@($Config.plugins.entries.PSObject.Properties).Count -eq 0) {
+      if (Remove-JsonNoteProperty -Node $Config.plugins -Name "entries") {
+        $changedKeys.Add("plugins.entries")
+      }
+    }
+  }
+
+  if ($Config.PSObject.Properties.Name -contains "mcp" -and $Config.mcp -is [pscustomobject]) {
+    $mcpPropertyNames = @($Config.mcp.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($mcpPropertyNames -contains "servers" -and $Config.mcp.servers -is [pscustomobject]) {
+      foreach ($serverName in @("agentmemory", "markitdown")) {
+        if (Remove-JsonNoteProperty -Node $Config.mcp.servers -Name $serverName) {
+          $changedKeys.Add("mcp.servers.$serverName")
+        }
       }
 
-      if ($entry.PSObject.Properties.Name -contains "enabled") {
-        if ($entry.enabled -ne $false) {
-          $entry.enabled = $false
-          $changedKeys.Add("plugins.entries.$pluginName.enabled")
+      if (@($Config.mcp.servers.PSObject.Properties).Count -eq 0) {
+        if (Remove-JsonNoteProperty -Node $Config.mcp -Name "servers") {
+          $changedKeys.Add("mcp.servers")
         }
-      } else {
-        $entry | Add-Member -NotePropertyName "enabled" -NotePropertyValue $false
-        $changedKeys.Add("plugins.entries.$pluginName.enabled")
+      }
+    }
+
+    if (@($Config.mcp.PSObject.Properties).Count -eq 0) {
+      if (Remove-JsonNoteProperty -Node $Config -Name "mcp") {
+        $changedKeys.Add("mcp")
       }
     }
   }
@@ -359,6 +383,75 @@ function Wait-TcpPort {
   return $false
 }
 
+function Test-HttpReady {
+  param(
+    [Parameter(Mandatory = $true)][string]$Url,
+    [int]$TimeoutSec = 5
+  )
+
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSec
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300)
+  } catch {
+    return $false
+  }
+}
+
+function Wait-HttpReady {
+  param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string]$Url,
+    [int]$TimeoutSeconds = 60,
+    [int]$ProbeIntervalSeconds = 2
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-HttpReady -Url $Url) {
+      Write-Ok "$Name is ready at $Url"
+      return
+    }
+
+    Start-Sleep -Seconds $ProbeIntervalSeconds
+  }
+
+  throw "$Name did not become ready at $Url"
+}
+
+function Test-GatewayReadyLog {
+  if (-not (Test-Path -LiteralPath $gatewayStdoutLog)) {
+    return $false
+  }
+
+  try {
+    return [bool](Select-String -LiteralPath $gatewayStdoutLog -Pattern '\[gateway\]\s+ready\b' -Quiet)
+  } catch {
+    return $false
+  }
+}
+
+function Wait-OpenClawGatewayReady {
+  param(
+    [int]$TimeoutSeconds = 60,
+    [int]$ProbeIntervalSeconds = 2
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-HttpReady -Url "http://127.0.0.1:29644/health" -TimeoutSec 5) {
+      return $true
+    }
+
+    if (Test-OpenClawGatewayHttp -Url "http://127.0.0.1:29644/" -TimeoutSec 5) {
+      return $true
+    }
+
+    Start-Sleep -Seconds $ProbeIntervalSeconds
+  }
+
+  return $false
+}
+
 function Test-OpenClawGatewayProbe {
   param(
     [Parameter(Mandatory = $true)][string]$OpenClawCommandPath,
@@ -479,13 +572,22 @@ function Test-OpenClawGatewayUsesManagedMedia {
     return $false
   }
 
+  $managedGatewayScriptPath = Join-Path $openClawRoot "scripts\$managedGatewayScriptName"
+  if (-not (Test-Path -LiteralPath $managedGatewayScriptPath)) {
+    return $false
+  }
+
   try {
     $gatewayText = Get-Content -LiteralPath $gatewayScriptPath -Raw -ErrorAction Stop
   } catch {
     return $false
   }
 
-  return ($gatewayText -match [regex]::Escape($managedGatewayScriptName))
+  return (
+    ($gatewayText -match [regex]::Escape($managedGatewayScriptName)) -or
+    ($gatewayText -match 'start-openclaw-gateway-hidden\.vbs') -or
+    ($gatewayText -match 'OPENCLAW_GATEWAY_LAUNCHER')
+  )
 }
 
 function Get-OpenClawManagedMediaProcesses {
@@ -511,10 +613,11 @@ function Get-OpenClawManagedMediaStatusText {
   $mediaProcesses = @(Get-OpenClawManagedMediaProcesses)
   $ttsProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+tts_server\.py' }).Count -gt 0
   $sttProcessDetected = @($mediaProcesses | Where-Object { $_.CommandLine -match 'workspace[\\/]+stt_server\.py' }).Count -gt 0
-  $ttsListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedTtsHealthPort
-  $sttListening = Test-TcpPort -TargetHost "127.0.0.1" -Port $managedSttHealthPort
+  $ttsHealthy = Test-HttpReady -Url "http://127.0.0.1:$managedTtsHealthPort/health"
+  $sttHealthy = Test-HttpReady -Url "http://127.0.0.1:$managedSttHealthPort/health"
+  $visionHealthy = Test-HttpReady -Url $managedVisionHealthUrl
 
-  $ttsStatus = if ($ttsListening) {
+  $ttsStatus = if ($ttsHealthy) {
     "TTS ready on 127.0.0.1:$managedTtsHealthPort"
   } elseif ($ttsProcessDetected) {
     "TTS process detected"
@@ -522,7 +625,7 @@ function Get-OpenClawManagedMediaStatusText {
     "TTS not detected"
   }
 
-  $sttStatus = if ($sttListening) {
+  $sttStatus = if ($sttHealthy) {
     "STT ready on 127.0.0.1:$managedSttHealthPort"
   } elseif ($sttProcessDetected) {
     "STT process detected"
@@ -530,7 +633,13 @@ function Get-OpenClawManagedMediaStatusText {
     "STT not detected"
   }
 
-  return "$ttsStatus; $sttStatus"
+  $visionStatus = if ($visionHealthy) {
+    "Vision ready on 127.0.0.1:8081"
+  } else {
+    "Vision not ready"
+  }
+
+  return "$ttsStatus; $sttStatus; $visionStatus"
 }
 
 function Get-OpenClawGatewayReadyTimeoutSeconds {
@@ -554,6 +663,81 @@ function Invoke-Checked {
   }
 }
 
+function Invoke-ManagedOpenClawRestartScript {
+  param([string]$Reason = "start")
+
+  if (-not (Test-Path -LiteralPath $openClawRestartPath)) {
+    throw "Cannot find managed restart script: $openClawRestartPath"
+  }
+
+  $logDir = Join-Path $openClawRoot "logs"
+  if (-not (Test-Path -LiteralPath $logDir)) {
+    [void](New-Item -ItemType Directory -Path $logDir -Force)
+  }
+
+  $stamp = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ([guid]::NewGuid().ToString("N").Substring(0, 8))
+  $safeReason = ([regex]::Replace($Reason, '[^A-Za-z0-9._-]+', '-')).Trim('-')
+  if ([string]::IsNullOrWhiteSpace($safeReason)) {
+    $safeReason = "start"
+  }
+
+  $stdoutPath = Join-Path $logDir ("start-openclaw-restart.{0}.{1}.stdout.log" -f $safeReason, $stamp)
+  $stderrPath = Join-Path $logDir ("start-openclaw-restart.{0}.{1}.stderr.log" -f $safeReason, $stamp)
+  $arguments = @(
+    "-NoLogo",
+    "-NoProfile",
+    "-WindowStyle", "Hidden",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $openClawRestartPath
+  )
+
+  $process = Start-Process `
+    -FilePath $powershellExe `
+    -ArgumentList $arguments `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath `
+    -WindowStyle Hidden `
+    -PassThru
+
+  Write-Info "Managed OpenClaw restart launched with PID $($process.Id); verifying runtime health next."
+  Write-Info "Restart logs: $stdoutPath ; $stderrPath"
+  return $true
+}
+
+function Clear-OpenClawStopMarker {
+  if (Test-Path -LiteralPath $openClawStopMarker) {
+    Remove-Item -LiteralPath $openClawStopMarker -Force
+    Write-Info "Removed openclaw.stop so watchdog and hidden launchers can recover the stack."
+  }
+}
+
+function Enable-OpenClawWatchdog {
+  param([switch]$NoRun)
+
+  if (-not (Test-Path -LiteralPath $openClawWatchdogStartPath)) {
+    Write-Warn "Cannot find watchdog start script: $openClawWatchdogStartPath"
+    return
+  }
+
+  $arguments = @(
+    "-NoLogo",
+    "-NoProfile",
+    "-WindowStyle", "Hidden",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $openClawWatchdogStartPath,
+    "-NoPause"
+  )
+  if ($NoRun) {
+    $arguments += "-NoRun"
+  }
+
+  try {
+    Invoke-Checked -FilePath $powershellExe -Arguments $arguments
+  } catch {
+    Write-Warn "Could not enable OpenClaw Watchdog: $($_.Exception.Message)"
+  }
+}
+
 function Invoke-Capture {
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
@@ -569,6 +753,269 @@ function Invoke-Capture {
   }
 }
 
+function Invoke-CaptureIsolatedProcess {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [string[]]$Arguments = @(),
+    [int]$TimeoutSeconds = 1200
+  )
+
+  $stamp = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ([guid]::NewGuid().ToString("N").Substring(0, 8))
+  $stdoutPath = Join-Path $env:TEMP ("openclaw-start-$stamp.stdout.log")
+  $stderrPath = Join-Path $env:TEMP ("openclaw-start-$stamp.stderr.log")
+  $process = $null
+
+  try {
+    $process = Start-Process `
+      -FilePath $FilePath `
+      -ArgumentList $Arguments `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $stdoutPath `
+      -RedirectStandardError $stderrPath `
+      -PassThru
+
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+      Stop-ProcessTree -ProcessId $process.Id
+      return [pscustomobject]@{
+        ExitCode = 124
+        Output = "Command timed out after ${TimeoutSeconds}s: $FilePath $($Arguments -join ' ')"
+      }
+    }
+
+    $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { "" }
+    $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
+    $text = ((@($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine).Trim()
+
+    return [pscustomobject]@{
+      ExitCode = [int]$process.ExitCode
+      Output = $text
+    }
+  } finally {
+    Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Get-ObjectPropertyValue {
+  param(
+    [AllowNull()]$Object,
+    [Parameter(Mandatory = $true)][string]$Name
+  )
+
+  if ($null -eq $Object) {
+    return $null
+  }
+
+  if ($Object.PSObject.Properties.Name -contains $Name) {
+    return $Object.$Name
+  }
+
+  return $null
+}
+
+function Stop-ProcessTree {
+  param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+  $children = @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.ParentProcessId -eq $ProcessId }
+  )
+
+  foreach ($child in $children) {
+    Stop-ProcessTree -ProcessId ([int]$child.ProcessId)
+  }
+
+  try {
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+    $process.WaitForExit(3000) | Out-Null
+  } catch {
+  }
+}
+
+function Stop-StaleTelegramStatusProbes {
+  param([int]$MinimumAgeSeconds = 60)
+
+  $now = Get-Date
+  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.CommandLine -and
+      $_.CommandLine -match 'channels\s+status' -and
+      $_.CommandLine -match '--channel\s+telegram'
+    } |
+    ForEach-Object {
+      $ageSeconds = 999999
+      try {
+        $createdAt = [System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)
+        $ageSeconds = ($now - $createdAt).TotalSeconds
+      } catch {
+      }
+
+      if ($ageSeconds -ge $MinimumAgeSeconds) {
+        Stop-ProcessTree -ProcessId ([int]$_.ProcessId)
+      }
+    }
+}
+
+function Invoke-OpenClawTelegramStatusJson {
+  param(
+    [Parameter(Mandatory = $true)][string]$OpenClawCommandPath,
+    [int]$TimeoutSeconds = 45
+  )
+
+  $stamp = "{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmssfff"), ([guid]::NewGuid().ToString("N"))
+  $stdoutPath = Join-Path $env:TEMP ("openclaw-telegram-status-$stamp.stdout.log")
+  $stderrPath = Join-Path $env:TEMP ("openclaw-telegram-status-$stamp.stderr.log")
+  $openClawNpmRoot = Split-Path -Parent $OpenClawCommandPath
+  $openClawEntry = Join-Path $openClawNpmRoot "node_modules\openclaw\openclaw.mjs"
+  $telegramProbeScript = Join-Path $openClawRoot "scripts\probe-openclaw-telegram-status.mjs"
+  $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+  $statusFilePath = $OpenClawCommandPath
+  $statusArguments = @("channels", "status", "--channel", "telegram", "--json")
+  if ($nodeCommand -and (Test-Path -LiteralPath $telegramProbeScript)) {
+    $statusFilePath = $nodeCommand.Source
+    $statusArguments = @($telegramProbeScript, "--timeout-ms", "30000")
+  } elseif ($nodeCommand -and (Test-Path -LiteralPath $openClawEntry)) {
+    $statusFilePath = $nodeCommand.Source
+    $statusArguments = @($openClawEntry, "channels", "status", "--channel", "telegram", "--json")
+  }
+  $process = $null
+
+  try {
+    Stop-StaleTelegramStatusProbes -MinimumAgeSeconds 60
+    $process = Start-Process `
+      -FilePath $statusFilePath `
+      -ArgumentList $statusArguments `
+      -RedirectStandardOutput $stdoutPath `
+      -RedirectStandardError $stderrPath `
+      -WindowStyle Hidden `
+      -PassThru
+
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+      Stop-ProcessTree -ProcessId $process.Id
+      Stop-StaleTelegramStatusProbes -MinimumAgeSeconds 0
+      return [pscustomobject]@{
+        ExitCode = 124
+        Output = ""
+        Error = "openclaw telegram status probe timed out after ${TimeoutSeconds}s"
+      }
+    }
+
+    $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { "" }
+    $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
+    return [pscustomobject]@{
+      ExitCode = [int]$process.ExitCode
+      Output = $stdout.Trim()
+      Error = $stderr.Trim()
+    }
+  } finally {
+    Stop-StaleTelegramStatusProbes -MinimumAgeSeconds 60
+    Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Test-OpenClawTelegramReady {
+  param(
+    [Parameter(Mandatory = $true)][string]$OpenClawCommandPath,
+    [ref]$Detail
+  )
+
+  $oldDisableAutoSelectFamily = $env:OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY
+  $oldDnsResultOrder = $env:OPENCLAW_TELEGRAM_DNS_RESULT_ORDER
+  $oldForceIpv4 = $env:OPENCLAW_TELEGRAM_FORCE_IPV4
+
+  try {
+    $env:OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY = "1"
+    $env:OPENCLAW_TELEGRAM_DNS_RESULT_ORDER = "ipv4first"
+    $env:OPENCLAW_TELEGRAM_FORCE_IPV4 = "1"
+
+    $result = Invoke-OpenClawTelegramStatusJson -OpenClawCommandPath $OpenClawCommandPath -TimeoutSeconds 45
+    $text = [string]$result.Output
+    if ([int]$result.ExitCode -ne 0) {
+      $Detail.Value = "openclaw channels status exited with code $($result.ExitCode)"
+      if (-not [string]::IsNullOrWhiteSpace($result.Error)) {
+        $Detail.Value += ": $($result.Error)"
+      }
+      return $false
+    }
+
+    $jsonStart = $text.IndexOf("{")
+    $jsonEnd = $text.LastIndexOf("}")
+    if ($jsonStart -lt 0 -or $jsonEnd -lt $jsonStart) {
+      $Detail.Value = "Telegram status output did not contain JSON."
+      return $false
+    }
+
+    $status = $text.Substring($jsonStart, $jsonEnd - $jsonStart + 1) | ConvertFrom-Json
+    $channelAccounts = Get-ObjectPropertyValue -Object $status -Name "channelAccounts"
+    $telegramAccounts = Get-ObjectPropertyValue -Object $channelAccounts -Name "telegram"
+    $enabledConfigured = @(
+      @($telegramAccounts) |
+        Where-Object {
+          $null -ne $_ -and
+          (Get-ObjectPropertyValue -Object $_ -Name "enabled") -eq $true -and
+          (Get-ObjectPropertyValue -Object $_ -Name "configured") -eq $true
+        }
+    )
+
+    if ($enabledConfigured.Count -eq 0) {
+      $Detail.Value = "Telegram has no enabled configured accounts."
+      return $false
+    }
+
+    $notReady = New-Object System.Collections.Generic.List[string]
+    foreach ($account in $enabledConfigured) {
+      $accountId = [string](Get-ObjectPropertyValue -Object $account -Name "accountId")
+      if ([string]::IsNullOrWhiteSpace($accountId)) {
+        $accountId = "unknown"
+      }
+
+      $running = (Get-ObjectPropertyValue -Object $account -Name "running") -eq $true
+      $connected = (Get-ObjectPropertyValue -Object $account -Name "connected") -eq $true
+      $probe = Get-ObjectPropertyValue -Object $account -Name "probe"
+      $probeOk = $null -eq $probe -or (Get-ObjectPropertyValue -Object $probe -Name "ok") -eq $true
+      if (-not ($running -and $connected -and $probeOk)) {
+        $notReady.Add(("{0}(running={1}, connected={2}, probe={3})" -f $accountId, $running, $connected, $probeOk))
+      }
+    }
+
+    if ($notReady.Count -eq 0) {
+      $Detail.Value = "Telegram accounts ready: " + (($enabledConfigured | ForEach-Object { [string](Get-ObjectPropertyValue -Object $_ -Name "accountId") }) -join ", ")
+      return $true
+    }
+
+    $Detail.Value = "Telegram accounts not ready: " + ($notReady -join "; ")
+    return $false
+  } catch {
+    $Detail.Value = $_.Exception.Message
+    return $false
+  } finally {
+    $env:OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY = $oldDisableAutoSelectFamily
+    $env:OPENCLAW_TELEGRAM_DNS_RESULT_ORDER = $oldDnsResultOrder
+    $env:OPENCLAW_TELEGRAM_FORCE_IPV4 = $oldForceIpv4
+  }
+}
+
+function Wait-OpenClawTelegramReady {
+  param(
+    [Parameter(Mandatory = $true)][string]$OpenClawCommandPath,
+    [int]$TimeoutSeconds = 300,
+    [int]$ProbeIntervalSeconds = 5
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  $detail = ""
+  while ((Get-Date) -lt $deadline) {
+    if (Test-OpenClawTelegramReady -OpenClawCommandPath $OpenClawCommandPath -Detail ([ref]$detail)) {
+      Write-Ok $detail
+      return
+    }
+
+    Start-Sleep -Seconds $ProbeIntervalSeconds
+  }
+
+  throw "Telegram did not become ready. Last status: $detail"
+}
+
 function Invoke-OpenClawRestart {
   param([Parameter(Mandatory = $true)][string]$OpenClawCommandPath)
 
@@ -576,7 +1023,19 @@ function Invoke-OpenClawRestart {
   Stop-OpenClawRuntime
 
   if (Test-OpenClawGatewayUsesManagedMedia) {
-    Write-Info "OpenClaw gateway manages TTS/STT sidecars, so they will be restarted together."
+    Write-Info "OpenClaw gateway manages Vision/TTS/STT sidecars, so they will be restarted together."
+  }
+
+  if (Test-Path -LiteralPath $openClawRestartPath) {
+    Write-Info "Restarting OpenClaw stack with managed restart script"
+    [void](Invoke-ManagedOpenClawRestartScript -Reason "manual")
+    return
+  }
+
+  if (Test-Path -LiteralPath $openClawStartPath) {
+    Write-Info "Restarting OpenClaw stack with .openclaw\\start.cmd"
+    Invoke-Checked -FilePath $openClawStartPath
+    return
   }
 
   Write-Info "Restarting OpenClaw gateway"
@@ -602,7 +1061,15 @@ function Get-OpenClawNodeHostProcesses {
   return @(
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
       Where-Object {
-        ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bnode\s+run\b') -or
+        ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bnode\s+run\b')
+      }
+  )
+}
+
+function Get-OpenClawNodeStartupProcesses {
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
         ($_.Name -like "powershell*.exe" -and $_.CommandLine -match 'start-openclaw-node\.ps1') -or
         ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'node\.cmd')
       }
@@ -616,7 +1083,9 @@ function Get-OpenClawAgentMemoryProcesses {
         $_.ProcessId -ne $PID -and
         $_.CommandLine -and (
           $_.CommandLine -match '\.openclaw[\\/]+agentmemory\.cmd' -or
-          $_.CommandLine -match '\.openclaw[\\/]+tools[\\/]+agentmemory'
+          $_.CommandLine -match '\.openclaw[\\/]+tools[\\/]+agentmemory' -or
+          $_.CommandLine -match '\.openclaw[\\/]+tools[\\/]+markitdown' -or
+          $_.CommandLine -match '\bmarkitdown_mcp\b'
         )
       }
   )
@@ -630,6 +1099,7 @@ function Stop-OpenClawRuntime {
   $processesToStop = @(
     @(Get-OpenClawGatewayHostProcesses) +
     @(Get-OpenClawNodeHostProcesses) +
+    @(Get-OpenClawNodeStartupProcesses) +
     @(Get-OpenClawManagedMediaProcesses) +
     @(Get-OpenClawAgentMemoryProcesses)
   ) | Sort-Object ProcessId -Unique
@@ -642,12 +1112,18 @@ function Stop-OpenClawRuntime {
 }
 
 function Wait-OpenClawNodeHost {
-  param([int]$TimeoutSeconds = 30)
+  param(
+    [int]$TimeoutSeconds = 30,
+    [int]$StableSeconds = 20
+  )
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     if (@(Get-OpenClawNodeHostProcesses).Count -gt 0) {
-      return $true
+      Start-Sleep -Seconds $StableSeconds
+      if (@(Get-OpenClawNodeHostProcesses).Count -gt 0) {
+        return $true
+      }
     }
 
     Start-Sleep -Seconds 1
@@ -672,21 +1148,19 @@ function Invoke-SyncCurrentModel {
   }
 
   if (-not (Test-Path -LiteralPath $powershellExe)) {
-    $scriptResult = Invoke-Capture -FilePath "powershell.exe" -Arguments @(
+    $scriptResult = Invoke-CaptureIsolatedProcess -FilePath "powershell.exe" -Arguments @(
       "-NoLogo",
       "-NoProfile",
       "-ExecutionPolicy", "Bypass",
       "-File", $syncScriptPath,
-      "-RestartOpenClaw",
       "-NoPause"
     )
   } else {
-    $scriptResult = Invoke-Capture -FilePath $powershellExe -Arguments @(
+    $scriptResult = Invoke-CaptureIsolatedProcess -FilePath $powershellExe -Arguments @(
       "-NoLogo",
       "-NoProfile",
       "-ExecutionPolicy", "Bypass",
       "-File", $syncScriptPath,
-      "-RestartOpenClaw",
       "-NoPause"
     )
   }
@@ -706,21 +1180,19 @@ function Invoke-SyncCurrentModel {
     Start-Sleep -Seconds 2
 
     if (-not (Test-Path -LiteralPath $powershellExe)) {
-      $scriptResult = Invoke-Capture -FilePath "powershell.exe" -Arguments @(
+      $scriptResult = Invoke-CaptureIsolatedProcess -FilePath "powershell.exe" -Arguments @(
         "-NoLogo",
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", $syncScriptPath,
-        "-RestartOpenClaw",
         "-NoPause"
       )
     } else {
-      $scriptResult = Invoke-Capture -FilePath $powershellExe -Arguments @(
+      $scriptResult = Invoke-CaptureIsolatedProcess -FilePath $powershellExe -Arguments @(
         "-NoLogo",
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", $syncScriptPath,
-        "-RestartOpenClaw",
         "-NoPause"
       )
     }
@@ -742,17 +1214,25 @@ function Ensure-OpenClawRuntime {
   $gatewayReadyTimeoutSeconds = Get-OpenClawGatewayReadyTimeoutSeconds
 
   if ($gatewayUsesManagedMedia) {
-    Write-Info "Detected managed TTS/STT sidecars behind gateway.cmd. Allowing up to $gatewayReadyTimeoutSeconds seconds for gateway warmup."
+    Write-Info "Detected managed Vision/TTS/STT sidecars behind gateway.cmd. Allowing up to $gatewayReadyTimeoutSeconds seconds for gateway warmup."
   }
 
-  $gatewayReady = Wait-TcpPort -TargetHost "127.0.0.1" -Port 29644 -TimeoutSeconds $gatewayReadyTimeoutSeconds -ProbeIntervalSeconds 2
+  $gatewayReady = Wait-OpenClawGatewayReady -TimeoutSeconds $gatewayReadyTimeoutSeconds -ProbeIntervalSeconds 2
   if (-not $gatewayReady) {
     if (@(Get-OpenClawGatewayHostProcesses).Count -eq 0) {
-      Write-Warn "Gateway process was not detected after the restart. Launching gateway.cmd directly."
-      Start-BackgroundCmd -ScriptPath $gatewayScriptPath
-      $gatewayReady = Wait-TcpPort -TargetHost "127.0.0.1" -Port 29644 -TimeoutSeconds $gatewayReadyTimeoutSeconds -ProbeIntervalSeconds 2
+      if (Test-Path -LiteralPath $openClawRestartPath) {
+        Write-Warn "Gateway process was not detected after the restart. Running managed restart script."
+        [void](Invoke-ManagedOpenClawRestartScript -Reason "runtime-recovery")
+      } elseif (Test-Path -LiteralPath $openClawStartPath) {
+        Write-Warn "Gateway process was not detected after the restart. Running .openclaw\\start.cmd."
+        Invoke-Checked -FilePath $openClawStartPath
+      } else {
+        Write-Warn "Gateway process was not detected after the restart. Launching gateway.cmd directly."
+        Start-BackgroundCmd -ScriptPath $gatewayScriptPath
+      }
+      $gatewayReady = Wait-OpenClawGatewayReady -TimeoutSeconds $gatewayReadyTimeoutSeconds -ProbeIntervalSeconds 2
     } elseif ($gatewayUsesManagedMedia) {
-      Write-Warn "Gateway host is still warming up while the managed TTS/STT sidecars initialize."
+      Write-Warn "Gateway host is still warming up while the managed Vision/TTS/STT sidecars initialize."
     } else {
       Write-Warn "Gateway process exists but 127.0.0.1:29644 is still warming up."
     }
@@ -765,31 +1245,54 @@ function Ensure-OpenClawRuntime {
 
   Write-Ok "OpenClaw gateway is listening on 127.0.0.1:29644"
 
-  if (-not (Test-OpenClawGatewayProbe -OpenClawCommandPath $OpenClawCommandPath -TimeoutSeconds $gatewayReadyTimeoutSeconds)) {
-    throw "OpenClaw gateway is listening on 127.0.0.1:29644, but the gateway RPC probe still fails."
+  if ($gatewayUsesManagedMedia) {
+    Wait-HttpReady -Name "TTS" -Url "http://127.0.0.1:$managedTtsHealthPort/health" -TimeoutSeconds 60
+    Wait-HttpReady -Name "STT" -Url "http://127.0.0.1:$managedSttHealthPort/health" -TimeoutSeconds 60
+    Wait-HttpReady -Name "Vision" -Url $managedVisionHealthUrl -TimeoutSeconds 60
   }
 
-  Write-Ok "OpenClaw gateway RPC probe is reachable"
-
-  if (-not (Wait-OpenClawNodeHost -TimeoutSeconds 45)) {
+  if (-not (Wait-OpenClawNodeHost -TimeoutSeconds 600)) {
     Write-Warn "Node host was not detected after the service restart. Launching node.cmd directly."
     Start-BackgroundCmd -ScriptPath $nodeScriptPath
 
-    if (-not (Wait-OpenClawNodeHost -TimeoutSeconds 60)) {
+    if (-not (Wait-OpenClawNodeHost -TimeoutSeconds 600)) {
       throw "OpenClaw node host did not stay running."
     }
   }
 
   Write-Ok "OpenClaw node host is running"
+
+  $shouldCheckTelegram = $false
+  if (Test-Path -LiteralPath $openClawConfigPath) {
+    try {
+      $configForTelegramCheck = Get-Content -LiteralPath $openClawConfigPath -Raw | ConvertFrom-Json
+      if (Get-Command Test-OpenClawTelegramConfigured -ErrorAction SilentlyContinue) {
+        $shouldCheckTelegram = Test-OpenClawTelegramConfigured -Config $configForTelegramCheck
+      }
+    } catch {
+      $shouldCheckTelegram = $false
+    }
+  }
+
+  if ($shouldCheckTelegram) {
+    Write-Warn "Telegram readiness is monitored by watchdog after the core stack is healthy."
+  }
 }
 
 function Show-Summary {
   param([Parameter(Mandatory = $true)][bool]$ModelSyncPerformed)
 
   $activeModelId = Get-RunningLlamaModelId -ModelsUrl $llamaModelsUrl
-  $gatewayListening = Test-TcpPort -TargetHost "127.0.0.1" -Port 29644
+  $gatewayListening = Test-HttpReady -Url "http://127.0.0.1:29644/health"
   $nodeProcesses = @(Get-OpenClawNodeHostProcesses)
   $managedMediaStatus = if (Test-OpenClawGatewayUsesManagedMedia) { Get-OpenClawManagedMediaStatusText } else { $null }
+  $telegramDetail = ""
+  $telegramReady = $false
+  try {
+    $telegramReady = Test-OpenClawTelegramReady -OpenClawCommandPath (Get-OpenClawCommandPath) -Detail ([ref]$telegramDetail)
+  } catch {
+    $telegramDetail = $_.Exception.Message
+  }
 
   Write-Host ""
   Write-Host "OpenClaw Start Summary" -ForegroundColor Green
@@ -799,6 +1302,7 @@ function Show-Summary {
   }
   Write-Host ("Gateway   : {0}" -f $(if ($gatewayListening) { "listening on 127.0.0.1:29644" } else { "not listening" }))
   Write-Host ("Node      : {0}" -f $(if ($nodeProcesses.Count -gt 0) { "running ($($nodeProcesses.Count) process entry/entries)" } else { "not detected" }))
+  Write-Host ("Telegram  : {0}" -f $(if ($telegramReady) { $telegramDetail } else { "not ready ($telegramDetail)" }))
   if ($null -ne $managedMediaStatus) {
     Write-Host "Media     : $managedMediaStatus"
   }
@@ -820,15 +1324,21 @@ function Pause-BeforeExit {
   }
 }
 
+$script:OpenClawStartExitCode = 0
+
 try {
   $openClawCommandPath = Get-OpenClawCommandPath
+  Clear-OpenClawStopMarker
   Ensure-ManagedOpenClawStartupAssets
   Repair-OpenClawConfigIfNeeded
+  Enable-OpenClawWatchdog -NoRun
   $hasRunningLlama = Test-LlamaServerAvailable -ModelsUrl $llamaModelsUrl
 
   if ($hasRunningLlama) {
-    Write-Info "Detected a running llama.cpp server. Syncing OpenClaw to the active model and restarting services."
+    Write-Info "Detected a running llama.cpp server. Syncing OpenClaw to the active model."
     Invoke-SyncCurrentModel
+    Write-Info "Restarting OpenClaw services after model sync."
+    Invoke-OpenClawRestart -OpenClawCommandPath $openClawCommandPath
   } else {
     Write-Info "No running llama.cpp server detected. Starting OpenClaw with the existing configuration."
     Invoke-OpenClawRestart -OpenClawCommandPath $openClawCommandPath
@@ -836,11 +1346,13 @@ try {
 
   Ensure-OpenClawRuntime -OpenClawCommandPath $openClawCommandPath
   Show-Summary -ModelSyncPerformed:$hasRunningLlama
+  Enable-OpenClawWatchdog
 } catch {
   Write-Host ""
   Write-Host "Error:" -ForegroundColor Red
   Write-Host $_.Exception.Message -ForegroundColor Red
-  exit 1
+  $script:OpenClawStartExitCode = 1
 } finally {
   Pause-BeforeExit
+  exit $script:OpenClawStartExitCode
 }
