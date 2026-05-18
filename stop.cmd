@@ -18,5 +18,5 @@ if not exist "%POWERSHELL_EXE%" (
     set "POWERSHELL_EXE=powershell.exe"
 )
 
-"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%STOP_PS1%" -VisionServiceOnly %*
+"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%STOP_PS1%" %*
 exit /b %ERRORLEVEL%

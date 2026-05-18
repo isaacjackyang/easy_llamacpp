@@ -1,7 +1,7 @@
 ﻿# llama.cpp Launcher / llama.cpp 啟動器
 
-這個資料夾包含 `Start_LCPP.ps1`，也包含較方便雙擊或命令列使用的 `Start.cmd`、`stop_all.cmd`、`start_openclaw.cmd`、`stop_openclaw.cmd`、`show_status.cmd`、`start_watchdog.cmd`、`stop_watchdog.cmd`、`start_codex_telegram_worker1.cmd`、`stop_codex_telegram_worker1.cmd`、`stop_llamacpp.cmd`、`start_voice_service.cmd`、`stop_voice_service.cmd`、`start_vision.cmd`、`stop_vision.cmd`、`install.cmd`、`install_latest.cmd`。它們分別用來啟動、全部停止、啟動/停止 OpenClaw、查看 OpenClaw stack 狀態、啟用/停用 watchdog、啟用/停用 Codex Telegram worker1 bridge、只停止 `llama.cpp`、只啟動 TTS/STT、只停止 TTS/STT、只啟動 vision sidecar、只停止 vision sidecar、安裝官方 Windows 預編譯版，以及在本機編譯安裝最新版 `llama.cpp` 到 `bin\`，並管理本機的 `llama-server.exe`、模型切換、背景執行與 OpenClaw runtime。
-This folder contains `Start_LCPP.ps1` and also simpler `Start.cmd`, `stop_all.cmd`, `start_openclaw.cmd`, `stop_openclaw.cmd`, `show_status.cmd`, `start_watchdog.cmd`, `stop_watchdog.cmd`, `start_codex_telegram_worker1.cmd`, `stop_codex_telegram_worker1.cmd`, `stop_llamacpp.cmd`, `start_voice_service.cmd`, `stop_voice_service.cmd`, `start_vision.cmd`, `stop_vision.cmd`, `install.cmd`, and `install_latest.cmd` wrappers for double-click or command-line use. They are used to start, stop everything, start/stop OpenClaw, show the OpenClaw stack status, enable/disable the watchdog, enable/disable the Codex Telegram worker1 bridge, stop `llama.cpp` only, start TTS/STT only, stop TTS/STT only, start the vision sidecar only, stop the vision sidecar only, install the official Windows prebuilt release, and locally build/install the latest `llama.cpp` into the `bin\` folder, including local `llama-server.exe` management, model switching, background execution, and the OpenClaw runtime.
+這個資料夾現在是純 `llama.cpp` Windows 啟動器，重點是 `Start_LCPP.ps1` 與它的 `Start.cmd`、`stop.cmd`、`stop_llamacpp.cmd`、`install.cmd`、`install_latest.cmd` 包裝器。它們負責啟動主 `llama-server.exe`、在同一個服務上掛 `--mmproj` 視覺能力、切換模型、背景執行、清理舊進程，以及安裝或更新本機 `bin\` 下的 `llama.cpp`。
+This folder is now a pure `llama.cpp` Windows launcher. The main entry points are `Start_LCPP.ps1` plus the simpler `Start.cmd`, `stop.cmd`, `stop_llamacpp.cmd`, `install.cmd`, and `install_latest.cmd` wrappers. They manage the primary `llama-server.exe`, attach vision through `--mmproj` on the same service, switch models, run in the background, clean stale processes, and install or update the local `bin\` llama.cpp files.
 
 ## 目錄結構 / Folder Layout
 
@@ -10,28 +10,15 @@ Use the following layout so your own scripts stay separate from the `llama.cpp` 
 
 ```text
 Start.cmd
+stop.cmd
 install.cmd
 install_latest.cmd
-stop_all.cmd
-start_openclaw.cmd
-stop_openclaw.cmd
-show_status.cmd
-start_watchdog.cmd
-stop_watchdog.cmd
-start_codex_telegram_worker1.cmd
-stop_codex_telegram_worker1.cmd
 stop_llamacpp.cmd
-start_voice_service.cmd
-stop_voice_service.cmd
-start_vision.cmd
-stop_vision.cmd
 README.md
 PS1\
   Install_LCPP_Prebuilt.ps1
   Install_LCPP.ps1
   Start_LCPP.ps1
-  Start_Voice_Service.ps1
-  Start_Vision_Service.ps1
   stop.ps1
   scan_model.ps1
   Install_LCPP_Autostart.ps1
@@ -156,20 +143,6 @@ You can also use `Start.cmd` for the same launcher flow, which is more convenien
 .\Start.cmd
 ```
 
-若只想快速清理舊進程，也可以直接用：  
-If you only want to quickly clear old processes, you can also use:
-
-```bat
-.\stop_all.cmd
-```
-
-若只想關閉 OpenClaw，可用：  
-If you only want to stop OpenClaw, use:
-
-```bat
-.\stop_openclaw.cmd
-```
-
 若只想關閉 `llama.cpp`，可用：  
 If you only want to stop `llama.cpp`, use:
 
@@ -177,129 +150,8 @@ If you only want to stop `llama.cpp`, use:
 .\stop_llamacpp.cmd
 ```
 
-若只想啟動語音服務 TTS/STT，可用：  
-If you only want to start the TTS/STT voice services, use:
-
-```bat
-.\start_voice_service.cmd
-```
-
-若只想停止語音服務 TTS/STT，可用：  
-If you only want to stop the TTS/STT voice services, use:
-
-```bat
-.\stop_voice_service.cmd
-```
-
-若只想啟動 vision sidecar，可用；它會用 `llama-server` 載入 vision GGUF 與 `--mmproj`，預設服務在 `127.0.0.1:8081`：  
-If you only want to start the vision sidecar, use this; it runs `llama-server` with the vision GGUF and `--mmproj`, defaulting to `127.0.0.1:8081`:
-
-```bat
-.\start_vision.cmd
-```
-
-一般模型啟動時，`Start_LCPP.ps1` 會自動在模型同資料夾尋找最相近的 `mmproj*.gguf`。找到時主 `llama-server` 會直接加上 `--mmproj <path>` 與 `--jinja`，狀態列會顯示 `Vision : enabled on primary server`；OpenClaw 的 `llama-cpp-vision` provider 也會同步指到目前主服務。`start_vision.cmd` 仍保留給需要獨立 `8081` sidecar 的情境。
-During normal model startup, `Start_LCPP.ps1` automatically looks for the closest matching `mmproj*.gguf` beside the selected model. When found, the primary `llama-server` is launched with `--mmproj <path>` and `--jinja`, the status view shows `Vision : enabled on primary server`, and OpenClaw's `llama-cpp-vision` provider is synced to the active primary server. `start_vision.cmd` remains available for a separate `8081` sidecar when needed.
-
-若只想停止 vision sidecar，可用：  
-If you only want to stop the vision sidecar, use:
-
-```bat
-.\stop_vision.cmd
-```
-
-## OpenClaw 啟動維護 / OpenClaw Startup Maintenance
-
-完整啟動流程、watchdog 原理、狀態檢查與本機踩坑紀錄，請見 [`docs/OpenClaw-startup-watchdog-runbook.md`](docs/OpenClaw-startup-watchdog-runbook.md)。
-
-這套流程把 OpenClaw 當成一組常駐服務管理，而不是只啟動單一 gateway。核心目標是：重開機或手動重啟後，primary `llama.cpp` 由 launcher/autostart 維持，OpenClaw Gateway/WebUI、Node、TTS、STT、Vision、Telegram 與 watchdog 也能回到可用狀態，且 OpenClaw 相關視窗預設隱藏。
-
-### 入口 / Entry Points
-
-從這個 repo 啟動與停止 OpenClaw：
-
-```bat
-.\start_openclaw.cmd -NoPause
-.\stop_openclaw.cmd
-.\show_status.cmd
-.\start_watchdog.cmd
-.\stop_watchdog.cmd
-.\start_codex_telegram_worker1.cmd
-.\stop_codex_telegram_worker1.cmd
-```
-
-同步到 OpenClaw runtime 後，也可以直接用：
-
-```bat
-%USERPROFILE%\.openclaw\start.cmd
-%USERPROFILE%\.openclaw\stop.cmd
-```
-
-`start_openclaw.cmd` 會用 hidden PowerShell 執行 `PS1\Start_OpenClaw.ps1`。`stop_openclaw.cmd` 會轉呼叫 `%USERPROFILE%\.openclaw\stop.cmd`，建立 `openclaw.stop` 停止標記、停用/結束 watchdog，並停止 Gateway、Node、TTS、STT、Vision sidecar 與相關 OpenClaw 進程。`start_watchdog.cmd` 只會啟用 `\OpenClaw Watchdog` 並要求它立即跑一次；`stop_watchdog.cmd` 只會停用 watchdog 排程，不會停止 OpenClaw 服務，也不會預設強殺正在跑的 watchdog pass，避免切半進行中的重啟。需要硬停目前那輪時可用 `stop_watchdog.cmd -ForceEnd`。`start_codex_telegram_worker1.cmd` / `stop_codex_telegram_worker1.cmd` 管理已移出 OpenClaw 的 `worker1` Telegram bot；目前 worker1 bridge/autostart/automation 預設暫停，避免消耗 Codex 帳戶額度。
-
-### 啟動流程 / Startup Flow
-
-1. `PS1\Start_OpenClaw.ps1` 先同步 managed 啟動資產到 `%USERPROFILE%\.openclaw\scripts\`，來源在 `PS1\OpenClaw\`。
-2. 同步內容包含 `run-openclaw-gateway-with-media.ps1`、`start-llama-cpp-vision.ps1`、hidden Gateway/Node launcher、Control UI patch 與 workspace `TOOLS.md`。
-3. 腳本會修復 `openclaw.json`：同步目前模型資訊、清掉舊 graphiti/context-engine slot、保留 install metadata，並在 Telegram token/config 存在時保持 Telegram 啟用。
-4. 如果 `127.0.0.1:8080/v1/models` 上已有 primary `llama.cpp` server，OpenClaw provider 會同步到目前正在跑的模型；模型同步只改 config/session，不再在 `Update_OpenClaw_Status.ps1` 裡巢狀重啟，避免外層 starter 卡住。
-5. Gateway 重啟走 `%USERPROFILE%\.openclaw\scripts\restart-openclaw-gateway.ps1`。`Start_OpenClaw.ps1` 只 dispatch restart pass，接著用自己的 health checks 等待服務恢復；不要用 `Start-Process -Wait` 等 restart script，因為它會留下長駐 Gateway/Node descendants。
-6. Hidden Gateway launcher 執行 `run-openclaw-gateway-with-media.ps1`：先把 `browser.enabled=true`、heavy plugin/MCP 殘留壓回關閉，避免啟動時 stage/install browser runtime deps，再啟動 TTS `127.0.0.1:8000/health` 與 STT `127.0.0.1:8001/health`，最後確保 Vision sidecar `127.0.0.1:8081/v1/models`。
-7. Vision 一律走 `llama-server`，使用 vision GGUF 搭配 `--mmproj`，不走 `llama-cli --mmproj`。managed Vision sidecar 與一般模型啟動的預設 sampling temperature 都是 `--temp 0.35`。
-8. TTS/STT/Vision 準備好後，Gateway 用 `node ...\openclaw\dist\index.js gateway run --port 29644` 在隱藏視窗中啟動，WebUI/health 入口是 `http://127.0.0.1:29644/` 與 `http://127.0.0.1:29644/health`。
-9. Gateway health 連續穩定後，再啟動 hidden Node launcher；Node wrapper 會等 Gateway ready，然後執行 `node ...\openclaw\dist\index.js node run --host 127.0.0.1 --port 29644`。`gateway.cmd` 目前只指向 hidden VBS launcher，但仍視為 managed media 啟動路徑，所以 starter 會給 TTS/STT/Vision/Gateway 最多 480 秒 warmup。
-10. Gateway 啟動 channels 後，Telegram 以 polling 模式連線；OpenClaw 只管理 `default`、`worker2`。`worker1` bot token 已移到 Codex Telegram bridge。
-
-### 服務與健康訊號 / Services
-
-| 服務 | 預設位置 / 檢查方式 | 管理方式 |
-| --- | --- | --- |
-| Primary `llama.cpp` | `http://127.0.0.1:8080/v1/models` | 由 `Start.cmd` / `PS1\Start_LCPP.ps1` 或其 autostart 管理；OpenClaw 啟動時會偵測並同步 |
-| Vision sidecar | `http://127.0.0.1:8081/v1/models` | OpenClaw Gateway launcher 與 watchdog 管理，使用 `llama-server --mmproj --parallel 2 --temp 0.35` |
-| TTS | `http://127.0.0.1:8000/health` | OpenClaw Gateway launcher 與 watchdog 管理 |
-| STT | `http://127.0.0.1:8001/health` | OpenClaw Gateway launcher 與 watchdog 管理 |
-| Gateway / WebUI | `http://127.0.0.1:29644/health`、`http://127.0.0.1:29644/` | hidden Gateway launcher 與 watchdog 管理 |
-| Node | `node ... dist\index.js node run ...` 進程 | hidden Node launcher 與 watchdog 管理 |
-| Telegram | `openclaw channels status --channel telegram --json` | Gateway channel 管理；OpenClaw 只管理 `default`、`worker2`，啟動時保留 enabled 設定並套用 IPv4-first 網路設定 |
-| Codex Telegram worker1 | `show_status.cmd` 的 `Codex Telegram worker1` 行 | `worker1` bot 不屬於 OpenClaw；目前 bridge/autostart/automation 暫停，需要時手動啟用 |
-| Watchdog | Windows 工作排程 `\OpenClaw Watchdog` | 每 1 分鐘檢查一次 OpenClaw stack；核心服務連續失敗才自動重啟 |
-
-### Watchdog 原理 / Watchdog Behavior
-
-Watchdog 是 Windows 工作排程 `\OpenClaw Watchdog`，作為開機/登入後自動恢復 OpenClaw stack 的保險，目前設定為每 1 分鐘執行 `%USERPROFILE%\.openclaw\scripts\watch-openclaw-stack-hidden.vbs`，再由 VBS 隱藏呼叫 `watch-openclaw-stack.ps1`。它只做很小的判斷，避免自己變成新的不穩定來源：
-
-- 先檢查 `%USERPROFILE%\.openclaw\openclaw.stop`。只要 stop marker 存在，就直接退出，避免你手動 stop 後又被排程拉起來。
-- 使用 mutex `Local\OpenClawStackWatchdog`，避免上一輪還在重啟時下一輪又重疊執行。
-- 每輪檢查 primary `llama.cpp`、TTS、STT、Vision、Gateway 的 health，並檢查 OpenClaw Node 進程是否存在。
-- 如果 `%USERPROFILE%\.openclaw\openclaw.restart` 殘留，但沒有任何 restart process 還在跑，而且健康檢查仍失敗，watchdog 會把它視為 stale marker、清掉後重新修復。
-- 全部通過就安靜結束；失敗會先寫入 `%USERPROFILE%\.openclaw\logs\openclaw-watchdog.log`。為了避開短暫 health timeout 造成的重啟循環，核心服務需連續 2 次失敗才重啟。
-- `restart-openclaw-gateway.ps1` 會重新啟用 watchdog、停止殘留 Gateway/Node、透過 `\OpenClaw Gateway` / `\OpenClaw Node` 工作排程重啟 hidden Gateway/Node，並等 TTS/STT/Vision/Gateway/Node ready 後才結束。Telegram 會等一段時間；如果 Telegram 還沒 ready，流程不再永久卡住，改交給下一輪 watchdog 繼續修復。
-- Telegram 是 watchdog 的檢查項目之一，使用輕量 helper 直接問 Gateway `channels.status`；正常狀態是 enabled/configured accounts 具備 `running=true`、`connected=true`。watchdog 會把 `running/connected` 寫入 cache 供 `show_status.cmd` 顯示，但只有 provider 明確 `running=False` 且連續 2 次失敗才重啟。`connected=False`、Telegram API/網路抖動、Gateway 忙碌或 probe timeout 只記錄與顯示，不會直接重啟整套 OpenClaw。
-
-Watchdog 的排程 action 應該是 `wscript.exe %USERPROFILE%\.openclaw\scripts\watch-openclaw-stack-hidden.vbs`，不是直接跑 `powershell.exe`。這是為了避免 Windows 每分鐘建立 console 視窗，造成像 cmd 視窗短暫跳出又縮到工作列。Codex Telegram worker1 bridge 的登入自啟也同樣走 `wscript.exe ...run-codex-telegram-worker1-bridge.vbs`。
-
-`OPENCLAW_SKIP_PLUGIN_SERVICES=1` 與 `OPENCLAW_SKIP_BUNDLED_RUNTIME_DEPS=1` 會保留，用來避免重型 plugin service 或 provider bundled dependency install 在 startup 卡住；但不要設定 `OPENCLAW_SKIP_CHANNELS`，否則 Telegram channel 不會啟動。Telegram 相關 launcher/env 會套用 IPv4-first 設定，以避開 Windows/Node DNS family 選擇造成的 Telegram 連線問題。`OPENCLAW_TELEGRAM_SKIP_NATIVE_COMMANDS=1` 也會在 Gateway launcher 裡設定，讓 Telegram 啟動時不同步 native command menu，避免 command catalog 掃描把 Gateway 卡住；bot polling/接收訊息仍會啟動。2026-04-28 追加：如果 OpenClaw WebUI/tool 曾把 `browser.enabled` 改成 `true`，Gateway launcher 會在每次啟動前自動寫回 `false`，避免 browser plugin 重新安裝 `playwright-core` 之類 runtime deps，拖到 Telegram probe timeout。
-
-2026-04-28 另修正：`start_openclaw.cmd` 曾因兩個啟動器問題誤判 Telegram/Gateway 掛掉。第一，外層不再呼叫 `Update_OpenClaw_Status.ps1 -RestartOpenClaw`，避免同步模型時巢狀 restart。第二，restart wrapper 不再同步等待 restart script 的輸出管線，因為 hidden Gateway/Node 是長駐 descendants，會讓 `Start-Process -Wait` 或 stdout/stderr pipe 等不到結束。
-
-### 常用檢查指令 / Diagnostics
-
-```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8080/v1/models
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8081/v1/models
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:29644/health
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/health
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8001/health
-openclaw channels status --channel telegram --json
-.\show_status.cmd -DeepTelegram
-schtasks.exe /Query /TN "\OpenClaw Watchdog" /V /FO LIST
-Get-Content "$env:USERPROFILE\.openclaw\logs\openclaw-watchdog.log" -Tail 40
-Get-Content "$env:USERPROFILE\.openclaw\logs\gateway.stdout.log" -Tail 120
-```
-
-OpenClaw 重新安裝或 npm 更新後，請先看 [`docs\OpenClaw-reinstall-notes.md`](docs/OpenClaw-reinstall-notes.md)；裡面記錄了 compact `TOOLS.md`、Telegram IPv4 env/config，以及必要時要補回 OpenClaw bundle 的手動 patch。
-
-如果 Control UI 看起來像是「首頁開了，但就是連不上 gateway」，請先檢查瀏覽器裡記住的 websocket 位址是不是舊埠號，而不是只看 HTTP 首頁有沒有開。
+一般模型啟動時，`Start_LCPP.ps1` 會先讓你選主模型，再提供一個 `Vision Mmproj` 選項。這個選項預設會用主模型名稱自動比對最接近的 `mmproj*.gguf`；如果找不到合理候選，就維持空白。你也可以改成手動選擇 `mmproj`，或明確停用 vision，最後才真正啟動服務。vision 現在只會掛在同一個 `8080` 主服務上，不再使用獨立 `8081` side service。
+During normal startup, `Start_LCPP.ps1` first lets you choose the primary model and then exposes a `Vision Mmproj` option. By default it auto-matches the closest `mmproj*.gguf` for the selected primary model; if no reasonable match exists, it stays blank. You can also switch to a manual `mmproj` picker or disable vision explicitly before the server is actually launched. Vision now stays on the same primary `8080` service and no longer uses a separate `8081` side service.
 
 如果你想直接編譯並安裝最新版官方 `llama.cpp`，也可以用：
 If you want to build and install the latest official `llama.cpp` directly, you can also use:
@@ -398,11 +250,11 @@ You can now append extra `llama-server.exe` parameters directly after the `Start
 For example:
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 131072 --metrics
 ```
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -Background --ctx-size 8192 --api-key my-secret-key --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 131072 --api-key my-secret-key --metrics
 ```
 
 如果你想看目前這版 `llama-server.exe` 實際支援哪些參數，可以直接用：  
@@ -438,7 +290,7 @@ Purpose: Sets the HTTP port for `llama-server.exe`. The default is `8080`. In pr
 範例 / Example:
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -Port 8081
+.\PS1\Start_LCPP.ps1 -Port 8090
 ```
 
 ### `-GpuLayers <string>`
@@ -456,8 +308,8 @@ Purpose: Passed to `--gpu-layers`. Allowed values are `auto`, `all`, or a non-ne
 
 ### `-ExtremeMode`
 
-用途：啟用更激進的自動 fitting，優先把 VRAM 往上推。這個模式主要搭配 `-GpuLayers auto` 使用；它會改用更小的 `--fit-target`，並在沒有手動覆寫時把 prompt cache 壓得更小。`llama.cpp` server slot 固定為 `--parallel 2`。  
-Purpose: Enables a more aggressive auto-fit profile that prioritizes pushing VRAM usage higher. This mode is mainly intended for use with `-GpuLayers auto`; it uses a smaller `--fit-target` and, unless you override it yourself, reduces prompt cache size. The `llama.cpp` server slot count is fixed at `--parallel 2`.
+用途：啟用更激進的自動 fitting，優先把 VRAM 往上推。這個模式主要搭配 `-GpuLayers auto` 使用；它會改用更小的 `--fit-target`，並在沒有手動覆寫時把 prompt cache 壓得更小。`llama.cpp` server slot 固定為 `--parallel 1`。  
+Purpose: Enables a more aggressive auto-fit profile that prioritizes pushing VRAM usage higher. This mode is mainly intended for use with `-GpuLayers auto`; it uses a smaller `--fit-target` and, unless you override it yourself, reduces prompt cache size. The `llama.cpp` server slot count is fixed at `--parallel 1`.
 
 範例 / Example:
 
@@ -467,8 +319,8 @@ Purpose: Enables a more aggressive auto-fit profile that prioritizes pushing VRA
 
 ### `-AutoTune`
 
-用途：啟用 per-model 的學習模式。當 `-GpuLayers auto` 這次啟動成功、模型完整放進 GPU、而且整體 GPU 使用率接近 95% 時，腳本會把 `GPU Layers`、`--fit-target`、`--cache-ram` 等結果存到 [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json)。之後同一個模型、同一組顯卡配置、同一組 llama 參數再啟動時，會優先重用那組已學到的設定；server slot 仍固定為 `--parallel 2`。  
-Purpose: Enables per-model learning. When a `-GpuLayers auto` launch succeeds, fully fits on GPU, and lands near 95% aggregate GPU usage, the script stores the learned `GPU Layers`, `--fit-target`, and `--cache-ram` values in [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json). Later launches of the same model with the same GPU layout and llama arguments reuse that learned profile first; server slots remain fixed at `--parallel 2`.
+用途：啟用 per-model 的學習模式。當 `-GpuLayers auto` 這次啟動成功、模型完整放進 GPU、而且整體 GPU 使用率接近 95% 時，腳本會把 `GPU Layers`、`--fit-target`、`--cache-ram` 等結果存到 [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json)。之後同一個模型、同一組顯卡配置、同一組 llama 參數再啟動時，會優先重用那組已學到的設定；server slot 仍固定為 `--parallel 1`。  
+Purpose: Enables per-model learning. When a `-GpuLayers auto` launch succeeds, fully fits on GPU, and lands near 95% aggregate GPU usage, the script stores the learned `GPU Layers`, `--fit-target`, and `--cache-ram` values in [`json/model-tuning.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-tuning.json). Later launches of the same model with the same GPU layout and llama arguments reuse that learned profile first; server slots remain fixed at `--parallel 1`.
 
 範例 / Example:
 
@@ -599,7 +451,7 @@ Skip the menu and start in the background with a specific model:
 Skip the menu and use another port:
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -BypassMenu -Background -Port 8081
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -Port 8090
 ```
 
 查看目前狀態：  
@@ -623,11 +475,18 @@ Restart the background server with Extreme Mode:
 .\PS1\Start_LCPP.ps1 -BypassMenu -Background -NoBrowser -NoPause -ExtremeMode
 ```
 
-強制清理這個工作資料夾下舊的 `llama-server.exe`、OpenClaw、TTS、STT、vision sidecar 進程：  
-Force-clean older `llama-server.exe`, OpenClaw, TTS, STT, and vision sidecar processes that belong to this workspace:
+強制清理這個工作資料夾下舊的 `llama-server.exe` 進程：  
+Force-clean older `llama-server.exe` processes that belong to this workspace:
 
 ```powershell
 .\PS1\stop.ps1
+```
+
+也可以直接雙擊或在命令列使用：
+You can also use the simpler wrapper directly:
+
+```powershell
+.\stop.cmd
 ```
 
 停止目前追蹤中的 server：  
@@ -637,8 +496,14 @@ Stop the currently tracked server:
 .\PS1\Start_LCPP.ps1 -Stop
 ```
 
-`stop.ps1` 會比 `-Stop` 更激進一些。它不只會處理目前追蹤中的 PID，也會掃描這個工作資料夾對應的 `llama-server.exe` 路徑，並一起停止 OpenClaw、TTS、STT、vision sidecar 的殘留進程，適合用在 VRAM / RAM 沒有正常釋放時。  
-`stop.ps1` is more aggressive than `-Stop`. It does not only stop the tracked PID, but also scans for `llama-server.exe` processes that belong to this workspace and clears lingering OpenClaw, TTS, STT, and vision sidecar processes too. It is useful when VRAM / RAM has not been released cleanly.
+`stop.ps1` 會比 `-Stop` 更激進一些。它不只會處理目前追蹤中的 PID，也會掃描這個工作資料夾對應的 `llama-server.exe` 路徑並一起停止，適合用在 VRAM / RAM 沒有正常釋放時。  
+`stop.ps1` is more aggressive than `-Stop`. It does not only stop the tracked PID, but also scans for `llama-server.exe` processes that belong to this workspace and stops them too. It is useful when VRAM / RAM has not been released cleanly.
+
+若 vision 啟動異常，先檢查三件事：主 server 狀態是否有 `Mmproj : <path>`、`logs\llama-server.stderr.log` 實際載入的是哪顆模型、以及 `json\model-index.json` 裡該模型是否仍保有正確的手動 `mmproj_path`。
+If vision startup behaves unexpectedly, first check three things: whether the primary server status shows `Mmproj : <path>`, which model `logs\llama-server.stderr.log` actually loaded, and whether the matching model entry in `json\model-index.json` still keeps the correct manual `mmproj_path`.
+
+若只想補啟或停止 background watchdog，而不重啟 `llama-server.exe`，可直接用 `start_watchdog.cmd` 與 `stop_watchdog.cmd`。  
+If you only want to start or stop the background watchdog without restarting `llama-server.exe`, use `start_watchdog.cmd` and `stop_watchdog.cmd` directly.
 
 查看底層 `llama-server.exe` 全部參數：  
 Show all underlying `llama-server.exe` parameters:
@@ -651,7 +516,7 @@ Show all underlying `llama-server.exe` parameters:
 Forward extra `llama-server` parameters through the wrapper:
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 131072 --metrics
 ```
 
 ## 模型切換行為 / Model Switching Behavior
@@ -662,11 +527,13 @@ If no tracked server is running, the script starts a new one.
 每次進入實際啟動流程前，腳本都會先清理這個工作資料夾下舊的 `llama-server.exe` 進程，再啟動新的 server。  
 Before each actual launch, the script clears older `llama-server.exe` processes started from this workspace, then starts a fresh server.
 
-如果 `-GpuLayers` 保持 `auto`，腳本還會在啟動時偵測目前可用的 GPU VRAM 與系統 RAM，動態調整 `--fit-target`、`--cache-ram`，目標是盡量吃滿 VRAM，但減少把壓力打到 pagefile / SSD 的機率。`llama.cpp` server slot 會固定帶 `--parallel 2`。  
-If `-GpuLayers` stays at `auto`, the script also detects currently available GPU VRAM and system RAM at launch time and adjusts `--fit-target` and `--cache-ram`, aiming to fill VRAM while reducing the chance of spilling pressure into the pagefile / SSD. The `llama.cpp` server always uses `--parallel 2`.
+Background launches now go through a small PowerShell supervisor that writes runtime ownership state to `logs/llama-runtime-owner.json` and starts a watchdog. `-Status`, `-Stop`, `start.cmd`, and `stop.ps1` treat that ownership state as authoritative and automatically clear untracked workspace `llama-server.exe` instances.
 
-如果再加上 `-ExtremeMode`，這套自動調整會更激進，通常會換成更小的 VRAM 保留空間，並把 prompt cache 壓得更低；slots 仍固定為 2。  
-If you also add `-ExtremeMode`, the auto-tuning becomes more aggressive, usually with a smaller VRAM margin and lower prompt-cache overhead; slots remain fixed at 2.
+如果 `-GpuLayers` 保持 `auto`，腳本還會在啟動時偵測目前可用的 GPU VRAM 與系統 RAM，動態調整 `--fit-target`、`--cache-ram`，目標是盡量吃滿 VRAM，但減少把壓力打到 pagefile / SSD 的機率。`llama.cpp` server slot 會固定帶 `--parallel 1`。  
+If `-GpuLayers` stays at `auto`, the script also detects currently available GPU VRAM and system RAM at launch time and adjusts `--fit-target` and `--cache-ram`, aiming to fill VRAM while reducing the chance of spilling pressure into the pagefile / SSD. The `llama.cpp` server always uses `--parallel 1`.
+
+如果再加上 `-ExtremeMode`，這套自動調整會更激進，通常會換成更小的 VRAM 保留空間，並把 prompt cache 壓得更低；slots 仍固定為 1。  
+If you also add `-ExtremeMode`, the auto-tuning becomes more aggressive, usually with a smaller VRAM margin and lower prompt-cache overhead; slots remain fixed at 1.
 
 如果你開啟 `-AutoTune`，而這次載入最終完整塞進 GPU 並落在目標 VRAM 區間，腳本會把這次驗證成功的組合記下來；之後再啟動同一模型時，就會優先套用該 profile。若目前可用 VRAM 比當初學到時更少，腳本會自動退回即時自動 fitting，不會硬套舊設定。  
 If you enable `-AutoTune` and a launch fully fits on GPU within the target VRAM window, the script remembers that validated combination and prefers it on later launches of the same model. If current free VRAM is lower than when the profile was learned, the script automatically falls back to live adaptive fitting instead of forcing the old settings.
@@ -820,6 +687,15 @@ Rollback steps:
 - `logs/llama-server.stderr.log`：錯誤輸出 log。  
   `logs/llama-server.stderr.log`: Error output log.
 
+- `logs/launch-audit.jsonl`：每次實際進入啟動流程時追加一筆 JSONL 審計紀錄，包含入口腳本、PowerShell / cmd 呼叫鏈、模型、埠號與完整 `llama-server.exe` 參數。  
+  `logs/launch-audit.jsonl`: Appends one JSONL audit record for each real launch attempt, including the entry script, PowerShell / cmd caller chain, model, port, and full `llama-server.exe` arguments.
+
+- `logs/llama-runtime-owner.json`：目前受管 runtime 的 ownership state，包含 `server_pid`、watchdog PID、模型路徑與啟動參數。只要這份 state 消失，`-Status` / `-Stop` / watchdog 會把殘留的 workspace `llama-server.exe` 當成 untracked instance 清掉。  
+  `logs/llama-runtime-owner.json`: Ownership state for the managed runtime, including `server_pid`, watchdog PID, model path, and launch arguments. If this state disappears, `-Status`, `-Stop`, and the watchdog treat any remaining workspace `llama-server.exe` as an untracked instance and clear it.
+
+- `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`：背景 watchdog 的 PID 與事件紀錄。它會保留 state 指向的 managed server，並定期清除不屬於目前 owner state 的 workspace `llama-server.exe`。  
+  `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`: PID and event log for the background watchdog. It preserves the server claimed by the current owner state and periodically clears workspace `llama-server.exe` instances that do not belong to it.
+
 - `json/model-index.json`：互動式選單使用的模型索引。  
   `json/model-index.json`: Model index used by the interactive launcher.
 
@@ -929,8 +805,8 @@ Download and run directly from Hugging Face:
   Sets a chat template, such as `chatml`.
 
 - `-c`
-  指定 context size，例如 `4096`、`8192`。  
-  Sets the context size, for example `4096` or `8192`.
+  指定 context size；本 launcher 預設是 `131072`，也可手動改成更小或更大。  
+  Sets the context size; this launcher now defaults to `131072`, and you can still override it to smaller or larger values.
 
 - `-n`
   指定最多生成幾個 token。`-1` 代表不限。  
@@ -1058,8 +934,8 @@ Below is a practical Traditional Chinese reference for the most useful options.
 | --- | --- | --- | --- |
 | `-m, --model FNAME` | 路徑 | 指定 GGUF 模型路徑 | `-m "C:\Models\a.gguf"` |
 | `--host HOST` | 字串 | 指定綁定位址 | `127.0.0.1`, `0.0.0.0` |
-| `--port PORT` | 整數 | 指定服務埠號 | `8080`, `8081` |
-| `-c, --ctx-size N` | 整數 | 指定 context size | `4096`, `8192` |
+| `--port PORT` | 整數 | 指定服務埠號 | `8080`, `8090` |
+| `-c, --ctx-size N` | 整數 | 指定 context size；本 launcher 預設 `131072` | `131072`, `65536` |
 | `-n, --predict N` | 整數 | 指定最多生成 token 數 | `256`, `512`, `-1` |
 | `-t, --threads N` | 整數 | 指定生成階段 CPU threads | `8`, `12`, `-1` |
 | `-tb, --threads-batch N` | 整數 | 指定 batch/prefill CPU threads | `8`, `16`, `-1` |
@@ -1073,7 +949,7 @@ Below is a practical Traditional Chinese reference for the most useful options.
 | `-ctv, --cache-type-v TYPE` | 列舉 | 設定 KV cache 的 V 型別 | `f16`, `q8_0`, `q4_0` |
 | `--mmap`, `--no-mmap` | 開關 | 控制是否 memory-map 模型 | 預設通常開啟 |
 | `--mlock` | 開關 | 盡量把模型留在 RAM，不讓系統換出 | 視 RAM 是否足夠 |
-| `-np, --parallel N` | 整數 | server slot 數量，可同時處理多請求；本 launcher 管理的 primary/vision server 固定使用 `2` | `2` |
+| `-np, --parallel N` | 整數 | server slot 數量，可同時處理多請求；本 launcher 管理的 primary server 固定使用 `1` | `1` |
 | `-cb, --cont-batching` | 開關 | 啟用 continuous batching | 預設通常開啟 |
 | `--threads-http N` | 整數 | HTTP request 處理執行緒數 | `-1`, `4` |
 | `--api-key KEY` | 字串 | 設定 API 金鑰驗證 | `my-secret-key` |
@@ -1100,21 +976,21 @@ Below is a practical Traditional Chinese reference for the most useful options.
 Forward `ctx-size` and metrics through the wrapper:
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 131072 --metrics
 ```
 
 加上 API key：  
 Add an API key:
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --api-key my-secret-key --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 131072 --api-key my-secret-key --metrics
 ```
 
 綁到區網位址讓其他裝置可連線：  
 Bind to the LAN so other devices can connect:
 
 ```powershell
-.\PS1\Start_LCPP.ps1 -Background --host 0.0.0.0 --ctx-size 4096 --api-key my-secret-key
+.\PS1\Start_LCPP.ps1 -Background --host 0.0.0.0 --ctx-size 131072 --api-key my-secret-key
 ```
 
 #### 注意事項 / Notes
@@ -1166,7 +1042,7 @@ Use this first after migration to confirm the server starts cleanly.
   -GpuLayers auto `
   --device CUDA0,CUDA1 `
   --split-mode layer `
-  --ctx-size 4096 `
+  --ctx-size 131072 `
   --fit on
 ```
 
@@ -1195,7 +1071,7 @@ Use this when both GPUs are similar, for example `12 GB + 12 GB`.
   --device CUDA0,CUDA1 `
   --split-mode layer `
   --tensor-split 1,1 `
-  --ctx-size 8192 `
+  --ctx-size 131072 `
   --fit on
 ```
 
@@ -1205,8 +1081,50 @@ Notes:
 - `--tensor-split 1,1` 代表大致平均分配。  
   `--tensor-split 1,1` means an approximately even split.
 
-- 如果啟動失敗，可以先退回 `-GpuLayers auto` 或把 `--ctx-size` 降回 `4096`。  
-  If startup fails, first fall back to `-GpuLayers auto` or reduce `--ctx-size` back to `4096`.
+- 如果啟動失敗，可以先退回 `-GpuLayers auto` 或把 `--ctx-size` 從 `131072` 降到 `65536`。  
+  If startup fails, first fall back to `-GpuLayers auto` or reduce `--ctx-size` from `131072` to `65536`.
+
+#### 本機已驗證預設 / Local Verified Preset
+
+這台雙 `RTX 5070 Ti 16 GB`、模型 `Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf` 的目前穩定高水位，是：
+The current stable high-water preset on this dual `RTX 5070 Ti 16 GB` machine for `Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf` is:
+
+```powershell
+.\start_qwen27b_iq4xs_dual_full.cmd
+```
+
+這個 wrapper 目前固定使用：
+This wrapper currently pins:
+
+- `--split-mode layer`
+- `--tensor-split 1,1`
+- `--ctx-size 163840`
+- `--fit-target 128`
+- `--cache-ram 0`
+- `mmproj-Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-f16.gguf`
+
+`180224` 雖然可啟動，但在這台機器上會讓 `nvidia-smi` 的 GPU0 記憶體回報變得不可信，所以暫時不列為穩定預設。  
+`180224` can start on this machine, but it makes GPU0 memory reporting from `nvidia-smi` unreliable, so it is not treated as the stable default for now.
+
+對應的 `Q6_K_P` 版本也已經另外做成一個獨立 preset：  
+The corresponding `Q6_K_P` build also has its own separate preset:
+
+```powershell
+.\start_qwen27b_q6kp_dual_full.cmd
+```
+
+這組目前固定使用：
+This preset currently pins:
+
+- `--split-mode layer`
+- `--tensor-split 1,1`
+- `--ctx-size 98304`
+- `--fit-target 128`
+- `--cache-ram 0`
+- `mmproj-Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-f16.gguf`
+
+同樣的 `Q6_K_P` 在這台雙 `RTX 5070 Ti 16 GB` 上，`131072` 和 `163840` 都會在 GPU1 OOM，所以目前穩定值先停在 `98304`。  
+On this dual `RTX 5070 Ti 16 GB` machine, the same `Q6_K_P` build runs out of memory on GPU1 at both `131072` and `163840`, so the stable value is currently kept at `98304`.
 
 #### 範本 3：兩張卡顯存不同時 / Template 3: When The GPUs Have Different VRAM Sizes
 
@@ -1221,7 +1139,7 @@ Use this for mixed setups such as `12 GB + 8 GB` or `24 GB + 12 GB`.
   --device CUDA0,CUDA1 `
   --split-mode layer `
   --tensor-split 3,2 `
-  --ctx-size 8192 `
+  --ctx-size 131072 `
   --fit on
 ```
 
@@ -1249,7 +1167,7 @@ If the new computer will serve as a shared host on your home or office network, 
   -GpuLayers auto `
   --device CUDA0,CUDA1 `
   --split-mode layer `
-  --ctx-size 4096 `
+  --ctx-size 131072 `
   --fit on `
   --host 0.0.0.0 `
   --api-key your-secret-key `
@@ -1271,14 +1189,14 @@ Notes:
 2. 先用 `-GpuLayers auto`
 3. 再加上 `--device CUDA0,CUDA1`
 4. 再加上 `--split-mode layer`
-5. 成功啟動後再提高 `--ctx-size`
+5. 如果啟動失敗，再把 `--ctx-size` 從 `131072` 往下調
 6. 最後才微調 `--tensor-split`
 
 1. Run `.\bin\llama-server.exe --list-devices`
 2. Start with `-GpuLayers auto`
 3. Then add `--device CUDA0,CUDA1`
 4. Then add `--split-mode layer`
-5. Raise `--ctx-size` only after successful startup
+5. If startup fails, lower `--ctx-size` from `131072`
 6. Tune `--tensor-split` last
 
 ### 5. 用 API 測試 `llama-server` / Testing `llama-server` With The API
@@ -1382,9 +1300,9 @@ Because this machine uses an RTX 5070 Ti with 16 GB VRAM, start with these recom
   先讓程式自動決定，不要一開始就用 `all`。  
   Let the program decide automatically instead of forcing `all` at the beginning.
 
-- `-c 8192`
-  大模型可以先從中等 context size 開始；如果還想往上推，再視 VRAM 使用量增加。  
-  For larger models, start with a moderate context size and increase it later based on actual VRAM usage.
+- `-c 131072`
+  目前 launcher 的統一起手預設就是 `131072`；如果顯存或穩定性不夠，再往下調整。  
+  The launcher now uses `131072` as the unified starting default; only lower it if VRAM headroom or stability is insufficient.
 
 - CPU threads 不確定時，先讓目前腳本自動處理。  
   If you are unsure about CPU threads, let the current launcher script choose them automatically first.

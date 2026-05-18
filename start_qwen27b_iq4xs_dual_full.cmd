@@ -18,9 +18,23 @@ if not exist "%POWERSHELL_EXE%" (
     set "POWERSHELL_EXE=powershell.exe"
 )
 
-rem Pass arguments through directly so quoted paths and llama.cpp flags stay intact.
-set "LCPP_LAUNCH_SOURCE=%~f0"
-"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LAUNCHER_PS1%" -ReturnNonZeroOnError -WrapperControlsPause %*
+"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LAUNCHER_PS1%" ^
+  -ReturnNonZeroOnError ^
+  -WrapperControlsPause ^
+  -BypassMenu ^
+  -Background ^
+  -NoBrowser ^
+  -NoPause ^
+  -ModelPath "D:\LLM Model\Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf" ^
+  -VisionMmprojPath "D:\LLM Model\mmproj-Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-f16.gguf" ^
+  -GpuLayers all ^
+  --split-mode layer ^
+  --tensor-split 1,1 ^
+  --ctx-size 163840 ^
+  --fit-target 128 ^
+  --cache-ram 0 ^
+  --host 127.0.0.1 ^
+  %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
