@@ -4,17 +4,18 @@ Launches llama.cpp through an interactive menu or direct control switches.
 
 .DESCRIPTION
 By default the script opens an interactive launcher menu.
-The first screen lets you choose Quick Start, Quick Start And OpenClaw, or Tune And Launch,
-then select a model from model-index.json, review model capabilities, and launch either
-a background service, the built-in Web UI, or a llama.cpp + OpenClaw flow. Direct control
-switches such as -Status, -Stop, and -LlamaHelp
+The first screen lets you choose Quick Start or Tune And Launch,
+then select a primary model from model-index.json, optionally choose an
+mmproj vision projector, review model capabilities, and launch either a
+background service or the built-in Web UI. Direct control switches such as
+-Status, -Stop, and -LlamaHelp
 still work without opening the menu. The script prefers llama.cpp binaries stored under
 the bin subfolder. Script parameters are the wrapper's own options. Additional
 llama-server.exe options can be passed through as trailing arguments.
 
 .PARAMETER Port
 TCP port used by llama-server.exe. Default is 8080.
-Use a valid, free port number such as 8080 or 8081. In practice this should be 1-65535.
+Use a valid, free port number such as 8080 or 8090. In practice this should be 1-65535.
 
 .PARAMETER GpuLayers
 Value passed to --gpu-layers.
@@ -39,6 +40,10 @@ Default is -1, which means auto and resolves to the logical CPU count.
 Path to the GGUF model file.
 Accepts either an absolute path or a path relative to the launcher root.
 When omitted, the launcher uses the default_model_id entry from json\model-index.json.
+
+.PARAMETER VisionMmprojPath
+Optional path to the vision mmproj GGUF file.
+Use this when you want a direct launch or bypass run to pin a specific projector.
 
 .PARAMETER ModelIndexPath
 Path to the model index JSON file used by the interactive menu.
@@ -103,8 +108,12 @@ Opens the interactive launcher menu.
 Opens the interactive launcher and preloads the supplied values.
 
 .EXAMPLE
-.\PS1\Start_LCPP.ps1 -Port 8081 -GpuLayers all -Threads 12 -ThreadsBatch 16
-Starts the server on port 8081 and uses explicit CPU/GPU settings.
+.\PS1\Start_LCPP.ps1 -BypassMenu -Background -ModelPath "C:\Models\example.gguf" -VisionMmprojPath "C:\Models\mmproj-example.gguf"
+Starts the server directly and pins a specific vision projector file.
+
+.EXAMPLE
+.\PS1\Start_LCPP.ps1 -Port 8090 -GpuLayers all -Threads 12 -ThreadsBatch 16
+Starts the server on port 8090 and uses explicit CPU/GPU settings.
 
 .EXAMPLE
 .\PS1\Start_LCPP.ps1 -Status
@@ -131,7 +140,7 @@ Stops the tracked server.
 Shows the llama-server.exe help output.
 
 .EXAMPLE
-.\PS1\Start_LCPP.ps1 -Background --ctx-size 4096 --metrics
+.\PS1\Start_LCPP.ps1 -Background --ctx-size 131072 --metrics
 Opens the interactive launcher and preloads additional llama-server.exe arguments.
 
 .EXAMPLE
@@ -142,7 +151,7 @@ Starts the server directly without opening the menu.
 Before each launch, the script automatically stops older llama-server.exe processes
 started from this workspace so stale GPU allocations do not linger.
 When GpuLayers is left at auto, the script also detects available GPU VRAM and system RAM
-to apply a smaller fit target and a bounded prompt cache. Server slots are fixed at 2.
+to apply a smaller fit target and a bounded prompt cache. Server slots are fixed at 1.
 ExtremeMode makes that auto-fit behavior more aggressive for users who want to push VRAM harder.
 AutoTune can learn and reuse a per-model tuning profile when a launch fits fully in GPU memory
 and lands near the target VRAM usage range.
@@ -164,6 +173,7 @@ param(
     [int]$Threads = -1,
     [int]$ThreadsBatch = -1,
     [string]$ModelPath = $null,
+    [string]$VisionMmprojPath = $null,
     [string]$ModelIndexPath = ".\json\model-index.json",
     [string]$OpenPath = "/v1/models",
     [int]$ReadyTimeoutSec = 180,
@@ -176,7 +186,6 @@ param(
     [switch]$LlamaHelp,
     [switch]$BypassMenu,
     [switch]$NoBrowser,
-    [switch]$NoAutoVision,
     [switch]$NoPause,
     [switch]$ReturnNonZeroOnError,
     [switch]$WrapperControlsPause,
@@ -222,14 +231,17 @@ $LegacyModelSwitchTimingFile = Join-Path $ScriptRoot "model-switch-times.json"
 $PidFile = Join-Path $LogRoot "llama-server.pid"
 $StdOutLog = Join-Path $LogRoot "llama-server.stdout.log"
 $StdErrLog = Join-Path $LogRoot "llama-server.stderr.log"
-$VisionStartScript = Join-Path $Ps1Root "Start_Vision_Service.ps1"
-$VisionPidFile = Join-Path $LogRoot "vision-server.pid"
-$VisionStdOutLog = Join-Path $LogRoot "vision-server.stdout.log"
-$VisionStdErrLog = Join-Path $LogRoot "vision-server.stderr.log"
+$LaunchAuditLog = Join-Path $LogRoot "launch-audit.jsonl"
+$RuntimeOwnerStateFile = Join-Path $LogRoot "llama-runtime-owner.json"
+$SupervisorPidFile = Join-Path $LogRoot "llama-supervisor.pid"
+$WatchdogPidFile = Join-Path $LogRoot "llama-watchdog.pid"
+$WatchdogLog = Join-Path $LogRoot "llama-watchdog.log"
 $TuningProfileFile = Join-Path $JsonRoot "model-tuning.json"
 $ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
+$SupervisorScriptPath = Join-Path $Ps1Root "llama_supervisor.ps1"
+$WatchdogScriptPath = Join-Path $Ps1Root "llama_watchdog.ps1"
 # Edit this line to force model scanning from a specific GGUF folder on each interactive launch.
-$ConfiguredModelScanPath = "E:\LLM Model"
+$ConfiguredModelScanPath = "D:\LLM Model"
 $BaseUrl = "http://127.0.0.1:$Port"
 $BrowserJob = $null
 $UsedInteractiveMenu = $false
@@ -241,12 +253,20 @@ $script:ModelFileSizeBytesCache = @{}
 $script:ModelFileSizeLabelCache = @{}
 $script:ModelRepeatingLayerCountCache = @{}
 $script:MmprojPathCache = @{}
+$script:LaunchModelEntry = $null
 $script:LaunchMmprojPath = $null
 $script:ModelGenerationArgs = @()
+$script:ManagedDefaultContextSize = 131072
 $script:LastAutoTuneProfile = $null
 $script:BackgroundStartupProgressLineLength = 0
 $script:BackgroundStartupProgressLastText = $null
-$script:OpenClawAfterStart = $false
+$script:SelectedVisionModelEntry = $null
+$script:SelectedVisionModelPath = $null
+$script:SelectedVisionMmprojPath = $null
+$script:SelectedVisionDisabled = $false
+if (-not [string]::IsNullOrWhiteSpace($VisionMmprojPath)) {
+    $script:SelectedVisionMmprojPath = $VisionMmprojPath
+}
 $ServerCleanupTimeoutSec = 20
 $ServerCleanupSettleMs = 2000
 $BackgroundStartupCheckSec = 20
@@ -257,11 +277,440 @@ $AutoTuneTargetUsagePercent = 95.0
 $AutoTuneMinUsagePercent = 93.0
 $AutoTuneMaxUsagePercent = 98.5
 $AutoTuneReuseHeadroomMiB = 128
-$FixedLlamaServerParallelSlots = 2
+$FixedLlamaServerParallelSlots = 1
+$WatchdogIntervalSec = 15
 
 foreach ($DirectoryPath in @($LogRoot, $JsonRoot)) {
     if (-not (Test-Path -LiteralPath $DirectoryPath -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $DirectoryPath -Force)
+    }
+}
+
+function Get-LaunchAuditProcessInfo {
+    param(
+        [Nullable[int]]$ProcessId
+    )
+
+    if (-not $ProcessId -or $ProcessId.Value -le 0) {
+        return $null
+    }
+
+    try {
+        $ProcessInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $($ProcessId.Value)" -ErrorAction SilentlyContinue
+    }
+    catch {
+        return $null
+    }
+
+    if (-not $ProcessInfo) {
+        return $null
+    }
+
+    [int]$ParentProcessId = 0
+    if ($ProcessInfo.ParentProcessId) {
+        $ParentProcessId = [int]$ProcessInfo.ParentProcessId
+    }
+
+    return [ordered]@{
+        pid             = [int]$ProcessInfo.ProcessId
+        parent_pid      = $ParentProcessId
+        name            = [string]$ProcessInfo.Name
+        executable_path = if ($ProcessInfo.ExecutablePath) { [string]$ProcessInfo.ExecutablePath } else { $null }
+        command_line    = if ($ProcessInfo.CommandLine) { [string]$ProcessInfo.CommandLine } else { $null }
+    }
+}
+
+function Find-LaunchSourcePathInCommandLine {
+    param(
+        [string]$CommandLine
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return $null
+    }
+
+    $PathMatches = [regex]::Matches($CommandLine, '(?i)([A-Z]:\\[^"\r\n]+?\.(?:cmd|bat|ps1))')
+    foreach ($PathMatch in $PathMatches) {
+        $CandidatePath = $PathMatch.Groups[1].Value
+        if (-not [string]::IsNullOrWhiteSpace($CandidatePath)) {
+            return $CandidatePath
+        }
+    }
+
+    return $null
+}
+
+function Resolve-LaunchAuditSource {
+    param(
+        [string]$DeclaredSource,
+        $CurrentProcessInfo,
+        $ParentProcessInfo,
+        $GrandparentProcessInfo
+    )
+
+    foreach ($Candidate in @(
+            $DeclaredSource,
+            $(if ($ParentProcessInfo) { Find-LaunchSourcePathInCommandLine -CommandLine $ParentProcessInfo.command_line } else { $null }),
+            $(if ($GrandparentProcessInfo) { Find-LaunchSourcePathInCommandLine -CommandLine $GrandparentProcessInfo.command_line } else { $null }),
+            $(if ($CurrentProcessInfo) { Find-LaunchSourcePathInCommandLine -CommandLine $CurrentProcessInfo.command_line } else { $null }),
+            $PSCommandPath
+        )) {
+        if ([string]::IsNullOrWhiteSpace($Candidate)) {
+            continue
+        }
+
+        try {
+            return [System.IO.Path]::GetFullPath($Candidate)
+        }
+        catch {
+            return $Candidate
+        }
+    }
+
+    return $null
+}
+
+function Write-LaunchAuditRecord {
+    param(
+        [string[]]$ServerArgs,
+        $AutoTuning,
+        [string]$LaunchMode,
+        [Nullable[int]]$LaunchedProcessId = $null,
+        [string]$StartupState = $null
+    )
+
+    try {
+        $CurrentProcessInfo = Get-LaunchAuditProcessInfo -ProcessId ([Nullable[int]]$PID)
+        $ParentProcessInfo = if ($CurrentProcessInfo -and $CurrentProcessInfo.parent_pid -gt 0) {
+            Get-LaunchAuditProcessInfo -ProcessId ([Nullable[int]]$CurrentProcessInfo.parent_pid)
+        }
+        else {
+            $null
+        }
+        $GrandparentProcessInfo = if ($ParentProcessInfo -and $ParentProcessInfo.parent_pid -gt 0) {
+            Get-LaunchAuditProcessInfo -ProcessId ([Nullable[int]]$ParentProcessInfo.parent_pid)
+        }
+        else {
+            $null
+        }
+
+        $DeclaredSource = [Environment]::GetEnvironmentVariable("LCPP_LAUNCH_SOURCE")
+        $ResolvedSource = Resolve-LaunchAuditSource -DeclaredSource $DeclaredSource -CurrentProcessInfo $CurrentProcessInfo -ParentProcessInfo $ParentProcessInfo -GrandparentProcessInfo $GrandparentProcessInfo
+        $ResolvedMmprojPath = if ($script:LaunchMmprojPath) { [string]$script:LaunchMmprojPath } else { $null }
+        $ArgumentString = if ($ServerArgs) { ConvertTo-ArgumentString -Arguments $ServerArgs } else { "" }
+
+        $AuditRecord = [ordered]@{
+            timestamp = (Get-Date).ToString("o")
+            launch_mode = $LaunchMode
+            launch_source = $ResolvedSource
+            declared_launch_source = if ([string]::IsNullOrWhiteSpace($DeclaredSource)) { $null } else { $DeclaredSource }
+            launcher_script = $PSCommandPath
+            launched_process_id = if ($LaunchedProcessId -and $LaunchedProcessId.Value -gt 0) { $LaunchedProcessId.Value } else { $null }
+            startup_state = if ([string]::IsNullOrWhiteSpace($StartupState)) { $null } else { $StartupState }
+            wrapper = [ordered]@{
+                background = [bool]$Background
+                bypass_menu = [bool]$BypassMenu
+                no_browser = [bool]$NoBrowser
+                no_pause = [bool]$NoPause
+                wrapper_controls_pause = [bool]$WrapperControlsPause
+                return_non_zero_on_error = [bool]$ReturnNonZeroOnError
+            }
+            server = [ordered]@{
+                exe = $ServerExe
+                model_path = $ModelPath
+                mmproj_path = $ResolvedMmprojPath
+                port = $Port
+                base_url = $BaseUrl
+                threads = $Threads
+                threads_batch = $ThreadsBatch
+                args = @($ServerArgs)
+                argument_string = $ArgumentString
+            }
+            tuning = [ordered]@{
+                source = if ($AutoTuning) { $AutoTuning.Source } else { $null }
+                source_label = if ($AutoTuning) { $AutoTuning.SourceLabel } else { $null }
+                fit_target_mib = if ($AutoTuning) { $AutoTuning.FitTargetMiB } else { $null }
+                cache_ram_mib = if ($AutoTuning) { $AutoTuning.CacheRamMiB } else { $null }
+                parallel_slots = if ($AutoTuning) { $AutoTuning.ParallelSlots } else { $null }
+                effective_gpu_layers = if ($AutoTuning) { $AutoTuning.EffectiveGpuLayers } else { $null }
+                use_managed_gpu_layers = if ($AutoTuning) { [bool]$AutoTuning.UseManagedGpuLayers } else { $false }
+                extreme_mode = [bool]$ExtremeMode
+                auto_tune = [bool]$AutoTune
+            }
+            invocation = [ordered]@{
+                current = $CurrentProcessInfo
+                parent = $ParentProcessInfo
+                grandparent = $GrandparentProcessInfo
+            }
+        }
+
+        Add-Content -LiteralPath $LaunchAuditLog -Value ($AuditRecord | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
+    }
+    catch {
+    }
+}
+
+function Get-CurrentHostExecutablePath {
+    try {
+        $HostProcess = Get-Process -Id $PID -ErrorAction SilentlyContinue
+        if ($HostProcess -and -not [string]::IsNullOrWhiteSpace($HostProcess.Path)) {
+            return [string]$HostProcess.Path
+        }
+    }
+    catch {
+    }
+
+    return "powershell.exe"
+}
+
+function ConvertTo-Base64Json {
+    param(
+        $Value,
+        [int]$Depth = 8
+    )
+
+    $Json = $Value | ConvertTo-Json -Depth $Depth -Compress
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Json))
+}
+
+function Read-RuntimeOwnerState {
+    if (-not (Test-Path -LiteralPath $RuntimeOwnerStateFile)) {
+        return $null
+    }
+
+    try {
+        $RawState = Get-Content -LiteralPath $RuntimeOwnerStateFile -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($RawState)) {
+            return $null
+        }
+
+        return ($RawState | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Remove-RuntimeOwnershipArtifacts {
+    foreach ($ArtifactPath in @(
+            $RuntimeOwnerStateFile,
+            $SupervisorPidFile,
+            $WatchdogPidFile
+        )) {
+        Remove-Item -LiteralPath $ArtifactPath -ErrorAction SilentlyContinue
+    }
+
+    Remove-TrackedPidFiles
+}
+
+function Get-ProcessInfoById {
+    param(
+        [Nullable[int]]$ProcessId
+    )
+
+    if (-not $ProcessId -or $ProcessId.Value -le 0) {
+        return $null
+    }
+
+    try {
+        return Get-CimInstance Win32_Process -Filter "ProcessId = $($ProcessId.Value)" -ErrorAction SilentlyContinue
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-CommandLineReferencesPath {
+    param(
+        [string]$CommandLine,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    return ($CommandLine -match [regex]::Escape($Path))
+}
+
+function Test-WorkspaceServerProcessInfo {
+    param(
+        $ProcessInfo
+    )
+
+    if (-not $ProcessInfo) {
+        return $false
+    }
+
+    foreach ($CandidateExe in $ServerExeCandidates) {
+        if ($ProcessInfo.ExecutablePath -and [string]::Equals($ProcessInfo.ExecutablePath, $CandidateExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+
+        if (Test-CommandLineReferencesPath -CommandLine ([string]$ProcessInfo.CommandLine) -Path $CandidateExe) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-WorkspaceScriptProcesses {
+    param(
+        [string]$ScriptPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
+        return @()
+    }
+
+    $ScriptPattern = [regex]::Escape($ScriptPath)
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.CommandLine -and ($_.CommandLine -match $ScriptPattern)
+            }
+    )
+}
+
+function Get-WorkspaceSupervisorProcesses {
+    return @(Get-WorkspaceScriptProcesses -ScriptPath $SupervisorScriptPath)
+}
+
+function Get-WorkspaceWatchdogProcesses {
+    return @(Get-WorkspaceScriptProcesses -ScriptPath $WatchdogScriptPath)
+}
+
+function Get-LiveRuntimeOwnerState {
+    $RuntimeState = Read-RuntimeOwnerState
+    if (-not $RuntimeState) {
+        return $null
+    }
+
+    [int]$ServerPid = 0
+    [int]$WatchdogPid = 0
+    if (-not [int]::TryParse([string]$RuntimeState.server_pid, [ref]$ServerPid) -or $ServerPid -le 0) {
+        return $null
+    }
+
+    $StateInStartupGrace = $false
+    try {
+        $CreatedAt = [datetime][string]$RuntimeState.created_at
+        $StateInStartupGrace = (((Get-Date) - $CreatedAt).TotalSeconds -lt 60)
+    }
+    catch {
+    }
+
+    $ServerProcessInfo = Get-ProcessInfoById -ProcessId ([Nullable[int]]$ServerPid)
+    $HasValidServerProcess = Test-WorkspaceServerProcessInfo -ProcessInfo $ServerProcessInfo
+    $HasLiveServerProcess = Get-Process -Id $ServerPid -ErrorAction SilentlyContinue
+
+    $HasValidWatchdogProcess = $false
+    if ([int]::TryParse([string]$RuntimeState.watchdog_pid, [ref]$WatchdogPid) -and $WatchdogPid -gt 0) {
+        $WatchdogProcessInfo = Get-ProcessInfoById -ProcessId ([Nullable[int]]$WatchdogPid)
+        $HasValidWatchdogProcess = $WatchdogProcessInfo -and (Test-CommandLineReferencesPath -CommandLine ([string]$WatchdogProcessInfo.CommandLine) -Path $WatchdogScriptPath)
+        if (-not $HasValidWatchdogProcess) {
+            $RuntimeState | Add-Member -NotePropertyName watchdog_pid -NotePropertyValue $null -Force
+        }
+    }
+    else {
+        $RuntimeState | Add-Member -NotePropertyName watchdog_pid -NotePropertyValue $null -Force
+    }
+
+    if ($HasValidServerProcess -and ($HasValidWatchdogProcess -or $StateInStartupGrace)) {
+        $RuntimeState | Add-Member -NotePropertyName startup_grace -NotePropertyValue $false -Force
+    }
+    elseif ($StateInStartupGrace -and $HasLiveServerProcess) {
+        $RuntimeState | Add-Member -NotePropertyName startup_grace -NotePropertyValue $true -Force
+    }
+    else {
+        return $null
+    }
+
+    return $RuntimeState
+}
+
+function Invoke-WorkspaceRuntimeGuard {
+    param(
+        [switch]$Quiet
+    )
+
+    $LiveState = Get-LiveRuntimeOwnerState
+    $FallbackState = if ($LiveState) { $LiveState } else { Read-RuntimeOwnerState }
+    $AllowedServerPid = $null
+    $AllowedSupervisorPid = $null
+    $AllowedWatchdogPid = $null
+    if ($FallbackState) {
+        [int]$ParsedServerPid = 0
+        [int]$ParsedSupervisorPid = 0
+        [int]$ParsedWatchdogPid = 0
+        if ([int]::TryParse([string]$FallbackState.server_pid, [ref]$ParsedServerPid) -and $ParsedServerPid -gt 0 -and (Get-Process -Id $ParsedServerPid -ErrorAction SilentlyContinue)) {
+            $AllowedServerPid = $ParsedServerPid
+        }
+
+        if ([int]::TryParse([string]$FallbackState.supervisor_pid, [ref]$ParsedSupervisorPid) -and $ParsedSupervisorPid -gt 0 -and (Get-Process -Id $ParsedSupervisorPid -ErrorAction SilentlyContinue)) {
+            $AllowedSupervisorPid = $ParsedSupervisorPid
+        }
+
+        if ([int]::TryParse([string]$FallbackState.watchdog_pid, [ref]$ParsedWatchdogPid) -and $ParsedWatchdogPid -gt 0 -and (Get-Process -Id $ParsedWatchdogPid -ErrorAction SilentlyContinue)) {
+            $AllowedWatchdogPid = $ParsedWatchdogPid
+        }
+    }
+
+    $TargetIds = New-Object System.Collections.Generic.List[int]
+
+    foreach ($WorkspaceServerProcess in @(Get-WorkspaceServerProcesses)) {
+        if ($AllowedServerPid -and ([int]$WorkspaceServerProcess.ProcessId -eq $AllowedServerPid)) {
+            continue
+        }
+
+        $TargetIds.Add([int]$WorkspaceServerProcess.ProcessId)
+    }
+
+    foreach ($SupervisorProcess in @(Get-WorkspaceSupervisorProcesses)) {
+        if ($AllowedSupervisorPid -and ([int]$SupervisorProcess.ProcessId -eq $AllowedSupervisorPid)) {
+            continue
+        }
+
+        $TargetIds.Add([int]$SupervisorProcess.ProcessId)
+    }
+
+    foreach ($WatchdogProcess in @(Get-WorkspaceWatchdogProcesses)) {
+        if ($AllowedWatchdogPid -and ([int]$WatchdogProcess.ProcessId -eq $AllowedWatchdogPid)) {
+            continue
+        }
+
+        $TargetIds.Add([int]$WatchdogProcess.ProcessId)
+    }
+
+    $UniqueTargetIds = @($TargetIds | Select-Object -Unique)
+    $StoppedIds = New-Object System.Collections.Generic.List[int]
+    foreach ($TargetId in $UniqueTargetIds) {
+        try {
+            Stop-Process -Id $TargetId -Force -ErrorAction Stop
+            $StoppedIds.Add([int]$TargetId)
+        }
+        catch {
+        }
+    }
+
+    $RemainingIds = @()
+    if ($UniqueTargetIds.Count -gt 0) {
+        $RemainingIds = @(Wait-ForProcessExit -ProcessIds $UniqueTargetIds -TimeoutSec $ServerCleanupTimeoutSec)
+    }
+
+    if (-not $FallbackState) {
+        Remove-RuntimeOwnershipArtifacts
+    }
+
+    if ((-not $Quiet) -and $StoppedIds.Count -gt 0) {
+        Write-Host "Guard  : cleared illegal runtime process(es): $($StoppedIds -join ', ')" -ForegroundColor Yellow
+    }
+
+    return [pscustomobject]@{
+        LiveState    = if ($LiveState) { $LiveState } else { $FallbackState }
+        StoppedIds   = @($StoppedIds)
+        RemainingIds = @($RemainingIds)
     }
 }
 
@@ -301,7 +750,7 @@ function Get-ServerArgs {
     $Arguments.Add("--port")
     $Arguments.Add([string]$Port)
 
-    $script:LaunchMmprojPath = Find-MmprojForModel -ModelPath $ModelPath
+    $script:LaunchMmprojPath = Resolve-LaunchMmprojPath -ModelPath $ModelPath -ModelEntry $script:LaunchModelEntry
     if (-not [string]::IsNullOrWhiteSpace($script:LaunchMmprojPath)) {
         $Arguments.Add("--mmproj")
         $Arguments.Add($script:LaunchMmprojPath)
@@ -317,6 +766,18 @@ function Get-ServerArgs {
     $Arguments.Add([string]$Threads)
     $Arguments.Add("--threads-batch")
     $Arguments.Add([string]$ThreadsBatch)
+
+    $CombinedArgs = @()
+    foreach ($Argument in $script:ModelGenerationArgs) {
+        $CombinedArgs += $Argument
+    }
+    foreach ($Argument in $LlamaArgs) {
+        $CombinedArgs += $Argument
+    }
+    if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
+        $Arguments.Add("--ctx-size")
+        $Arguments.Add([string]$script:ManagedDefaultContextSize)
+    }
 
     if ($AutoTuning) {
         if ($null -ne $AutoTuning.FitTargetMiB) {
@@ -952,13 +1413,18 @@ function Refresh-ModelIndexFromDefaultScanPath {
             $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($File.Name)
             $MmprojPath = Find-MmprojForModel -ModelPath $File.FullName
             $ExistingEntry = $null
+            $ExistingEntryIsManual = $false
             $ExistingKey = $File.FullName.ToLowerInvariant()
             if ($ExistingByPath.ContainsKey($ExistingKey)) {
                 $ExistingEntry = $ExistingByPath[$ExistingKey]
+                $ExistingEntryIsManual = -not (Test-ModelEntryIsAutoGenerated -ModelEntry $ExistingEntry)
             }
             $ModelEntry = [pscustomobject]@{
                 name = $BaseName
                 path = $File.FullName
+            }
+            if ($ExistingEntryIsManual -and $ExistingEntry.PSObject.Properties["capabilities"]) {
+                $ModelEntry | Add-Member -NotePropertyName "capabilities" -NotePropertyValue $ExistingEntry.capabilities
             }
 
             $GeneratedEntry = [ordered]@{
@@ -966,16 +1432,27 @@ function Refresh-ModelIndexFromDefaultScanPath {
                 name         = $BaseName
                 path         = $File.FullName
             }
-            if (-not [string]::IsNullOrWhiteSpace($MmprojPath)) {
-                $GeneratedEntry["mmproj_path"] = $MmprojPath
-                $ModelEntry | Add-Member -NotePropertyName "mmproj_path" -NotePropertyValue $MmprojPath
+            $EffectiveMmprojPath = if ($ExistingEntryIsManual -and $ExistingEntry.PSObject.Properties["mmproj_path"]) {
+                Resolve-ModelPath -Path ([string]$ExistingEntry.mmproj_path)
+            }
+            else {
+                $MmprojPath
+            }
+            if (-not [string]::IsNullOrWhiteSpace($EffectiveMmprojPath)) {
+                $GeneratedEntry["mmproj_path"] = $EffectiveMmprojPath
+                $ModelEntry | Add-Member -NotePropertyName "mmproj_path" -NotePropertyValue $EffectiveMmprojPath
             }
 
             $GeneratedEntry["capabilities"] = Resolve-ModelEntryCapabilities -ModelEntry $ModelEntry
             if ($ExistingEntry -and $ExistingEntry.PSObject.Properties["generation"]) {
                 $GeneratedEntry["generation"] = $ExistingEntry.generation
             }
-            $GeneratedEntry["notes"] = "Auto-generated by Start_LCPP.ps1 scan."
+            $GeneratedEntry["notes"] = if ($ExistingEntryIsManual -and $ExistingEntry.PSObject.Properties["notes"] -and -not [string]::IsNullOrWhiteSpace([string]$ExistingEntry.notes)) {
+                [string]$ExistingEntry.notes
+            }
+            else {
+                "Auto-generated by Start_LCPP.ps1 scan."
+            }
             $GeneratedEntry
         }
     )
@@ -1752,6 +2229,37 @@ function Test-MmprojFilePath {
     return ($FileName -match '(?i)(^|[-_.])mmproj([-_.]|$)')
 }
 
+function Test-ModelSupportsVision {
+    param(
+        [AllowNull()][string]$ModelName,
+        [AllowNull()][string]$ModelPath,
+        [AllowNull()][string]$Architecture
+    )
+
+    $SearchText = (@($ModelName, $ModelPath, $Architecture) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " "
+    if ([string]::IsNullOrWhiteSpace($SearchText)) {
+        return $false
+    }
+
+    $Normalized = $SearchText.ToLowerInvariant()
+    $NormalizedArchitecture = if ($Architecture) { $Architecture.ToLowerInvariant() } else { "" }
+    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen3vl|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
+    $ArchitectureVisionPattern = '^(qwen2vl|mllama|gemma3|minicpmv|llava|llava_next|pixtral|internvl|paligemma|glm4v|cogvlm|smolvlm|molmo|moondream|janus)$'
+
+    return ($Normalized -match $VisionPattern) -or ($NormalizedArchitecture -match $ArchitectureVisionPattern)
+}
+
+function Test-ModelEntryIsAutoGenerated {
+    param($ModelEntry)
+
+    if (-not $ModelEntry -or -not $ModelEntry.PSObject.Properties["notes"]) {
+        return $false
+    }
+
+    $Notes = [string]$ModelEntry.notes
+    return $Notes -match '^Auto-generated by (?:Start_LCPP|scan_model)\.ps1 scan\.?$'
+}
+
 function Get-MmprojNameTokens {
     param([Parameter(Mandatory = $true)][string]$Text)
 
@@ -1812,6 +2320,11 @@ function Find-MmprojForModel {
         return $null
     }
 
+    $Architecture = Get-GgufArchitectureHint -ModelPath $ResolvedModelPath
+    if (-not (Test-ModelSupportsVision -ModelName $null -ModelPath $ResolvedModelPath -Architecture $Architecture)) {
+        return $null
+    }
+
     if ($script:MmprojPathCache.ContainsKey($ResolvedModelPath)) {
         return $script:MmprojPathCache[$ResolvedModelPath]
     }
@@ -1848,6 +2361,16 @@ function Get-ModelEntryMmprojPath {
         [AllowNull()][string]$ModelPath
     )
 
+    $ResolvedModelPath = Resolve-ModelPath -Path $ModelPath
+    $ModelName = if ($ModelEntry -and $ModelEntry.PSObject.Properties["name"]) { [string]$ModelEntry.name } else { "" }
+    $Architecture = Get-GgufArchitectureHint -ModelPath $ResolvedModelPath
+    $IsVisionModel = Test-ModelSupportsVision -ModelName $ModelName -ModelPath $ResolvedModelPath -Architecture $Architecture
+    $ExplicitCapabilities = ConvertTo-ModelCapabilities -Source $(if ($ModelEntry -and $ModelEntry.PSObject.Properties["capabilities"]) { $ModelEntry.capabilities } else { $null })
+    $AllowExplicitOverride = $ExplicitCapabilities.vision -and -not (Test-ModelEntryIsAutoGenerated -ModelEntry $ModelEntry)
+    if (-not ($IsVisionModel -or $AllowExplicitOverride)) {
+        return $null
+    }
+
     if ($ModelEntry -and $ModelEntry.PSObject.Properties["mmproj_path"]) {
         $ExplicitPath = Resolve-ModelPath -Path ([string]$ModelEntry.mmproj_path)
         if (-not [string]::IsNullOrWhiteSpace($ExplicitPath) -and (Test-Path -LiteralPath $ExplicitPath -PathType Leaf)) {
@@ -1856,6 +2379,48 @@ function Get-ModelEntryMmprojPath {
     }
 
     return Find-MmprojForModel -ModelPath $ModelPath
+}
+
+function Resolve-LaunchMmprojPath {
+    param(
+        [AllowNull()][string]$ModelPath,
+        $ModelEntry
+    )
+
+    if ($script:SelectedVisionDisabled) {
+        return $null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:SelectedVisionMmprojPath)) {
+        $ResolvedSelectedMmprojPath = Resolve-ModelPath -Path $script:SelectedVisionMmprojPath
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedSelectedMmprojPath) -and (Test-Path -LiteralPath $ResolvedSelectedMmprojPath -PathType Leaf)) {
+            return $ResolvedSelectedMmprojPath
+        }
+    }
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $ModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        return $null
+    }
+
+    $EffectiveModelEntry = if ($ModelEntry) {
+        $ModelEntry
+    }
+    elseif ($script:LaunchModelEntry) {
+        $script:LaunchModelEntry
+    }
+    else {
+        Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $ResolvedModelPath
+    }
+
+    if ($EffectiveModelEntry) {
+        $ResolvedMmprojPath = Get-ModelEntryMmprojPath -ModelEntry $EffectiveModelEntry -ModelPath $ResolvedModelPath
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedMmprojPath)) {
+            return $ResolvedMmprojPath
+        }
+    }
+
+    return Find-MmprojForModel -ModelPath $ResolvedModelPath
 }
 
 function Get-InferredModelCapabilities {
@@ -1869,18 +2434,16 @@ function Get-InferredModelCapabilities {
     $Normalized = $SearchText.ToLowerInvariant()
     $NormalizedArchitecture = if ($Architecture) { $Architecture.ToLowerInvariant() } else { "" }
 
-    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen3vl|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
     $ReasoningPattern = '(?<![a-z0-9])(reason|reasoning|think|thinking|chain[\-_ ]?of[\-_ ]?thought|cot|qwq|r1)(?![a-z0-9])'
     $VideoPattern = '(?<![a-z0-9])(video|movie|temporal|video[\-_ ]?chat|video[\-_ ]?llm|qwen[\-_ ]?omni|omni[\-_ ]?video)(?![a-z0-9])'
     $VoicePattern = '(?<![a-z0-9])(voice|audio|speech|spoken|tts|stt|asr|whisper|wav2vec|bark|speecht5|qwen[\-_ ]?audio|qwen[\-_ ]?omni|omni[\-_ ]?audio)(?![a-z0-9])'
     $ToolsPattern = '(?<![a-z0-9])(tool|tools|function|functions|function[\-_ ]?call(?:ing)?|tool[\-_ ]?use|agent)(?![a-z0-9])'
     $RerankPattern = '(?<![a-z0-9])(rerank|reranker|re[\-_ ]?rank|cross[\-_ ]?encoder|bge[\-_ ]?reranker|jina[\-_ ]?reranker)(?![a-z0-9])'
     $EmbeddingPattern = '(?<![a-z0-9])(embed|embedding|embeddings|text[\-_ ]?embedding|nomic[\-_ ]?embed|jina[\-_ ]?embeddings?|bge|e5|gte)(?![a-z0-9])'
-    $ArchitectureVisionPattern = '^(qwen2vl|mllama|gemma3|minicpmv|llava|llava_next|pixtral|internvl|paligemma|glm4v|cogvlm|smolvlm|molmo|moondream|janus)$'
 
     $IsRerank = $Normalized -match $RerankPattern
     $IsEmbedding = (-not $IsRerank) -and ($Normalized -match $EmbeddingPattern)
-    $IsVision = ($Normalized -match $VisionPattern) -or ($NormalizedArchitecture -match $ArchitectureVisionPattern)
+    $IsVision = Test-ModelSupportsVision -ModelName $ModelName -ModelPath $ModelPath -Architecture $Architecture
     $IsReasoning = $Normalized -match $ReasoningPattern
     $IsVideo = $Normalized -match $VideoPattern
     $IsVoice = $Normalized -match $VoicePattern
@@ -1921,10 +2484,11 @@ function Resolve-ModelEntryCapabilities {
 
     $Architecture = Get-GgufArchitectureHint -ModelPath $ModelPath
     $InferredCapabilities = Get-InferredModelCapabilities -ModelName $ModelName -ModelPath $ModelPath -Architecture $Architecture
+    $AutoGeneratedEntry = Test-ModelEntryIsAutoGenerated -ModelEntry $ModelEntry
     $ResolvedCapabilities = New-EmptyModelCapabilities
 
     $ResolvedCapabilities.reasoning = $ExplicitCapabilities.reasoning -or $InferredCapabilities.reasoning
-    $ResolvedCapabilities.vision = $ExplicitCapabilities.vision -or $InferredCapabilities.vision -or (-not [string]::IsNullOrWhiteSpace($MmprojPath))
+    $ResolvedCapabilities.vision = (($ExplicitCapabilities.vision -and -not $AutoGeneratedEntry) -or $InferredCapabilities.vision)
     $ResolvedCapabilities.video = $ExplicitCapabilities.video -or $InferredCapabilities.video
     $ResolvedCapabilities.voice = $ExplicitCapabilities.voice -or $InferredCapabilities.voice
     $ResolvedCapabilities.tools = $ExplicitCapabilities.tools -or $InferredCapabilities.tools
@@ -3249,7 +3813,7 @@ function Read-ConsoleKey {
 
 function Wait-StatusViewAction {
     param(
-        [int]$RefreshIntervalSec = 10
+        [int]$RefreshIntervalSec = 15
     )
 
     $RefreshIntervalSec = [Math]::Max(1, $RefreshIntervalSec)
@@ -3838,6 +4402,361 @@ function Select-ModelEntry {
     }
 }
 
+function Get-VisionSelectableModels {
+    param(
+        [string]$IndexPath,
+        [AllowNull()][string]$PrimaryModelPath
+    )
+
+    $SearchRoots = New-Object System.Collections.Generic.List[string]
+    $ResolvedPrimaryModelPath = Resolve-ModelPath -Path $PrimaryModelPath
+    if (-not [string]::IsNullOrWhiteSpace($ResolvedPrimaryModelPath)) {
+        $PrimaryDirectory = Split-Path -Parent $ResolvedPrimaryModelPath
+        if (-not [string]::IsNullOrWhiteSpace($PrimaryDirectory) -and (Test-Path -LiteralPath $PrimaryDirectory -PathType Container)) {
+            $SearchRoots.Add($PrimaryDirectory)
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConfiguredModelScanPath) -and (Test-Path -LiteralPath $ConfiguredModelScanPath -PathType Container)) {
+        $SearchRoots.Add((Resolve-Path -LiteralPath $ConfiguredModelScanPath).Path)
+    }
+
+    $IndexData = Get-ModelIndexData -Path $IndexPath
+    foreach ($ModelEntry in @($IndexData.models)) {
+        if (-not $ModelEntry -or -not $ModelEntry.PSObject.Properties["path"]) {
+            continue
+        }
+
+        $ResolvedModelPath = Resolve-ModelPath -Path ([string]$ModelEntry.path)
+        if ([string]::IsNullOrWhiteSpace($ResolvedModelPath) -or -not (Test-Path -LiteralPath $ResolvedModelPath -PathType Leaf)) {
+            continue
+        }
+
+        $ModelDirectory = Split-Path -Parent $ResolvedModelPath
+        if (-not [string]::IsNullOrWhiteSpace($ModelDirectory) -and (Test-Path -LiteralPath $ModelDirectory -PathType Container)) {
+            $SearchRoots.Add($ModelDirectory)
+        }
+    }
+
+    $SeenRoots = @{}
+    $SeenMmprojPaths = @{}
+    $Candidates = foreach ($Root in @($SearchRoots)) {
+        if ([string]::IsNullOrWhiteSpace($Root)) {
+            continue
+        }
+
+        $ResolvedRoot = Resolve-ModelPath -Path $Root
+        if ([string]::IsNullOrWhiteSpace($ResolvedRoot) -or $SeenRoots.ContainsKey($ResolvedRoot)) {
+            continue
+        }
+        $SeenRoots[$ResolvedRoot] = $true
+
+        foreach ($Projector in @(Get-ChildItem -LiteralPath $ResolvedRoot -File -Filter "*mmproj*.gguf" -ErrorAction SilentlyContinue)) {
+            $ResolvedMmprojPath = Resolve-ModelPath -Path $Projector.FullName
+            if ([string]::IsNullOrWhiteSpace($ResolvedMmprojPath) -or $SeenMmprojPaths.ContainsKey($ResolvedMmprojPath)) {
+                continue
+            }
+            $SeenMmprojPaths[$ResolvedMmprojPath] = $true
+
+            [pscustomobject]@{
+                Model        = $null
+                ResolvedPath = ""
+                MmprojPath   = $ResolvedMmprojPath
+                SeriesKey    = ""
+                Architecture = ""
+                Capabilities = [pscustomobject](New-EmptyModelCapabilities)
+            }
+        }
+    }
+
+    return @(
+        $Candidates |
+            Sort-Object `
+                @{ Expression = { Get-ModelFileSizeBytes -Path $_.MmprojPath }; Descending = $true }, `
+                @{ Expression = { [System.IO.Path]::GetFileName([string]$_.MmprojPath) }; Descending = $false }
+    )
+}
+
+function Get-VisionCandidateDisplayName {
+    param(
+        [Parameter(Mandatory = $true)]
+        $VisionCandidate
+    )
+
+    $MmprojName = if ([string]::IsNullOrWhiteSpace([string]$VisionCandidate.MmprojPath)) {
+        "(no mmproj)"
+    }
+    else {
+        [System.IO.Path]::GetFileName([string]$VisionCandidate.MmprojPath)
+    }
+
+    return $MmprojName
+}
+
+function Get-VisionCandidatePrimaryLabel {
+    param(
+        [Parameter(Mandatory = $true)]
+        $VisionCandidate
+    )
+
+    return Get-VisionCandidateDisplayName -VisionCandidate $VisionCandidate
+}
+
+function Resolve-DefaultVisionModelCandidate {
+    param(
+        [string]$IndexPath,
+        $PrimaryModelEntry,
+        [string]$PrimaryModelPath
+    )
+
+    $ResolvedPrimaryPath = Resolve-ModelPath -Path $PrimaryModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedPrimaryPath) -and $PrimaryModelEntry -and $PrimaryModelEntry.PSObject.Properties["path"]) {
+        $ResolvedPrimaryPath = Resolve-ModelPath -Path ([string]$PrimaryModelEntry.path)
+    }
+    if ([string]::IsNullOrWhiteSpace($ResolvedPrimaryPath)) {
+        return $null
+    }
+
+    $ScoredCandidates = foreach ($Candidate in @(Get-VisionSelectableModels -IndexPath $IndexPath -PrimaryModelPath $ResolvedPrimaryPath)) {
+        $Score = 0
+        $Score += Get-MmprojTokenMatchScore -ModelPath $ResolvedPrimaryPath -ProjectorPath $Candidate.MmprojPath
+
+        if ($Score -le 0) {
+            continue
+        }
+
+        [pscustomobject]@{
+            Score = $Score
+            Match = $Candidate
+        }
+    }
+
+    $Selected = @($ScoredCandidates | Sort-Object Score -Descending | Select-Object -First 1)
+    if ($Selected.Count -eq 0) {
+        return $null
+    }
+
+    return $Selected[0].Match
+}
+
+function Set-LaunchConfigVisionSelection {
+    param(
+        [System.Collections.IDictionary]$Config,
+        [AllowNull()]$VisionCandidate,
+        [string]$SelectionMode
+    )
+
+    if ($VisionCandidate -and $VisionCandidate.Model) {
+        $Config.VisionModelName = [string]$VisionCandidate.Model.name
+        $Config.VisionModelPath = [string]$VisionCandidate.ResolvedPath
+        $Config.VisionMmprojPath = [string]$VisionCandidate.MmprojPath
+    }
+    elseif ($VisionCandidate -and -not [string]::IsNullOrWhiteSpace([string]$VisionCandidate.MmprojPath)) {
+        $Config.VisionModelName = [System.IO.Path]::GetFileName([string]$VisionCandidate.MmprojPath)
+        $Config.VisionModelPath = ""
+        $Config.VisionMmprojPath = [string]$VisionCandidate.MmprojPath
+    }
+    else {
+        $Config.VisionModelName = ""
+        $Config.VisionModelPath = ""
+        $Config.VisionMmprojPath = ""
+    }
+
+    $Config.VisionSelectionMode = $SelectionMode
+}
+
+function Sync-LaunchConfigVisionSelection {
+    param(
+        [System.Collections.IDictionary]$Config,
+        [string]$IndexPath
+    )
+
+    $SelectionMode = [string]$Config.VisionSelectionMode
+    if ([string]::IsNullOrWhiteSpace($SelectionMode)) {
+        $SelectionMode = "auto"
+    }
+
+    if ($SelectionMode -eq "disabled") {
+        Set-LaunchConfigVisionSelection -Config $Config -VisionCandidate $null -SelectionMode "disabled"
+        return
+    }
+
+    if ($SelectionMode -eq "manual" -and -not [string]::IsNullOrWhiteSpace([string]$Config.VisionMmprojPath)) {
+        $ResolvedMmprojPath = Resolve-ModelPath -Path ([string]$Config.VisionMmprojPath)
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedMmprojPath) -and (Test-Path -LiteralPath $ResolvedMmprojPath -PathType Leaf)) {
+            Set-LaunchConfigVisionSelection -Config $Config -VisionCandidate ([pscustomobject]@{
+                Model        = $null
+                ResolvedPath = ""
+                MmprojPath   = $ResolvedMmprojPath
+            }) -SelectionMode "manual"
+            return
+        }
+    }
+
+    $PrimaryModelEntry = Get-ModelIndexEntryByPath -IndexPath $IndexPath -ResolvedModelPath $Config.ModelPath
+    $AutoCandidate = Resolve-DefaultVisionModelCandidate -IndexPath $IndexPath -PrimaryModelEntry $PrimaryModelEntry -PrimaryModelPath $Config.ModelPath
+    Set-LaunchConfigVisionSelection -Config $Config -VisionCandidate $AutoCandidate -SelectionMode "auto"
+}
+
+function Show-VisionCandidateMenu {
+    param(
+        [object[]]$VisionCandidates,
+        [string]$CurrentMmprojPath,
+        [string]$PrimaryModelPath
+    )
+
+    if (-not $VisionCandidates -or $VisionCandidates.Count -eq 0) {
+        return [pscustomobject]@{ Action = "Back"; Candidate = $null }
+    }
+
+    $ResolvedCurrentPath = Resolve-ModelPath -Path $CurrentMmprojPath
+    $SelectedIndex = 0
+    if ($ResolvedCurrentPath) {
+        for ($Index = 0; $Index -lt $VisionCandidates.Count; $Index++) {
+            if ([string]::Equals([string]$VisionCandidates[$Index].MmprojPath, $ResolvedCurrentPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $SelectedIndex = $Index
+                break
+            }
+        }
+    }
+
+    while ($true) {
+        Show-MenuHeader -Title "Select Vision Mmproj" -Subtitle "Choose a vision projector file (mmproj). Press E to edit the index file."
+
+        for ($Index = 0; $Index -lt $VisionCandidates.Count; $Index++) {
+            $VisionCandidate = $VisionCandidates[$Index]
+            $IsSelected = $Index -eq $SelectedIndex
+            $MmprojPathResolved = [string]$VisionCandidate.MmprojPath
+            $Exists = Test-Path -LiteralPath $MmprojPathResolved
+            $SizeLabel = Get-ModelFileSizeLabel -Path $MmprojPathResolved
+            $Prefix = if ($IsSelected) { ">" } else { " " }
+            $Foreground = if ($IsSelected) { "Black" } else { "Gray" }
+            $Background = if ($IsSelected) { "DarkCyan" } else { "Black" }
+            $StateText = if ($Exists) { "OK" } else { "Missing" }
+            $Summary = "{0} {1} [{2}]" -f $SizeLabel, (Get-VisionCandidatePrimaryLabel -VisionCandidate $VisionCandidate), $StateText
+            Write-Host ("{0} {1}" -f $Prefix, (Get-FitText -Text $Summary -Width ([Math]::Max(30, (Get-ConsoleWidth) - 6)))) -ForegroundColor $Foreground -BackgroundColor $Background
+        }
+
+        $SelectedCandidate = $VisionCandidates[$SelectedIndex]
+        $SelectedMmprojPath = [string]$SelectedCandidate.MmprojPath
+        Write-Host ""
+        Write-Host ("Primary Model: {0}" -f $(if ([string]::IsNullOrWhiteSpace($PrimaryModelPath)) { "(none)" } else { [System.IO.Path]::GetFileName($PrimaryModelPath) })) -ForegroundColor Cyan
+        Write-Host ("Mmproj       : {0}" -f $(if ([string]::IsNullOrWhiteSpace($SelectedMmprojPath)) { "(none)" } else { $SelectedMmprojPath })) -ForegroundColor Green
+        Write-Host ("Size         : {0}" -f ((Get-ModelFileSizeLabel -Path $SelectedMmprojPath).TrimStart("[").TrimEnd("]")))
+        Write-Host ""
+        Write-Host "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns." -ForegroundColor Yellow
+
+        $Key = Read-ConsoleKey
+        switch ($Key.VirtualKeyCode) {
+            38 { $SelectedIndex = if ($SelectedIndex -le 0) { $VisionCandidates.Count - 1 } else { $SelectedIndex - 1 } }
+            40 { $SelectedIndex = if ($SelectedIndex -ge ($VisionCandidates.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
+            13 { return [pscustomobject]@{ Action = "Select"; Candidate = $SelectedCandidate } }
+            32 { return [pscustomobject]@{ Action = "Select"; Candidate = $SelectedCandidate } }
+            27 { return [pscustomobject]@{ Action = "Back"; Candidate = $null } }
+            default {
+                if ($Key.Character -match '^[Ee]$') {
+                    return [pscustomobject]@{ Action = "Edit"; Candidate = $null }
+                }
+
+                if ($Key.Character -match '^\d$') {
+                    $HotIndex = [int]$Key.Character.ToString() - 1
+                    if ($HotIndex -ge 0 -and $HotIndex -lt $VisionCandidates.Count) {
+                        return [pscustomobject]@{ Action = "Select"; Candidate = $VisionCandidates[$HotIndex] }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Select-VisionModelEntry {
+    param(
+        [string]$IndexPath,
+        [string]$CurrentMmprojPath,
+        [string]$PrimaryModelPath
+    )
+
+    $ResolvedCurrentPath = Resolve-ModelPath -Path $CurrentMmprojPath
+
+    while ($true) {
+        $VisionCandidates = @(Get-VisionSelectableModels -IndexPath $IndexPath -PrimaryModelPath $PrimaryModelPath)
+        if ($VisionCandidates.Count -eq 0) {
+            return $null
+        }
+
+        $Selection = Show-VisionCandidateMenu -VisionCandidates $VisionCandidates -CurrentMmprojPath $ResolvedCurrentPath -PrimaryModelPath $PrimaryModelPath
+        if ($Selection.Action -eq "Select") {
+            return $Selection.Candidate
+        }
+        if ($Selection.Action -eq "Edit") {
+            Start-Process -FilePath "notepad.exe" -ArgumentList ('"{0}"' -f $IndexPath) -Wait
+            continue
+        }
+        return $null
+    }
+}
+
+function Edit-VisionModelSelection {
+    param(
+        [System.Collections.IDictionary]$Config,
+        [string]$IndexPath
+    )
+
+    while ($true) {
+        $AutoCandidate = Resolve-DefaultVisionModelCandidate -IndexPath $IndexPath -PrimaryModelPath $Config.ModelPath
+        $AutoLabel = if ($AutoCandidate) {
+            Get-VisionCandidateDisplayName -VisionCandidate $AutoCandidate
+        }
+        else {
+            "(none)"
+        }
+
+        $Options = @(
+            [pscustomobject]@{
+                Name = "Use Auto Match"
+                Description = if ($AutoCandidate) { "Use the closest mmproj file for the selected primary model: $AutoLabel." } else { "No close mmproj match was found. Leave vision disabled." }
+                Value = "Auto"
+            },
+            [pscustomobject]@{
+                Name = "Choose Manually"
+                Description = "Pick a mmproj file manually."
+                Value = "Manual"
+            },
+            [pscustomobject]@{
+                Name = "Disable Vision"
+                Description = "Start only the primary llama.cpp server and skip mmproj vision."
+                Value = "Disable"
+            },
+            [pscustomobject]@{
+                Name = "Back"
+                Description = "Keep the current vision selection."
+                Value = "Back"
+            }
+        )
+
+        $Selection = Show-ListMenu -Title "Vision Mmproj" -Subtitle "Choose how the vision projector should be selected for the primary server." -Items $Options
+        switch ($Selection) {
+            "Auto" {
+                Set-LaunchConfigVisionSelection -Config $Config -VisionCandidate $AutoCandidate -SelectionMode "auto"
+                return
+            }
+            "Manual" {
+                $ManualCandidate = Select-VisionModelEntry -IndexPath $IndexPath -CurrentMmprojPath $Config.VisionMmprojPath -PrimaryModelPath $Config.ModelPath
+                if ($ManualCandidate) {
+                    Set-LaunchConfigVisionSelection -Config $Config -VisionCandidate $ManualCandidate -SelectionMode "manual"
+                    return
+                }
+            }
+            "Disable" {
+                Set-LaunchConfigVisionSelection -Config $Config -VisionCandidate $null -SelectionMode "disabled"
+                return
+            }
+            "Back" {
+                return
+            }
+        }
+    }
+}
+
 function Show-LaunchModeMenu {
     $Options = @(
         [pscustomobject]@{ Name = "Background Service"; Description = "Start llama-server.exe in the background without opening a browser."; Value = "Background Service" },
@@ -3851,7 +4770,6 @@ function Show-LaunchModeMenu {
 function Show-MainLauncherMenu {
     $Options = @(
         [pscustomobject]@{ Name = "Quick Start"; Description = "Pick a model, then choose background service or Web UI."; Value = "QuickStart" },
-        [pscustomobject]@{ Name = "Quick Start And OpenClaw"; Description = "Pick a model, start llama.cpp, then sync and start OpenClaw."; Value = "QuickStartOpenClaw" },
         [pscustomobject]@{ Name = "Tune And Launch"; Description = "Pick a model, edit a parameter matrix, then start."; Value = "TuneLaunch" },
         [pscustomobject]@{ Name = "Server Status"; Description = "Show tracked server status, runtime settings, and GPU offload summary."; Value = "Status" },
         [pscustomobject]@{ Name = "Stop Running Server"; Description = "Stop the currently tracked llama.cpp server."; Value = "Stop" },
@@ -3859,7 +4777,7 @@ function Show-MainLauncherMenu {
         [pscustomobject]@{ Name = "Exit"; Description = "Leave the launcher without changing anything."; Value = "Exit" }
     )
 
-    return Show-ListMenu -Title "llama.cpp Launcher" -Subtitle "First choose Quick Start, Quick Start And OpenClaw, or Tune And Launch. Utility actions stay here too." -Items $Options
+    return Show-ListMenu -Title "llama.cpp Launcher" -Subtitle "Choose Quick Start or Tune And Launch first. Utility actions stay here too." -Items $Options
 }
 
 function New-LaunchConfig {
@@ -3873,39 +4791,44 @@ function New-LaunchConfig {
     }
 
     $Config = [ordered]@{
-        ModelName       = $ModelEntry.name
-        ModelPath       = Resolve-ModelPath -Path $ModelEntry.path
+        ModelName         = $ModelEntry.name
+        ModelPath         = Resolve-ModelPath -Path $ModelEntry.path
         ModelCapabilities = Format-ModelCapabilities -ModelEntry $ModelEntry
-        LaunchMode      = if ($NoBrowser) { "Background Service" } else { "Open Web UI" }
-        OpenClawAfterStart = $false
-        Port            = [string]$Port
-        GpuLayers       = [string]$GpuLayers
-        RepeatingLayers = ""
+        VisionModelName   = ""
+        VisionModelPath   = ""
+        VisionMmprojPath  = ""
+        VisionSelectionMode = "auto"
+        LaunchMode        = if ($NoBrowser) { "Background Service" } else { "Open Web UI" }
+        Port              = [string]$Port
+        GpuLayers         = [string]$GpuLayers
+        RepeatingLayers   = ""
         ModelRepeatingLayerCount = $null
-        ExtremeMode     = [bool]$ExtremeMode
-        AutoTune        = [bool]$AutoTune
-        Threads         = [string]$RawThreads
-        ThreadsBatch    = [string]$RawThreadsBatch
-        ReadyTimeoutSec = [string]$ReadyTimeoutSec
-        OpenPath        = if ($OpenPath) { $OpenPath } else { "/" }
-        ContextSize     = [string]$ForwardConfig.ContextSize
-        Host            = if ($ForwardConfig.Host) { [string]$ForwardConfig.Host } else { "127.0.0.1" }
-        Metrics         = [bool]$ForwardConfig.Metrics
-        ApiKey          = [string]$ForwardConfig.ApiKey
-        Device          = [string]$ForwardConfig.Device
-        SplitMode       = [string]$ForwardConfig.SplitMode
-        TensorSplit     = [string]$ForwardConfig.TensorSplit
-        Fit             = [string]$ForwardConfig.Fit
-        ExtraArgs       = [string]$ForwardConfig.ExtraArgs
+        ExtremeMode       = [bool]$ExtremeMode
+        AutoTune          = [bool]$AutoTune
+        Threads           = [string]$RawThreads
+        ThreadsBatch      = [string]$RawThreadsBatch
+        ReadyTimeoutSec   = [string]$ReadyTimeoutSec
+        OpenPath          = if ($OpenPath) { $OpenPath } else { "/" }
+        ContextSize       = [string]$ForwardConfig.ContextSize
+        Host              = if ($ForwardConfig.Host) { [string]$ForwardConfig.Host } else { "127.0.0.1" }
+        Metrics           = [bool]$ForwardConfig.Metrics
+        ApiKey            = [string]$ForwardConfig.ApiKey
+        Device            = [string]$ForwardConfig.Device
+        SplitMode         = [string]$ForwardConfig.SplitMode
+        TensorSplit       = [string]$ForwardConfig.TensorSplit
+        Fit               = [string]$ForwardConfig.Fit
+        ExtraArgs         = [string]$ForwardConfig.ExtraArgs
     }
 
     Sync-LaunchConfigGpuFields -Config $Config
+    Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $ModelIndexPath
     return $Config
 }
 
 function Get-LaunchConfigItems {
     return @(
         [pscustomobject]@{ Key = "Model"; Label = "Model"; Type = "model" },
+        [pscustomobject]@{ Key = "VisionModel"; Label = "Vision Model"; Type = "visionModel" },
         [pscustomobject]@{ Key = "LaunchMode"; Label = "Launch"; Type = "choice"; Choices = @("Background Service", "Open Web UI") },
         [pscustomobject]@{ Key = "Port"; Label = "Port"; Type = "number"; Hint = "1-65535" },
         [pscustomobject]@{ Key = "OpenPath"; Label = "Open Path"; Type = "text"; Hint = "For Web UI use /" },
@@ -3916,7 +4839,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "Threads"; Label = "Threads"; Type = "number"; Hint = "-1 or positive integer" },
         [pscustomobject]@{ Key = "ThreadsBatch"; Label = "Threads Batch"; Type = "number"; Hint = "-1 or positive integer" },
         [pscustomobject]@{ Key = "ReadyTimeoutSec"; Label = "Ready Timeout"; Type = "number"; Hint = "seconds" },
-        [pscustomobject]@{ Key = "ContextSize"; Label = "Context Size"; Type = "numberOrBlank"; Hint = "blank uses llama.cpp default" },
+        [pscustomobject]@{ Key = "ContextSize"; Label = "Context Size"; Type = "numberOrBlank"; Hint = "blank uses managed default 131072" },
         [pscustomobject]@{ Key = "Host"; Label = "Host"; Type = "text"; Hint = "127.0.0.1 or 0.0.0.0" },
         [pscustomobject]@{ Key = "Metrics"; Label = "Metrics"; Type = "bool" },
         [pscustomobject]@{ Key = "ApiKey"; Label = "API Key"; Type = "text" },
@@ -3954,7 +4877,7 @@ function Get-LaunchConfigDefaultText {
         "AutoTune" { return "off" }
         "Threads" { return "auto -> $([Math]::Max(1, $LogicalThreads - 2))" }
         "ThreadsBatch" { return "auto -> $LogicalThreads" }
-        "ContextSize" { return "llama.cpp default" }
+        "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
         "ApiKey" { return "none" }
         "Device" { return "auto" }
         "SplitMode" { return "llama.cpp default" }
@@ -3973,6 +4896,23 @@ function Get-LaunchConfigValueText {
 
     switch ($Item.Key) {
         "Model" { return [string]$Config.ModelName }
+        "VisionModel" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.VisionMmprojPath)) {
+                if ([string]$Config.VisionSelectionMode -eq "disabled") {
+                    return "disabled"
+                }
+
+                return "auto -> none"
+            }
+
+            $Prefix = switch ([string]$Config.VisionSelectionMode) {
+                "manual" { "manual -> " }
+                "auto" { "auto -> " }
+                default { "" }
+            }
+
+            return "{0}{1}" -f $Prefix, $(if ([string]::IsNullOrWhiteSpace([string]$Config.VisionModelName)) { [System.IO.Path]::GetFileName([string]$Config.VisionMmprojPath) } else { [string]$Config.VisionModelName })
+        }
         "Metrics" { return $(if ($Config.Metrics) { "On" } else { "Off" }) }
         "ExtremeMode" { return $(if ($Config.ExtremeMode) { "On" } else { "Off" }) }
         "AutoTune" { return $(if ($Config.AutoTune) { "On" } else { "Off" }) }
@@ -4081,7 +5021,13 @@ function Edit-LaunchConfigItem {
                 $Config.ModelPath = Resolve-ModelPath -Path $SelectedModel.path
                 $Config.ModelCapabilities = Format-ModelCapabilities -ModelEntry $SelectedModel
                 Sync-LaunchConfigGpuFields -Config $Config
+                if ([string]$Config.VisionSelectionMode -eq "auto") {
+                    Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $IndexPath
+                }
             }
+        }
+        "visionModel" {
+            Edit-VisionModelSelection -Config $Config -IndexPath $IndexPath
         }
         "choice" {
             $Choices = @($Item.Choices)
@@ -4232,6 +5178,13 @@ function Show-LaunchConfigGrid {
         Write-Host ("Model        : {0}" -f $Config.ModelName) -ForegroundColor Cyan
         Write-ModelCapabilitiesLine -CapabilityText $Config.ModelCapabilities
         Write-Host ("Model Path   : {0}" -f (Get-FitText -Text $Config.ModelPath -Width ([Math]::Max(40, $Width - 16))))
+        if ([string]::IsNullOrWhiteSpace([string]$Config.VisionMmprojPath)) {
+            Write-Host ("Vision Model : {0}" -f $(if ([string]$Config.VisionSelectionMode -eq "disabled") { "disabled" } else { "none" })) -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host ("Vision Model : {0}" -f $Config.VisionModelName) -ForegroundColor Cyan
+            Write-Host ("Mmproj Path  : {0}" -f (Get-FitText -Text $Config.VisionMmprojPath -Width ([Math]::Max(40, $Width - 16))))
+        }
         Write-Host ""
         Write-Host "Esc returns to the main menu. Start Launch begins with the current settings." -ForegroundColor Yellow
 
@@ -4332,7 +5285,10 @@ function Apply-LaunchSelection {
     $script:Background = $true
     $script:NoPause = $true
     $script:NoBrowser = $Config.LaunchMode -eq "Background Service"
-    $script:OpenClawAfterStart = [bool]$Config.OpenClawAfterStart
+    $script:SelectedVisionDisabled = [string]$Config.VisionSelectionMode -eq "disabled"
+    $script:SelectedVisionModelPath = if ($Config.VisionModelPath) { Resolve-ModelPath -Path ([string]$Config.VisionModelPath) } else { $null }
+    $script:SelectedVisionMmprojPath = if ($Config.VisionMmprojPath) { Resolve-ModelPath -Path ([string]$Config.VisionMmprojPath) } else { $null }
+    $script:SelectedVisionModelEntry = if ($script:SelectedVisionModelPath) { Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $script:SelectedVisionModelPath } else { $null }
     if (-not $script:NoBrowser -and ($script:OpenPath -eq "/v1/models" -or [string]::IsNullOrWhiteSpace($script:OpenPath))) {
         $script:OpenPath = "/"
     }
@@ -4349,7 +5305,7 @@ function Wait-MenuContinue {
 
 function Show-LiveServerStatusView {
     param(
-        [int]$RefreshIntervalSec = 10
+        [int]$RefreshIntervalSec = 15
     )
 
     $RefreshIntervalSec = [Math]::Max(1, $RefreshIntervalSec)
@@ -4369,15 +5325,42 @@ function Show-LiveServerStatusView {
 }
 
 function Stop-TrackedServer {
+    $GuardResult = Invoke-WorkspaceRuntimeGuard
+    if ($GuardResult.RemainingIds.Count -gt 0) {
+        throw "Illegal runtime process(es) could not be cleared: $($GuardResult.RemainingIds -join ', ')"
+    }
+
+    $LiveState = Get-LiveRuntimeOwnerState
     $TrackedProcess = Get-TrackedServerProcess
     if (-not $TrackedProcess) {
-        Write-Host "No tracked llama.cpp server is running." -ForegroundColor Yellow
+        if ($GuardResult.StoppedIds.Count -gt 0) {
+            Write-Host "No tracked llama.cpp server is running. Illegal runtime process(es) were cleared." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "No tracked llama.cpp server is running." -ForegroundColor Yellow
+        }
         return
     }
 
-    Stop-Process -Id $TrackedProcess.Id -Force
-    $RemainingIds = Wait-ForProcessExit -ProcessIds @([int]$TrackedProcess.Id) -TimeoutSec $ServerCleanupTimeoutSec
-    Remove-TrackedPidFiles
+    $TargetIds = New-Object System.Collections.Generic.List[int]
+    $TargetIds.Add([int]$TrackedProcess.Id)
+    if ($LiveState -and $LiveState.supervisor_pid) {
+        $TargetIds.Add([int]$LiveState.supervisor_pid)
+    }
+    if ($LiveState -and $LiveState.watchdog_pid) {
+        $TargetIds.Add([int]$LiveState.watchdog_pid)
+    }
+
+    foreach ($TargetId in @($TargetIds | Select-Object -Unique)) {
+        try {
+            Stop-Process -Id $TargetId -Force -ErrorAction Stop
+        }
+        catch {
+        }
+    }
+
+    $RemainingIds = Wait-ForProcessExit -ProcessIds @($TargetIds | Select-Object -Unique) -TimeoutSec $ServerCleanupTimeoutSec
+    Remove-RuntimeOwnershipArtifacts
     if ($RemainingIds.Count -gt 0) {
         throw "Tracked llama.cpp server is still shutting down: $($RemainingIds -join ', ')"
     }
@@ -4421,21 +5404,7 @@ function Invoke-InteractiveLauncher {
                 if ($LaunchMode -eq "Open Web UI") {
                     $Config.OpenPath = "/"
                 }
-
-                Apply-LaunchSelection -Config $Config
-                return $true
-            }
-            "QuickStartOpenClaw" {
-                $ModelEntry = Select-ModelEntry -IndexPath $IndexPath -CurrentModelPath $ModelPath
-                if (-not $ModelEntry) {
-                    continue
-                }
-
-                $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $LlamaArgs
-                $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
-                $Config.LaunchMode = "Background Service"
-                $Config.OpenClawAfterStart = $true
-                $Config.OpenPath = "/v1/models"
+                Edit-VisionModelSelection -Config $Config -IndexPath $IndexPath
 
                 Apply-LaunchSelection -Config $Config
                 return $true
@@ -4461,7 +5430,7 @@ function Invoke-InteractiveLauncher {
                 return $true
             }
             "Status" {
-                Show-LiveServerStatusView -RefreshIntervalSec 10
+                Show-LiveServerStatusView -RefreshIntervalSec 15
             }
             "Stop" {
                 Show-MenuHeader -Title "Stop Running Server" -Subtitle "Stopping the tracked llama.cpp server if one exists."
@@ -4497,47 +5466,26 @@ function Remove-TrackedPidFiles {
 }
 
 function Get-TrackedServerRecord {
-    foreach ($CandidatePath in @(Get-TrackedPidFileCandidates)) {
-        if (-not (Test-Path -LiteralPath $CandidatePath)) {
-            continue
-        }
-
-        $PidText = ((Get-Content -LiteralPath $CandidatePath -ErrorAction SilentlyContinue | Select-Object -First 1) | Out-String).Trim()
-        if ($PidText -notmatch '^\d+$') {
-            Remove-Item -LiteralPath $CandidatePath -ErrorAction SilentlyContinue
-            continue
-        }
-
-        $Process = Get-Process -Id ([int]$PidText) -ErrorAction SilentlyContinue
-        if (-not $Process) {
-            Remove-Item -LiteralPath $CandidatePath -ErrorAction SilentlyContinue
-            continue
-        }
-
-        try {
-            $MatchesServerPath = $false
-            foreach ($CandidateExe in $ServerExeCandidates) {
-                if ([string]::Equals($Process.Path, $CandidateExe, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $MatchesServerPath = $true
-                    break
-                }
-            }
-
-            if (-not $MatchesServerPath) {
-                continue
-            }
-        }
-        catch {
-            continue
-        }
-
-        return [pscustomobject]@{
-            Process     = $Process
-            PidFilePath = $CandidatePath
-        }
+    $RuntimeState = Read-RuntimeOwnerState
+    if (-not $RuntimeState) {
+        return $null
     }
 
-    return $null
+    [int]$ServerPid = 0
+    if (-not [int]::TryParse([string]$RuntimeState.server_pid, [ref]$ServerPid) -or $ServerPid -le 0) {
+        return $null
+    }
+
+    $Process = Get-Process -Id $ServerPid -ErrorAction SilentlyContinue
+    if (-not $Process) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Process        = $Process
+        PidFilePath    = $PidFile
+        OwnershipState = $RuntimeState
+    }
 }
 
 function Get-TrackedPidFilePath {
@@ -5234,12 +6182,18 @@ function Get-WorkspaceServerProcesses {
 }
 
 function Stop-WorkspaceServerProcesses {
+    $OwnerState = Get-LiveRuntimeOwnerState
     $TrackedProcess = Get-TrackedServerProcess
     $TrackedModelPath = Get-TrackedServerModelPath -Process $TrackedProcess
+    if (-not $TrackedModelPath -and $OwnerState -and -not [string]::IsNullOrWhiteSpace([string]$OwnerState.model_path)) {
+        $TrackedModelPath = Resolve-ModelPath -Path ([string]$OwnerState.model_path)
+    }
     $WorkspaceServerProcesses = @(Get-WorkspaceServerProcesses)
+    $WorkspaceSupervisorProcesses = @(Get-WorkspaceSupervisorProcesses)
+    $WorkspaceWatchdogProcesses = @(Get-WorkspaceWatchdogProcesses)
 
-    if (-not $WorkspaceServerProcesses) {
-        Remove-TrackedPidFiles
+    if (($WorkspaceServerProcesses.Count -eq 0) -and ($WorkspaceSupervisorProcesses.Count -eq 0) -and ($WorkspaceWatchdogProcesses.Count -eq 0)) {
+        Remove-RuntimeOwnershipArtifacts
         return [pscustomobject]@{
             HadRunningServer = $false
             PreviousModelPath = $TrackedModelPath
@@ -5252,17 +6206,23 @@ function Stop-WorkspaceServerProcesses {
             ForEach-Object { [int]$_.ProcessId } |
             Select-Object -Unique
     )
+    $TargetIds = @(
+        $TargetIds +
+        @($WorkspaceSupervisorProcesses | ForEach-Object { [int]$_.ProcessId }) +
+        @($WorkspaceWatchdogProcesses | ForEach-Object { [int]$_.ProcessId }) |
+            Select-Object -Unique
+    )
     $StoppedIds = New-Object System.Collections.Generic.List[int]
-    foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
+    foreach ($TargetId in $TargetIds) {
         try {
-            Stop-Process -Id $WorkspaceServerProcess.ProcessId -Force -ErrorAction Stop
-            $StoppedIds.Add([int]$WorkspaceServerProcess.ProcessId)
+            Stop-Process -Id $TargetId -Force -ErrorAction Stop
+            $StoppedIds.Add([int]$TargetId)
         }
         catch {
         }
     }
 
-    Remove-TrackedPidFiles
+    Remove-RuntimeOwnershipArtifacts
 
     if ($StoppedIds.Count -gt 0) {
         Write-Host "Cleaned old llama.cpp server process(es): $($StoppedIds -join ', ')" -ForegroundColor Yellow
@@ -6011,520 +6971,16 @@ function Test-TcpPort {
     }
 }
 
-function Resolve-VisionServicePort {
-    if ($env:LCPP_VISION_PORT -match '^\d+$') {
-        return [int]$env:LCPP_VISION_PORT
-    }
-
-    return 8081
-}
-
-function Get-PowerShellExecutablePath {
-    $PowerShellExe = $null
-    try {
-        $PowerShellExe = (Get-Process -Id $PID).Path
-    }
-    catch {
-    }
-
-    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
-        $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    }
-    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
-        $PowerShellExe = "powershell.exe"
-    }
-
-    return $PowerShellExe
-}
-
-function Test-AutoVisionDisabled {
-    if ($NoAutoVision) {
-        return $true
-    }
-
-    $Flag = [string]$env:LCPP_DISABLE_AUTO_VISION
-    return ($Flag.Trim().ToLowerInvariant() -in @("1", "true", "yes", "y", "on"))
-}
-
-function Invoke-VisionSidecarAfterStart {
-    param(
-        [Parameter(Mandatory = $true)][string]$TargetModelPath,
-        [int]$TimeoutSec = 360
-    )
-
-    if (Test-AutoVisionDisabled) {
-        Write-Host "Vision : auto-start disabled" -ForegroundColor DarkGray
-        return
-    }
-    if (-not (Test-Path -LiteralPath $VisionStartScript -PathType Leaf)) {
-        Write-Host "Vision : start script missing: $VisionStartScript" -ForegroundColor Yellow
-        return
-    }
-
-    $ResolvedModelPath = Resolve-ModelPath -Path $TargetModelPath
-    $MmprojPath = Find-MmprojForModel -ModelPath $ResolvedModelPath
-    if ([string]::IsNullOrWhiteSpace($MmprojPath)) {
-        Write-Host "Vision : no matching mmproj found for this model" -ForegroundColor DarkGray
-        return
-    }
-    if (-not [string]::IsNullOrWhiteSpace($script:LaunchMmprojPath)) {
-        Write-Host "Vision : enabled on primary llama-server via --mmproj" -ForegroundColor Green
-        return
-    }
-
-    $VisionPort = Resolve-VisionServicePort
-    $VisionTimeoutSec = [Math]::Max(60, [Math]::Max($TimeoutSec, 360))
-    $PowerShellExe = Get-PowerShellExecutablePath
-    $VisionArgs = @(
-        "-NoLogo",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        $VisionStartScript,
-        "-ModelPath",
-        $ResolvedModelPath,
-        "-MmprojPath",
-        $MmprojPath,
-        "-Port",
-        [string]$VisionPort,
-        "-ReadyTimeoutSec",
-        [string]$VisionTimeoutSec,
-        "-NoPause"
-    )
-
-    Write-Host "Vision : enabling sidecar on 127.0.0.1:$VisionPort" -ForegroundColor Cyan
-    Write-Host "Mmproj : $MmprojPath"
-
-    & $PowerShellExe @VisionArgs
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Vision : ready on 127.0.0.1:$VisionPort" -ForegroundColor Green
-    }
-    else {
-        Write-Host "Vision : sidecar failed to start; llama.cpp text server remains running. See $VisionStdErrLog" -ForegroundColor Yellow
-    }
-}
-
-function Get-VisionServiceProcesses {
-    $VisionPort = Resolve-VisionServicePort
-    $TrackedIds = New-Object System.Collections.Generic.HashSet[int]
-    if (Test-Path -LiteralPath $VisionPidFile) {
-        $PidText = ((Get-Content -LiteralPath $VisionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1) | Out-String).Trim()
-        if ($PidText -match '^\d+$') {
-            [void]$TrackedIds.Add([int]$PidText)
-        }
-    }
-
-    $ServerPathPatterns = @($ServerExeCandidates | ForEach-Object { [regex]::Escape($_) })
-    $PortPattern = "(?i)(?:--port(?:\s+|=)$VisionPort\b|-p(?:\s+|=)$VisionPort\b)"
-
-    return @(
-        Get-CimInstance Win32_Process -Filter "Name = 'llama-server.exe'" -ErrorAction SilentlyContinue |
-            Where-Object {
-                $CommandLine = [string]$_.CommandLine
-                $IsTracked = $TrackedIds.Contains([int]$_.ProcessId)
-                $IsWorkspaceVision = $false
-
-                if ($CommandLine) {
-                    foreach ($PathPattern in $ServerPathPatterns) {
-                        if ($CommandLine -match $PathPattern -and $CommandLine -match '(?i)--mmproj' -and $CommandLine -match $PortPattern) {
-                            $IsWorkspaceVision = $true
-                            break
-                        }
-                    }
-                }
-
-                $IsTracked -or $IsWorkspaceVision
-            }
-    ) | Sort-Object ProcessId -Unique
-}
-
-function Get-OpenAiModelIdsFromPayload {
-    param([AllowNull()]$Payload)
-
-    if ($null -eq $Payload) {
-        return @()
-    }
-
-    if ($Payload.PSObject.Properties["data"] -and $null -ne $Payload.data) {
-        return @($Payload.data | ForEach-Object { if ($_.PSObject.Properties["id"]) { [string]$_.id } } | Where-Object { $_ })
-    }
-    if ($Payload.PSObject.Properties["models"] -and $null -ne $Payload.models) {
-        return @(
-            $Payload.models | ForEach-Object {
-                if ($_.PSObject.Properties["id"]) {
-                    [string]$_.id
-                }
-                elseif ($_.PSObject.Properties["model"]) {
-                    [string]$_.model
-                }
-                elseif ($_.PSObject.Properties["name"]) {
-                    [string]$_.name
-                }
-            } | Where-Object { $_ }
-        )
-    }
-
-    return @()
-}
-
-function Get-VisionRuntimeStatus {
-    $VisionHost = "127.0.0.1"
-    $VisionPort = Resolve-VisionServicePort
-    $VisionUrl = "http://{0}:{1}" -f $VisionHost, $VisionPort
-    $Processes = @(Get-VisionServiceProcesses)
-    $Listening = Test-TcpPort -TargetHost $VisionHost -Port $VisionPort
-    $Health = $null
-    if ($Listening) {
-        try {
-            $Health = Invoke-RestMethod -Uri "$VisionUrl/v1/models" -TimeoutSec 3
-        }
-        catch {
-            $Health = $null
-        }
-    }
-
-    return [pscustomobject]@{
-        Host         = $VisionHost
-        Port         = $VisionPort
-        Url          = $VisionUrl
-        Listening    = $Listening
-        ProcessCount = $Processes.Count
-        ModelIds     = @(Get-OpenAiModelIdsFromPayload -Payload $Health)
-    }
-}
-
-function Write-VisionStatusLine {
-    param([Parameter(Mandatory = $true)]$RuntimeStatus)
-
-    if ($RuntimeStatus.Listening -and $RuntimeStatus.ModelIds.Count -gt 0) {
-        Write-Host "Vision : ready on $($RuntimeStatus.Host):$($RuntimeStatus.Port) | model $($RuntimeStatus.ModelIds[0])" -ForegroundColor Green
-        return
-    }
-    if ($RuntimeStatus.Listening) {
-        Write-Host "Vision : listening on $($RuntimeStatus.Host):$($RuntimeStatus.Port), model list not ready" -ForegroundColor Yellow
-        return
-    }
-    if ($RuntimeStatus.ProcessCount -gt 0) {
-        Write-Host "Vision : process exists, but $($RuntimeStatus.Host):$($RuntimeStatus.Port) is not listening yet" -ForegroundColor Yellow
-        return
-    }
-
-    Write-Host "Vision : not running" -ForegroundColor DarkGray
-}
-
-function Get-OpenClawManagedMediaProcesses {
-    return @(
-        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.CommandLine -and (
-                    $_.CommandLine -match 'workspace[\\/]+tts_server\.py' -or
-                    $_.CommandLine -match 'workspace[\\/]+stt_server\.py'
-                )
-            }
-    )
-}
-
-function Get-OpenClawManagedMediaHealth {
-    param(
-        [Parameter(Mandatory = $true)][string]$ServiceHost,
-        [Parameter(Mandatory = $true)][int]$Port
-    )
-
-    try {
-        return Invoke-RestMethod -Uri ("http://{0}:{1}/health" -f $ServiceHost, $Port) -TimeoutSec 2
-    }
-    catch {
-        return $null
-    }
-}
-
-function Get-OpenClawManagedMediaServiceStatus {
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][string]$ProcessPattern,
-        [Parameter(Mandatory = $true)][int]$Port
-    )
-
-    $ServiceHost = "127.0.0.1"
-    $Processes = @(
-        Get-OpenClawManagedMediaProcesses |
-            Where-Object { $_.CommandLine -match $ProcessPattern }
-    )
-    $Listening = Test-TcpPort -TargetHost $ServiceHost -Port $Port
-    $Health = if ($Listening) { Get-OpenClawManagedMediaHealth -ServiceHost $ServiceHost -Port $Port } else { $null }
-
-    return [pscustomobject]@{
-        Name            = $Name
-        Host            = $ServiceHost
-        Port            = $Port
-        Url             = "http://{0}:{1}/" -f $ServiceHost, $Port
-        ProcessCount    = $Processes.Count
-        Listening       = $Listening
-        Model           = if ($Health -and $Health.PSObject.Properties["model"]) { [string]$Health.model } else { $null }
-        DefaultSpeaker  = if ($Health -and $Health.PSObject.Properties["defaultSpeaker"]) { [string]$Health.defaultSpeaker } else { $null }
-        DefaultLanguage = if ($Health -and $Health.PSObject.Properties["defaultLanguage"]) { [string]$Health.defaultLanguage } else { $null }
-        Device          = if ($Health -and $Health.PSObject.Properties["device"]) { [string]$Health.device } else { $null }
-    }
-}
-
-function Get-OpenClawManagedMediaRuntimeStatus {
-    return [pscustomobject]@{
-        Tts = Get-OpenClawManagedMediaServiceStatus -Name "TTS" -ProcessPattern 'workspace[\\/]+tts_server\.py' -Port 8000
-        Stt = Get-OpenClawManagedMediaServiceStatus -Name "STT" -ProcessPattern 'workspace[\\/]+stt_server\.py' -Port 8001
-    }
-}
-
-function Write-OpenClawManagedMediaStatusLine {
-    param(
-        [Parameter(Mandatory = $true)][string]$Label,
-        [Parameter(Mandatory = $true)]$ServiceStatus
-    )
-
-    $HostPortText = "{0}:{1}" -f $ServiceStatus.Host, $ServiceStatus.Port
-    $Parts = New-Object System.Collections.Generic.List[string]
-
-    if ($ServiceStatus.Listening) {
-        $Parts.Add("ready on $HostPortText")
-    }
-    elseif ($ServiceStatus.ProcessCount -gt 0) {
-        $Parts.Add("process detected, but $HostPortText is not listening yet")
-    }
-    else {
-        $Parts.Add("not running (expected $HostPortText)")
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.Model)) {
-        $Parts.Add("model $($ServiceStatus.Model)")
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.DefaultSpeaker)) {
-        $Parts.Add("speaker $($ServiceStatus.DefaultSpeaker)")
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.DefaultLanguage)) {
-        $Parts.Add("default lang $($ServiceStatus.DefaultLanguage)")
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ServiceStatus.Device)) {
-        $Parts.Add("device $($ServiceStatus.Device)")
-    }
-
-    $ForegroundColor = if ($ServiceStatus.Listening) {
-        "Green"
-    }
-    elseif ($ServiceStatus.ProcessCount -gt 0) {
-        "Yellow"
-    }
-    else {
-        "DarkGray"
-    }
-
-    Write-Host ("{0,-7}: {1}" -f $Label, ($Parts -join " | ")) -ForegroundColor $ForegroundColor
-}
-
-function Get-OpenClawGatewayHostProcesses {
-    return @(
-        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object {
-                ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bgateway\b') -or
-                ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'gateway\.cmd')
-            }
-    )
-}
-
-function Get-OpenClawNodeHostProcesses {
-    return @(
-        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object {
-                ($_.Name -eq "node.exe" -and $_.CommandLine -match 'node_modules[\\/]+openclaw[\\/]+dist[\\/]+index\.js' -and $_.CommandLine -match '\bnode\s+run\b') -or
-                ($_.Name -like "powershell*.exe" -and $_.CommandLine -match 'start-openclaw-node\.ps1') -or
-                ($_.Name -eq "cmd.exe" -and $_.CommandLine -match 'node\.cmd')
-            }
-    )
-}
-
-function Get-OpenClawRuntimeStatus {
-    $OpenClawConfigPath = Join-Path $env:USERPROFILE ".openclaw\openclaw.json"
-    $GatewayHost = "127.0.0.1"
-    $GatewayPort = 29644
-    $GatewayProcesses = @()
-    $NodeProcesses = @()
-    $ManagedMediaStatus = $null
-    $GatewayListening = $false
-
-    $Installed = Test-Path -LiteralPath $OpenClawConfigPath
-    if ($Installed) {
-        $GatewayProcesses = @(Get-OpenClawGatewayHostProcesses)
-        $NodeProcesses = @(Get-OpenClawNodeHostProcesses)
-        $GatewayListening = Test-TcpPort -TargetHost $GatewayHost -Port $GatewayPort
-        $ManagedMediaStatus = Get-OpenClawManagedMediaRuntimeStatus
-    }
-
-    return [pscustomobject]@{
-        Installed           = $Installed
-        ConfigPath          = $OpenClawConfigPath
-        GatewayHost         = $GatewayHost
-        GatewayPort         = $GatewayPort
-        GatewayUrl          = "http://{0}:{1}/" -f $GatewayHost, $GatewayPort
-        GatewayListening    = $GatewayListening
-        GatewayProcessCount = $GatewayProcesses.Count
-        NodeProcessCount    = $NodeProcesses.Count
-        ManagedMediaStatus  = $ManagedMediaStatus
-        NeedsRuntimeStart   = $Installed -and ((-not $GatewayListening) -or $NodeProcesses.Count -eq 0)
-    }
-}
-
-function Write-OpenClawStatusLines {
-    param([Parameter(Mandatory = $true)]$RuntimeStatus)
-
-    if (-not $RuntimeStatus.Installed) {
-        Write-Host "Claw   : not installed/configured for this Windows user" -ForegroundColor DarkGray
-        return
-    }
-
-    $GatewayText = if ($RuntimeStatus.GatewayListening) {
-        "gateway listening on $($RuntimeStatus.GatewayHost):$($RuntimeStatus.GatewayPort)"
-    }
-    elseif ($RuntimeStatus.GatewayProcessCount -gt 0) {
-        "gateway process exists, but $($RuntimeStatus.GatewayHost):$($RuntimeStatus.GatewayPort) is not listening yet"
-    }
-    else {
-        "gateway not running"
-    }
-
-    $NodeText = if ($RuntimeStatus.NodeProcessCount -gt 0) {
-        "running ($($RuntimeStatus.NodeProcessCount) process entry/entries)"
-    }
-    else {
-        "not running"
-    }
-
-    $GatewayColor = if ($RuntimeStatus.GatewayListening) {
-        "Green"
-    }
-    elseif ($RuntimeStatus.GatewayProcessCount -gt 0) {
-        "Yellow"
-    }
-    else {
-        "DarkGray"
-    }
-
-    $NodeColor = if ($RuntimeStatus.NodeProcessCount -gt 0) {
-        "Green"
-    }
-    else {
-        "Yellow"
-    }
-
-    Write-Host "Claw   : $GatewayText" -ForegroundColor $GatewayColor
-    Write-Host "Node   : $NodeText" -ForegroundColor $NodeColor
-    Write-Host "ClawURL: $($RuntimeStatus.GatewayUrl)"
-    if ($RuntimeStatus.ManagedMediaStatus) {
-        Write-OpenClawManagedMediaStatusLine -Label "TTS" -ServiceStatus $RuntimeStatus.ManagedMediaStatus.Tts
-        Write-OpenClawManagedMediaStatusLine -Label "STT" -ServiceStatus $RuntimeStatus.ManagedMediaStatus.Stt
-    }
-}
-
-function Invoke-OpenClawStatusSyncSilently {
-    $OpenClawStatus = Get-OpenClawRuntimeStatus
-    if (-not $OpenClawStatus.Installed) {
-        return
-    }
-
-    $SyncScriptPath = Join-Path $Ps1Root "Update_OpenClaw_Status.ps1"
-    if (-not (Test-Path -LiteralPath $SyncScriptPath)) {
-        return
-    }
-
-    $PowerShellExe = (Get-Process -Id $PID).Path
-    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
-        $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    }
-    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
-        $PowerShellExe = "powershell.exe"
-    }
-
-    $SyncStdOutLog = Join-Path $LogRoot "openclaw-sync.stdout.log"
-    $SyncStdErrLog = Join-Path $LogRoot "openclaw-sync.stderr.log"
-    $SyncArguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $SyncScriptPath, "-NoPause")
-    if ($OpenClawStatus.NeedsRuntimeStart) {
-        $SyncArguments += "-RestartOpenClaw"
-    }
-
-    try {
-        $SyncProcess = Start-Process `
-            -FilePath $PowerShellExe `
-            -ArgumentList $SyncArguments `
-            -WorkingDirectory $ScriptRoot `
-            -RedirectStandardOutput $SyncStdOutLog `
-            -RedirectStandardError $SyncStdErrLog `
-            -WindowStyle Hidden `
-            -PassThru
-
-        if (-not $SyncProcess.WaitForExit(45000)) {
-            try {
-                $SyncProcess.Kill()
-            }
-            catch {
-            }
-
-            Write-Host "OpenClaw sync: timed out after launch; keeping llama.cpp running with the new runtime state." -ForegroundColor Yellow
-            return
-        }
-
-        if ($SyncProcess.ExitCode -ne 0) {
-            Write-Host "OpenClaw sync: skipped after launch (see $SyncStdErrLog if you need details)." -ForegroundColor Yellow
-        }
-    }
-    catch {
-        Write-Host "OpenClaw sync: skipped after launch ($($_.Exception.Message))." -ForegroundColor Yellow
-    }
-}
-
-function Invoke-OpenClawLauncherAfterStart {
-    param(
-        [Parameter(Mandatory = $true)][string]$ServerBaseUrl,
-        [Parameter(Mandatory = $true)][int]$TimeoutSec
-    )
-
-    $OpenClawStatus = Get-OpenClawRuntimeStatus
-    if (-not $OpenClawStatus.Installed) {
-        Write-Host "OpenClaw: skipped because no local OpenClaw config was found for this Windows user." -ForegroundColor Yellow
-        return
-    }
-
-    $OpenClawLauncherPath = Join-Path $Ps1Root "Start_OpenClaw.ps1"
-    if (-not (Test-Path -LiteralPath $OpenClawLauncherPath)) {
-        Write-Host "OpenClaw: skipped because the launcher script is missing: $OpenClawLauncherPath" -ForegroundColor Yellow
-        return
-    }
-
-    if (-not (Wait-ForServerReady -ServerBaseUrl $ServerBaseUrl -TimeoutSec $TimeoutSec)) {
-        Write-Host "OpenClaw: llama.cpp was not ready in time, so OpenClaw startup was skipped for now." -ForegroundColor Yellow
-        return
-    }
-
-    $PowerShellExe = (Get-Process -Id $PID).Path
-    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
-        $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    }
-    if ([string]::IsNullOrWhiteSpace($PowerShellExe) -or -not (Test-Path -LiteralPath $PowerShellExe)) {
-        $PowerShellExe = "powershell.exe"
-    }
-
-    Write-Host "OpenClaw: llama.cpp is ready. Starting OpenClaw now." -ForegroundColor Cyan
-
-    try {
-        & $PowerShellExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $OpenClawLauncherPath -NoPause
-        $OpenClawExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
-        if ($OpenClawExitCode -ne 0) {
-            Write-Host "OpenClaw: launcher exited with code $OpenClawExitCode. llama.cpp is still running." -ForegroundColor Yellow
-        }
-    }
-    catch {
-        Write-Host "OpenClaw: launcher failed ($($_.Exception.Message)). llama.cpp is still running." -ForegroundColor Yellow
-    }
-}
-
 function Show-ServerStatus {
+    $GuardResult = Invoke-WorkspaceRuntimeGuard -Quiet
+    if ($GuardResult.RemainingIds.Count -gt 0) {
+        throw "Illegal runtime process(es) could not be cleared: $($GuardResult.RemainingIds -join ', ')"
+    }
+
+    if ($GuardResult.StoppedIds.Count -gt 0) {
+        Write-Host "Guard  : cleared illegal runtime process(es): $($GuardResult.StoppedIds -join ', ')" -ForegroundColor Yellow
+    }
+
     $TrackedProcess = Get-TrackedServerProcess
     $IsUntrackedWorkspaceServer = $false
     if (-not $TrackedProcess) {
@@ -6533,8 +6989,6 @@ function Show-ServerStatus {
     }
 
     $Listener = Test-PortInUse
-    $OpenClawStatus = Get-OpenClawRuntimeStatus
-    $VisionStatus = Get-VisionRuntimeStatus
 
     if ($TrackedProcess) {
         $TrackedSettings = Get-TrackedServerLaunchSettings -Process $TrackedProcess
@@ -6678,9 +7132,8 @@ function Show-ServerStatus {
             Write-Host "Vision : enabled on primary server | mmproj $($TrackedSettings.MmprojPath)" -ForegroundColor Green
         }
         else {
-            Write-VisionStatusLine -RuntimeStatus $VisionStatus
+            Write-Host "Vision : disabled" -ForegroundColor DarkGray
         }
-        Write-OpenClawStatusLines -RuntimeStatus $OpenClawStatus
         Write-Host "Logs   : $($TrackedLogPaths.StdOutLog)"
         Write-Host "Error  : $($TrackedLogPaths.StdErrLog)"
         return
@@ -6693,8 +7146,7 @@ function Show-ServerStatus {
     }
 
     Write-Host "Status : stopped" -ForegroundColor Yellow
-    Write-VisionStatusLine -RuntimeStatus $VisionStatus
-    Write-OpenClawStatusLines -RuntimeStatus $OpenClawStatus
+    Write-Host "Vision : no running llama.cpp server" -ForegroundColor DarkGray
 }
 
 $PendingSwitchTimingContext = $null
@@ -6754,6 +7206,7 @@ try {
 
     $ModelPath = Resolve-LaunchModelPath -IndexPath $ModelIndexPath -RequestedModelPath $ModelPath
     $LaunchModelEntry = Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $ModelPath
+    $script:LaunchModelEntry = $LaunchModelEntry
     $script:ModelGenerationArgs = @(Get-ModelGenerationArgs -ModelEntry $LaunchModelEntry -UserArguments $LlamaArgs)
 
     $ResolvedThreads = Resolve-RequestedThreads -RequestedThreads $RawThreads -RequestedThreadsBatch $RawThreadsBatch
@@ -6785,7 +7238,7 @@ try {
     Write-Host "Starting llama.cpp server..." -ForegroundColor Green
     Write-Host "Server : $ServerExe"
     Write-Host "Model  : $ModelPath"
-    $LaunchMmprojPath = Find-MmprojForModel -ModelPath $ModelPath
+    $LaunchMmprojPath = Resolve-LaunchMmprojPath -ModelPath $ModelPath -ModelEntry $LaunchModelEntry
     if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
         Write-Host "Mmproj : $LaunchMmprojPath"
     }
@@ -6831,9 +7284,58 @@ try {
     Write-Host ""
 
     $ServerArgs = Get-ServerArgs -AutoTuning $AutoLaunchTuning
+    $LaunchSessionId = [guid]::NewGuid().ToString()
+    $PowerShellHostPath = Get-CurrentHostExecutablePath
+    $EncodedServerArgs = ConvertTo-Base64Json -Value @($ServerArgs)
+    $SupervisorArgumentList = @(
+        "-NoLogo"
+        "-NoProfile"
+        "-ExecutionPolicy"
+        "Bypass"
+        "-File"
+        $SupervisorScriptPath
+        "-ProjectRoot"
+        $ScriptRoot
+        "-ServerExe"
+        $ServerExe
+        "-ServerArgsBase64"
+        $EncodedServerArgs
+        "-StdOutLog"
+        $StdOutLog
+        "-StdErrLog"
+        $StdErrLog
+        "-PidFile"
+        $PidFile
+        "-RuntimeOwnerStateFile"
+        $RuntimeOwnerStateFile
+        "-SupervisorPidFile"
+        $SupervisorPidFile
+        "-WatchdogPidFile"
+        $WatchdogPidFile
+        "-WatchdogLog"
+        $WatchdogLog
+        "-WatchdogScriptPath"
+        $WatchdogScriptPath
+        "-WatchdogIntervalSec"
+        ([string]$WatchdogIntervalSec)
+        "-SessionId"
+        $LaunchSessionId
+        "-LaunchMode"
+        $(if ($Background) { "background" } else { "foreground" })
+        "-Port"
+        ([string]$Port)
+        "-ModelPath"
+        $ModelPath
+    )
+    if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
+        $SupervisorArgumentList += @(
+            "-MmprojPath"
+            $LaunchMmprojPath
+        )
+    }
+    $SupervisorArgumentString = ConvertTo-ArgumentString -Arguments $SupervisorArgumentList
 
     if ($Background) {
-        $ArgumentString = ConvertTo-ArgumentString -Arguments $ServerArgs
         $StartupCheckSec = [Math]::Min($BackgroundStartupCheckSec, [Math]::Max(10, $ReadyTimeoutSec))
         $BaselineWorkspaceServerIds = @(
             Get-WorkspaceServerProcesses |
@@ -6849,20 +7351,11 @@ try {
             $BackgroundAttemptCount++
             Reset-BackgroundServerLogs
             $BackgroundProcess = Start-Process `
-                -FilePath $ServerExe `
-                -ArgumentList $ArgumentString `
+                -FilePath $PowerShellHostPath `
+                -ArgumentList $SupervisorArgumentString `
                 -WorkingDirectory $ScriptRoot `
-                -RedirectStandardOutput $StdOutLog `
-                -RedirectStandardError $StdErrLog `
                 -WindowStyle Hidden `
                 -PassThru
-
-            Set-Content -LiteralPath $PidFile -Value $BackgroundProcess.Id -Encoding ASCII
-            if ($SwitchTimingContext) {
-                Set-ModelSwitchTimingPending -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -LaunchPid $BackgroundProcess.Id | Out-Null
-                $PendingSwitchTimingContext = $SwitchTimingContext
-                $PendingSwitchTimingLaunchPid = [Nullable[int]]$BackgroundProcess.Id
-            }
 
             try {
                 if ($WrapperControlsPause) {
@@ -6941,6 +7434,8 @@ try {
         Write-Host "URL    : $BaseUrl"
         Write-Host "Logs   : $StdOutLog"
         Write-Host "Error  : $StdErrLog"
+        $AuditLaunchPid = if ($TrackedBackgroundPid) { [Nullable[int]]$TrackedBackgroundPid } else { [Nullable[int]]$BackgroundProcess.Id }
+        Write-LaunchAuditRecord -ServerArgs $ServerArgs -AutoTuning $AutoLaunchTuning -LaunchMode "background" -LaunchedProcessId $AuditLaunchPid -StartupState $StartupState
         if ($AutoLaunchTuning.Source -eq "saved-profile") {
             Write-Host "Saved  : reused learned profile from $TuningProfileFile" -ForegroundColor Cyan
         }
@@ -6951,18 +7446,6 @@ try {
             elseif (-not [string]::IsNullOrWhiteSpace($AutoTuneSaveResult.Message)) {
                 Write-Host "AutoTune: $($AutoTuneSaveResult.Message)" -ForegroundColor Yellow
             }
-        }
-        if ($StartupState -eq "Ready") {
-            Invoke-VisionSidecarAfterStart -TargetModelPath $ModelPath -TimeoutSec ([Math]::Max(1, $ReadyTimeoutSec))
-            if ($OpenClawAfterStart) {
-                Invoke-OpenClawLauncherAfterStart -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max(1, $ReadyTimeoutSec))
-            }
-            else {
-                Invoke-OpenClawStatusSyncSilently
-            }
-        }
-        elseif ($OpenClawAfterStart) {
-            Invoke-OpenClawLauncherAfterStart -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max(1, $ReadyTimeoutSec - $StartupCheckSec))
         }
         if (-not $NoBrowser) {
             if ($StartupState -eq "Ready") {
@@ -7021,7 +7504,8 @@ try {
         Start-ModelSwitchTimingRecorderDetached -TargetModelPath $SwitchTimingContext.TargetModelPath -PreviousModelPath $SwitchTimingContext.PreviousModelPath -StartedAt $SwitchTimingContext.SwitchStartedAt -ServerBaseUrl $BaseUrl -TimeoutSec ([Math]::Max($ReadyTimeoutSec, 600))
     }
 
-    & $ServerExe @ServerArgs
+    Write-LaunchAuditRecord -ServerArgs $ServerArgs -AutoTuning $AutoLaunchTuning -LaunchMode "foreground" -StartupState "invoking"
+    & $PowerShellHostPath @SupervisorArgumentList
     if ($LASTEXITCODE -ne 0) {
         throw "llama.cpp exited with code $LASTEXITCODE."
     }
