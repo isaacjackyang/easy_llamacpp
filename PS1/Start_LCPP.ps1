@@ -6300,30 +6300,56 @@ function Get-BackgroundServerCandidate {
     )
 
     $WorkspaceServerProcesses = @(Get-WorkspaceServerProcesses -TargetModelPath $TargetModelPath)
-    if ($WorkspaceServerProcesses.Count -eq 0) {
-        return $null
-    }
+    if ($WorkspaceServerProcesses.Count -gt 0) {
+        $ListeningProcess = Get-ListeningWorkspaceServerProcess -TargetModelPath $TargetModelPath
+        if ($ListeningProcess) {
+            return $ListeningProcess
+        }
 
-    $ListeningProcess = Get-ListeningWorkspaceServerProcess -TargetModelPath $TargetModelPath
-    if ($ListeningProcess) {
-        return $ListeningProcess
-    }
+        if ($ExpectedLaunchPid -and $ExpectedLaunchPid.Value -gt 0) {
+            foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
+                if ([int]$WorkspaceServerProcess.ProcessId -eq $ExpectedLaunchPid.Value) {
+                    return $WorkspaceServerProcess
+                }
+            }
+        }
 
-    if ($ExpectedLaunchPid -and $ExpectedLaunchPid.Value -gt 0) {
         foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
-            if ([int]$WorkspaceServerProcess.ProcessId -eq $ExpectedLaunchPid.Value) {
+            if ($BaselineProcessIds -notcontains ([int]$WorkspaceServerProcess.ProcessId)) {
                 return $WorkspaceServerProcess
             }
         }
     }
 
-    foreach ($WorkspaceServerProcess in $WorkspaceServerProcesses) {
-        if ($BaselineProcessIds -notcontains ([int]$WorkspaceServerProcess.ProcessId)) {
-            return $WorkspaceServerProcess
+    $RuntimeState = Get-LiveRuntimeOwnerState
+    if (-not $RuntimeState) {
+        $RuntimeState = Read-RuntimeOwnerState
+    }
+
+    if ($RuntimeState) {
+        [int]$RuntimeServerPid = 0
+        if ([int]::TryParse([string]$RuntimeState.server_pid, [ref]$RuntimeServerPid) -and $RuntimeServerPid -gt 0) {
+            $RuntimeModelMatches = $true
+            if (-not [string]::IsNullOrWhiteSpace($TargetModelPath) -and -not [string]::IsNullOrWhiteSpace([string]$RuntimeState.model_path)) {
+                $ResolvedRuntimeModelPath = Resolve-ModelPath -Path ([string]$RuntimeState.model_path)
+                $RuntimeModelMatches = [string]::Equals($ResolvedRuntimeModelPath, $TargetModelPath, [System.StringComparison]::OrdinalIgnoreCase)
+            }
+
+            if ($RuntimeModelMatches -and (Get-Process -Id $RuntimeServerPid -ErrorAction SilentlyContinue)) {
+                return [pscustomobject]@{
+                    ProcessId    = $RuntimeServerPid
+                    CommandLine  = [string]$RuntimeState.server_exe
+                    ExecutablePath = [string]$RuntimeState.server_exe
+                }
+            }
         }
     }
 
-    return $WorkspaceServerProcesses | Select-Object -First 1
+    if ($WorkspaceServerProcesses.Count -gt 0) {
+        return $WorkspaceServerProcesses | Select-Object -First 1
+    }
+
+    return $null
 }
 
 function Wait-ForPortRelease {
@@ -6739,6 +6765,25 @@ function Wait-ForBackgroundServerReadyWithProgress {
         }
 
         if (($Process -and $Process.HasExited) -and -not $CandidateProcess) {
+            $CandidateProcess = Get-BackgroundServerCandidate -BaselineProcessIds $BaselineProcessIds -ExpectedLaunchPid $ExpectedLaunchPid -TargetModelPath $TargetModelPath
+            if (-not $CandidateProcess) {
+                try {
+                    $ServerReady = Test-ServerReady -ServerBaseUrl $ServerBaseUrl
+                }
+                catch {
+                    $ServerReady = $false
+                }
+            }
+
+            if ($CandidateProcess -or $ServerReady) {
+                $ProgressInfo = Get-BackgroundStartupProgressInfo -LogPath $StdErrLog -ServerReady:$ServerReady
+                Write-BackgroundStartupProgress -ProgressInfo $ProgressInfo -Tick $Tick -Ready:$ServerReady -Complete:([bool]$ServerReady)
+                return [pscustomobject]@{
+                    State     = if ($ServerReady) { "Ready" } else { "Loading" }
+                    ProcessId = if ($CandidateProcess) { [int]$CandidateProcess.ProcessId } elseif ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }
+                }
+            }
+
             Write-BackgroundStartupProgress -ProgressInfo $ProgressInfo -Tick $Tick -Complete
 
             $FailureLog = Get-LogTailText -Path $StdErrLog
@@ -6852,6 +6897,21 @@ function Wait-ForBackgroundServerStartup {
                 $ObservedExitCodeLabel = [string]$Process.ExitCode
             }
             catch {
+            }
+
+            $CandidateProcess = Get-BackgroundServerCandidate -BaselineProcessIds $BaselineProcessIds -ExpectedLaunchPid $ExpectedLaunchPid -TargetModelPath $TargetModelPath
+            if ($CandidateProcess) {
+                return [pscustomobject]@{
+                    State     = "Loading"
+                    ProcessId = [int]$CandidateProcess.ProcessId
+                }
+            }
+
+            if (Test-ServerReady -ServerBaseUrl $ServerBaseUrl) {
+                return [pscustomobject]@{
+                    State     = "Ready"
+                    ProcessId = if ($ExpectedLaunchPid) { $ExpectedLaunchPid.Value } else { $null }
+                }
             }
         }
 
@@ -7359,7 +7419,7 @@ try {
 
             try {
                 if ($WrapperControlsPause) {
-                    Write-Host "Waiting for the server to finish loading..." -ForegroundColor Cyan
+                    Write-Host "Waiting for server readiness confirmation..." -ForegroundColor Cyan
                     $StartupResult = Wait-ForBackgroundServerReadyWithProgress -Process $BackgroundProcess -ServerBaseUrl $BaseUrl -BaselineProcessIds $BaselineWorkspaceServerIds -TargetModelPath $ModelPath
                 }
                 else {
@@ -7396,7 +7456,7 @@ try {
 
         if ($AutoLaunchTuning.AutoTuneEnabled -and $StartupState -ne "Ready") {
             $RemainingReadyWaitSec = [Math]::Max(1, $ReadyTimeoutSec - $StartupCheckSec)
-            Write-Host "AutoTune: waiting for the server to finish loading before evaluating the learned profile..." -ForegroundColor Cyan
+            Write-Host "AutoTune: waiting for server readiness before evaluating the learned profile..." -ForegroundColor Cyan
             if (Wait-ForServerReady -ServerBaseUrl $BaseUrl -TimeoutSec $RemainingReadyWaitSec) {
                 $StartupState = "Ready"
             }
@@ -7430,7 +7490,14 @@ try {
 
         Write-Host "Background server started." -ForegroundColor Green
         Write-Host "PID    : $(if ($TrackedBackgroundPid) { $TrackedBackgroundPid } else { $BackgroundProcess.Id })"
-        Write-Host "State  : $(if ($StartupState -eq 'Ready') { 'ready' } else { "loading (process alive after $StartupCheckSec seconds)" })"
+        if ($StartupState -eq "Ready") {
+            Write-Host "State  : ready"
+        }
+        else {
+            Write-Host "State  : loading" -ForegroundColor Yellow
+            Write-Host "Note   : llama.cpp is still starting after $StartupCheckSec seconds. No startup failure has been detected." -ForegroundColor Yellow
+            Write-Host "Check  : use -Status, watch $StdErrLog, or open $BaseUrl$OpenPath once the server finishes loading." -ForegroundColor Yellow
+        }
         Write-Host "URL    : $BaseUrl"
         Write-Host "Logs   : $StdOutLog"
         Write-Host "Error  : $StdErrLog"
@@ -7453,12 +7520,17 @@ try {
                 Start-Process "$BaseUrl$OpenPath"
             }
             else {
-                Write-Host "Browser: the Web UI will open automatically when the server is ready." -ForegroundColor Cyan
+                Write-Host "Browser: the Web UI will open automatically after the server becomes ready." -ForegroundColor Cyan
                 Start-BrowserWhenReadyDetached
             }
         }
         if ($WrapperControlsPause) {
-            Write-Host "Server is ready. Closing the launcher window..." -ForegroundColor Cyan
+            if ($StartupState -eq "Ready") {
+                Write-Host "Server is ready. Closing the launcher window..." -ForegroundColor Cyan
+            }
+            else {
+                Write-Host "Server is still loading in the background. Closing the launcher window..." -ForegroundColor Cyan
+            }
         }
         else {
             Write-Host "You can close this PowerShell window." -ForegroundColor Cyan
