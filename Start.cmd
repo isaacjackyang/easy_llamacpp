@@ -1,6 +1,8 @@
 @echo off
 setlocal EnableExtensions
 
+chcp 65001 >nul 2>nul
+
 set "SCRIPT_DIR=%~dp0"
 set "LAUNCHER_PS1=%SCRIPT_DIR%PS1\Start_LCPP.ps1"
 set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"

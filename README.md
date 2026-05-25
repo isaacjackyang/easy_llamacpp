@@ -143,6 +143,9 @@ You can also use `Start.cmd` for the same launcher flow, which is more convenien
 .\Start.cmd
 ```
 
+`Start.cmd` 現在也會先切到 UTF-8 code page，互動式啟動器的常用畫面，以及像 `-Status`、背景啟動摘要、停止服務這類非互動式狀態訊息，都會用中英雙語一起顯示，降低 Windows 主控台中文亂碼的風險。  
+`Start.cmd` now switches the console to a UTF-8 code page first, and both the common interactive launcher screens plus non-interactive status output such as `-Status`, background startup summaries, and stop-server messages display bilingual Chinese and English text together to reduce the risk of mojibake on Windows consoles.
+
 若只想關閉 `llama.cpp`，可用：  
 If you only want to stop `llama.cpp`, use:
 
@@ -178,12 +181,12 @@ If you only want to install the Windows autostart scheduled task by itself, use:
 The first screen provides these main entry points:
 
 - `Quick Start`
-  先選模型，再選 `Background Service` 或 `Open Web UI`。  
-  Pick a model, then choose `Background Service` or `Open Web UI`.
+  先選模型，再選 `Background Service` 或 `Open Web UI`。如果同一個模型已經有自訂儲存設定檔，這裡也會先列出來，讓你直接套用。  
+  Pick a model, then choose `Background Service` or `Open Web UI`. If that model already has saved custom profiles, Quick Start shows them first so you can launch with one directly.
 
 - `Tune And Launch`
-  先選模型，再進入可用鍵盤操作的參數矩陣畫面。用方向鍵移動，按 `Enter` 或 `Space` 編輯目前格子。矩陣裡包含 `GPU Layers`、`Repeating Layers`，也新增了 `Auto Tune` 開關。開啟後，腳本會在這次啟動真的完整塞進 GPU 且 VRAM 使用率接近目標時，把學到的參數寫進 `model-tuning.json`。  
-  Pick a model, then open a keyboard-driven parameter matrix. Use arrow keys to move and press `Enter` or `Space` to edit the current cell. The matrix includes `GPU Layers`, `Repeating Layers`, and an `Auto Tune` toggle. When enabled, the script saves learned parameters to `model-tuning.json` after a launch that fully fits on GPU and lands near the target VRAM usage.
+  先選模型，再進入可用鍵盤操作的參數矩陣畫面。用方向鍵移動，按 `Enter` 或 `Space` 編輯目前格子。矩陣裡包含 `GPU Layers`、`Repeating Layers`、`Reasoning`、`Think Level`、`MTP`、`SPEC_DRAFT_N_MAX`、`Auto Tune`，以及新的 `Apply Auto Tune Learned Values` 和 `Save Profile` 動作。當你用方向鍵移動高亮欄位時，畫面下方會同步顯示該選項的功能與建議數值，方便直接在選單裡判斷要不要改。`Auto Tune` 開啟後，腳本會在這次啟動真的完整塞進 GPU 且 VRAM 使用率接近目標時，把學到的參數寫進 `model-tuning.json`；`Apply Auto Tune Learned Values` 可以把匹配到的 learned profile 直接轉成這一頁的明確設定；而 `Save Profile` 會把你目前這一頁的手動設定存進 `launch-profiles.json`，供之後在 Quick Start 直接套用。  
+  Pick a model, then open a keyboard-driven parameter matrix. Use arrow keys to move and press `Enter` or `Space` to edit the current cell. The matrix now includes fields such as `GPU Layers`, `Repeating Layers`, `Reasoning`, `Think Level`, `MTP`, `SPEC_DRAFT_N_MAX`, `Auto Tune`, plus the new `Apply Auto Tune Learned Values` and `Save Profile` actions. As you move the highlight with the arrow keys, the bottom panel updates with a plain-language explanation and a recommended starting value for the selected field. When `Auto Tune` is enabled, the script saves learned parameters to `model-tuning.json` after a launch that fully fits on GPU and lands near the target VRAM usage; `Apply Auto Tune Learned Values` can materialize a matching learned profile into explicit values on the current page; `Save Profile` stores the current manual page settings in `launch-profiles.json` so Quick Start can reuse them later.
 
 - `Server Status` / `Stop Running Server` / `llama-server Help`
   常用維護動作也保留在主選單。  
@@ -702,6 +705,9 @@ Rollback steps:
 - `json/model-tuning.json`：`-AutoTune` 學到的 per-model 調校資料。  
   `json/model-tuning.json`: Per-model tuning data learned by `-AutoTune`.
 
+- `json/launch-profiles.json`：你在 `Tune And Launch` 裡用 `Save Profile` 手動存下來的自訂啟動設定檔。  
+  `json/launch-profiles.json`: Custom launch profiles you save manually from `Tune And Launch` with `Save Profile`.
+
 - `json/model-switch-times.json`：模型切換時間紀錄。  
   `json/model-switch-times.json`: Model switch timing history.
 
@@ -1125,6 +1131,47 @@ This preset currently pins:
 
 同樣的 `Q6_K_P` 在這台雙 `RTX 5070 Ti 16 GB` 上，`131072` 和 `163840` 都會在 GPU1 OOM，所以目前穩定值先停在 `98304`。  
 On this dual `RTX 5070 Ti 16 GB` machine, the same `Q6_K_P` build runs out of memory on GPU1 at both `131072` and `163840`, so the stable value is currently kept at `98304`.
+
+#### Qwen3.6 MTP 啟動 / Qwen3.6 MTP Startup
+
+現在 `Start_LCPP.ps1` 會自動辨識檔名、`id` 或 `path` 含有 `Qwen3.6` 與 `MTP` 的模型，並套用一組對齊 Unsloth `Qwen3.6 llama.cpp MTP` 教學的預設參數。  
+`Start_LCPP.ps1` now auto-detects models whose filename, `id`, or `path` contains both `Qwen3.6` and `MTP`, then applies a default parameter set aligned with the Unsloth `Qwen3.6 llama.cpp MTP` guide.
+
+如果你是走 `Tune And Launch`，現在也可以直接在矩陣裡切換 `MTP` 開或關，並設定 `SPEC_DRAFT_N_MAX`。預設值是 `2`。  
+If you launch through `Tune And Launch`, you can now toggle `MTP` directly inside the matrix and set `SPEC_DRAFT_N_MAX` there as well. The default value is `2`.
+
+同一個矩陣現在也加入了 `Reasoning` 與 `Think Level`。`Reasoning` 會對應 `llama.cpp` 的 `--reasoning auto|on|off`；`Think Level` 會對應 `--reasoning-budget`，目前內建的級別是 `Low (1024)`、`Medium (4096)`、`High (8192)`、`Max (-1)`。  
+The same matrix now also includes `Reasoning` and `Think Level`. `Reasoning` maps to `llama.cpp` `--reasoning auto|on|off`; `Think Level` maps to `--reasoning-budget`, with built-in levels `Low (1024)`, `Medium (4096)`, `High (8192)`, and `Max (-1)`.
+
+自動補上的重點是：  
+The launcher now auto-adds:
+
+- `--spec-type draft-mtp`
+- `--spec-draft-n-max 2`
+- `--flash-attn on`
+- `--cache-type-k q8_0`
+- `--cache-type-v q8_0`
+- `--jinja`
+- `--temp 0.6`
+- `--top-p 0.95`
+- `--top-k 20`
+- `--min-p 0.0`
+- `--presence-penalty 0`
+- `--repeat-penalty 1`
+
+這些預設只會套用在真正的 `MTP` GGUF 上；一般 `Qwen3.6` GGUF 不會被強行加上 `MTP` 參數，避免啟動失敗。你也仍然可以在命令列後面自己覆寫這些值。  
+These defaults only apply to real `MTP` GGUFs. Regular `Qwen3.6` GGUFs are left alone so the launcher does not force incompatible `MTP` flags. You can still override any of these values through trailing command-line arguments.
+
+這台機器另外補了兩個可直接雙擊的雙 GPU MTP preset：  
+This machine now also includes two double-click dual-GPU MTP presets:
+
+```powershell
+.\start_qwen27b_mtp_q5xl_dual.cmd
+.\start_qwen27b_mtp_q8_dual.cmd
+```
+
+目前這兩個 preset 預設走純文字 MTP 路徑，不主動掛 `mmproj`。如果你之後要測圖片輸入，再額外補 `-VisionMmprojPath` 或在互動式選單裡手動指定。  
+These presets currently use a text-first MTP path and do not attach `mmproj` by default. If you want to test image input later, add `-VisionMmprojPath` explicitly or choose an `mmproj` manually from the interactive launcher.
 
 #### 範本 3：兩張卡顯存不同時 / Template 3: When The GPUs Have Different VRAM Sizes
 
