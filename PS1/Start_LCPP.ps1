@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Launches llama.cpp through an interactive menu or direct control switches.
 
@@ -195,6 +195,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+try {
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [Console]::InputEncoding = $Utf8NoBom
+    [Console]::OutputEncoding = $Utf8NoBom
+    $OutputEncoding = $Utf8NoBom
+}
+catch {
+}
+
 $LauncherScriptHome = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $ScriptRoot = if ([string]::Equals([System.IO.Path]::GetFileName($LauncherScriptHome), "PS1", [System.StringComparison]::OrdinalIgnoreCase)) {
     Split-Path -Parent $LauncherScriptHome
@@ -227,6 +236,7 @@ $LegacyStdOutLog = Join-Path $ScriptRoot "llama-server.stdout.log"
 $LegacyStdErrLog = Join-Path $ScriptRoot "llama-server.stderr.log"
 $LegacyModelIndexFile = Join-Path $ScriptRoot "model-index.json"
 $LegacyTuningProfileFile = Join-Path $ScriptRoot "model-tuning.json"
+$LegacySavedLaunchProfileFile = Join-Path $ScriptRoot "launch-profiles.json"
 $LegacyModelSwitchTimingFile = Join-Path $ScriptRoot "model-switch-times.json"
 $PidFile = Join-Path $LogRoot "llama-server.pid"
 $StdOutLog = Join-Path $LogRoot "llama-server.stdout.log"
@@ -237,6 +247,7 @@ $SupervisorPidFile = Join-Path $LogRoot "llama-supervisor.pid"
 $WatchdogPidFile = Join-Path $LogRoot "llama-watchdog.pid"
 $WatchdogLog = Join-Path $LogRoot "llama-watchdog.log"
 $TuningProfileFile = Join-Path $JsonRoot "model-tuning.json"
+$SavedLaunchProfileFile = Join-Path $JsonRoot "launch-profiles.json"
 $ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
 $SupervisorScriptPath = Join-Path $Ps1Root "llama_supervisor.ps1"
 $WatchdogScriptPath = Join-Path $Ps1Root "llama_watchdog.ps1"
@@ -704,7 +715,7 @@ function Invoke-WorkspaceRuntimeGuard {
     }
 
     if ((-not $Quiet) -and $StoppedIds.Count -gt 0) {
-        Write-Host "Guard  : cleared illegal runtime process(es): $($StoppedIds -join ', ')" -ForegroundColor Yellow
+        Write-BilingualField -ChineseLabel "守護檢查" -EnglishLabel "Guard" -ChineseValue ("已清除非法執行中的程序：{0}" -f ($StoppedIds -join ', ')) -EnglishValue ("cleared illegal runtime process(es): {0}" -f ($StoppedIds -join ', ')) -ForegroundColor Yellow
     }
 
     return [pscustomobject]@{
@@ -717,6 +728,7 @@ function Invoke-WorkspaceRuntimeGuard {
 foreach ($Migration in @(
         [pscustomobject]@{ Legacy = $LegacyModelIndexFile; Preferred = (Join-Path $JsonRoot "model-index.json") },
         [pscustomobject]@{ Legacy = $LegacyTuningProfileFile; Preferred = $TuningProfileFile },
+        [pscustomobject]@{ Legacy = $LegacySavedLaunchProfileFile; Preferred = $SavedLaunchProfileFile },
         [pscustomobject]@{ Legacy = $LegacyModelSwitchTimingFile; Preferred = $ModelSwitchTimingFile }
     )) {
     if ((Test-Path -LiteralPath $Migration.Legacy) -and -not (Test-Path -LiteralPath $Migration.Preferred)) {
@@ -774,6 +786,16 @@ function Get-ServerArgs {
     foreach ($Argument in $LlamaArgs) {
         $CombinedArgs += $Argument
     }
+
+    if (Test-Qwen36MtpDefaultsEnabled -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath -Arguments $CombinedArgs) {
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value "2"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-fa|--flash-attn)(?:=|$)') -Flag "--flash-attn" -Value "on"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctv|--cache-type-v)(?:=|$)') -Flag "--cache-type-v" -Value "q8_0"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
+    }
+
     if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
         $Arguments.Add("--ctx-size")
         $Arguments.Add([string]$script:ManagedDefaultContextSize)
@@ -1680,6 +1702,74 @@ function Sync-LaunchConfigGpuFields {
     $Config.RepeatingLayers = Convert-GpuLayersToRepeatingLayers -GpuLayers ([string]$Config.GpuLayers) -RepeatingLayerCount $RepeatingLayerCount
 }
 
+function Sync-LaunchConfigMtpFields {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $IsQwen36MtpModel = Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    if ($null -eq $Config.MtpEnabled) {
+        $Config.MtpEnabled = $IsQwen36MtpModel
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) {
+        $Config.SpecDraftNMax = "2"
+    }
+}
+
+function Get-ThinkLevelChoices {
+    return @(
+        "Auto"
+        "Low (1024)"
+        "Medium (4096)"
+        "High (8192)"
+        "Max (-1)"
+    )
+}
+
+function Convert-ReasoningBudgetToThinkLevel {
+    param(
+        [string]$ReasoningBudget
+    )
+
+    switch (([string]$ReasoningBudget).Trim()) {
+        "" { return "Auto" }
+        "1024" { return "Low (1024)" }
+        "4096" { return "Medium (4096)" }
+        "8192" { return "High (8192)" }
+        "-1" { return "Max (-1)" }
+        default { return "Auto" }
+    }
+}
+
+function Convert-ThinkLevelToReasoningBudget {
+    param(
+        [string]$ThinkLevel
+    )
+
+    switch (([string]$ThinkLevel).Trim()) {
+        "Low (1024)" { return "1024" }
+        "Medium (4096)" { return "4096" }
+        "High (8192)" { return "8192" }
+        "Max (-1)" { return "-1" }
+        default { return "" }
+    }
+}
+
+function Sync-LaunchConfigReasoningFields {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ReasoningMode)) {
+        $Config.ReasoningMode = "auto"
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
+        $Config.ThinkLevel = "Auto"
+    }
+}
+
 function Get-GpuOffloadInfo {
     param(
         [System.Diagnostics.Process]$Process = $null
@@ -1975,7 +2065,7 @@ function Save-AutoTuneProfile {
 
     return [pscustomobject]@{
         Saved   = $true
-        Message = "Saved auto-tune profile at {0:N1}% GPU usage." -f [double]$ObservedUsage.AggregateUsagePercent
+        Message = Format-BilingualText -ChineseText ("已在 GPU 使用率 {0:N1}% 時儲存自動調校設定檔。" -f [double]$ObservedUsage.AggregateUsagePercent) -EnglishText ("Saved auto-tune profile at {0:N1}% GPU usage." -f [double]$ObservedUsage.AggregateUsagePercent)
         Profile = [pscustomobject]$Profile
     }
 }
@@ -1983,30 +2073,30 @@ function Save-AutoTuneProfile {
 function Show-GpuOffload {
     $OffloadInfo = Get-GpuOffloadInfo
 
-    Write-Host ("Status : {0}" -f $(if ($OffloadInfo.Running) { "running" } else { "stopped" })) -ForegroundColor $(if ($OffloadInfo.Running) { "Green" } else { "Yellow" })
+    Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "Status" -ChineseValue $(if ($OffloadInfo.Running) { "運行中" } else { "已停止" }) -EnglishValue $(if ($OffloadInfo.Running) { "running" } else { "stopped" }) -ForegroundColor $(if ($OffloadInfo.Running) { "Green" } else { "Yellow" })
     if ($OffloadInfo.ModelPath) {
-        Write-Host "Model  : $($OffloadInfo.ModelPath)"
+        Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue $OffloadInfo.ModelPath -EnglishValue $OffloadInfo.ModelPath
     }
     if ($OffloadInfo.RequestedGpuLayers) {
-        Write-Host "Asked  : $($OffloadInfo.RequestedGpuLayers)"
+        Write-BilingualField -ChineseLabel "要求 GPU 層數" -EnglishLabel "Requested GPU Layers" -ChineseValue ([string]$OffloadInfo.RequestedGpuLayers) -EnglishValue ([string]$OffloadInfo.RequestedGpuLayers)
     }
 
     if ($null -ne $OffloadInfo.RepeatingLayers -or $null -ne $OffloadInfo.OffloadedLayers) {
         if ($null -ne $OffloadInfo.RepeatingLayers) {
-            Write-Host "Repeat : $($OffloadInfo.RepeatingLayers)"
+            Write-BilingualField -ChineseLabel "重複層" -EnglishLabel "Repeating Layers" -ChineseValue ([string]$OffloadInfo.RepeatingLayers) -EnglishValue ([string]$OffloadInfo.RepeatingLayers)
         }
         if ($null -ne $OffloadInfo.OffloadedLayers -and $null -ne $OffloadInfo.TotalLayers) {
-            Write-Host "Total  : $($OffloadInfo.OffloadedLayers)/$($OffloadInfo.TotalLayers) layers to GPU"
+            Write-BilingualField -ChineseLabel "總計" -EnglishLabel "Total" -ChineseValue ("{0}/{1} 層已卸載到 GPU" -f $OffloadInfo.OffloadedLayers, $OffloadInfo.TotalLayers) -EnglishValue ("{0}/{1} layers offloaded to GPU" -f $OffloadInfo.OffloadedLayers, $OffloadInfo.TotalLayers)
         }
         if ($null -ne $OffloadInfo.GpuModelBufferMiB) {
-            Write-Host ("Buffer : {0:N2} MiB" -f $OffloadInfo.GpuModelBufferMiB)
+            Write-BilingualField -ChineseLabel "緩衝區" -EnglishLabel "Buffer" -ChineseValue ("{0:N2} MiB" -f $OffloadInfo.GpuModelBufferMiB) -EnglishValue ("{0:N2} MiB" -f $OffloadInfo.GpuModelBufferMiB)
         }
     }
     else {
-        Write-Host "GPU offload information is not available yet." -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "GPU 卸載資訊尚未可用。" -EnglishText "GPU offload information is not available yet.") -ForegroundColor Yellow
     }
 
-    Write-Host "Log    : $($OffloadInfo.LogPath)"
+    Write-BilingualField -ChineseLabel "記錄檔" -EnglishLabel "Log" -ChineseValue $OffloadInfo.LogPath -EnglishValue $OffloadInfo.LogPath
 }
 
 function ConvertTo-BoolFlag {
@@ -3216,6 +3306,7 @@ function Initialize-JsonWorkspaceFiles {
     )
 
     Ensure-TuningProfileFile -Path $TuningProfileFile
+    Ensure-SavedLaunchProfileFile -Path $SavedLaunchProfileFile
     Ensure-ModelSwitchTimingFile -Path $ModelSwitchTimingFile
     Ensure-ModelIndexFile -Path $IndexPath
 }
@@ -3325,6 +3416,124 @@ function Test-LlamaArgumentProvided {
     return $false
 }
 
+function Get-LlamaArgumentValue {
+    param(
+        [AllowNull()][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string[]]$Patterns
+    )
+
+    if (-not $Arguments) {
+        return ""
+    }
+
+    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
+        $Argument = [string]$Arguments[$Index]
+        foreach ($Pattern in $Patterns) {
+            $Match = [regex]::Match($Argument, $Pattern)
+            if (-not $Match.Success) {
+                continue
+            }
+
+            if ($Match.Groups.Count -gt 1 -and $Match.Groups[1].Success) {
+                return [string]$Match.Groups[1].Value
+            }
+
+            if (($Index + 1) -lt $Arguments.Count) {
+                return [string]$Arguments[$Index + 1]
+            }
+
+            return ""
+        }
+    }
+
+    return ""
+}
+
+function Add-DefaultLlamaArgument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]]$TargetArguments,
+        [AllowNull()][string[]]$UserArguments,
+        [Parameter(Mandatory = $true)][string[]]$Patterns,
+        [Parameter(Mandatory = $true)][string]$Flag,
+        [AllowNull()][string]$Value = $null
+    )
+
+    $ExistingArguments = @()
+    foreach ($Argument in @($UserArguments)) {
+        $ExistingArguments += [string]$Argument
+    }
+    foreach ($Argument in @($TargetArguments)) {
+        $ExistingArguments += [string]$Argument
+    }
+
+    if (Test-LlamaArgumentProvided -Arguments $ExistingArguments -Patterns $Patterns) {
+        return
+    }
+
+    $TargetArguments.Add($Flag)
+    if ($null -ne $Value) {
+        $TargetArguments.Add($Value)
+    }
+}
+
+function Test-IsQwen36MtpModel {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    $CandidateParts = New-Object System.Collections.Generic.List[string]
+
+    if ($ModelEntry) {
+        foreach ($PropertyName in @("id", "name", "path")) {
+            if ($ModelEntry.PSObject.Properties[$PropertyName] -and -not [string]::IsNullOrWhiteSpace([string]$ModelEntry.$PropertyName)) {
+                $CandidateParts.Add([string]$ModelEntry.$PropertyName)
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        $CandidateParts.Add($ResolvedModelPath)
+    }
+
+    if ($CandidateParts.Count -eq 0) {
+        return $false
+    }
+
+    $CombinedText = ($CandidateParts.ToArray() -join "`n")
+    return ($CombinedText -match '(?i)qwen3(?:[._]|)6' -and $CombinedText -match '(?i)(?:^|[^a-z0-9])mtp(?:[^a-z0-9]|$)')
+}
+
+function Test-Qwen36MtpDefaultsEnabled {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath,
+        [AllowNull()][string[]]$Arguments
+    )
+
+    if (-not (Test-IsQwen36MtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)) {
+        return $false
+    }
+
+    $ExplicitSpecType = (Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^--spec-type(?:=(.+))?$')).Trim()
+    if ([string]::IsNullOrWhiteSpace($ExplicitSpecType)) {
+        return $true
+    }
+
+    $SpecTypes = @(
+        $ExplicitSpecType -split ',' |
+            ForEach-Object { $_.Trim().ToLowerInvariant() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($SpecTypes.Count -eq 0) {
+        return $true
+    }
+
+    return ($SpecTypes -contains "draft-mtp")
+}
+
 function ConvertTo-LlamaScalarArgumentValue {
     param($Value)
 
@@ -3350,7 +3559,9 @@ function Get-ModelGenerationArgs {
         [AllowNull()][string[]]$UserArguments
     )
 
-    $DefaultTemperature = "0.35"
+    $ResolvedModelPath = if ($ModelEntry -and $ModelEntry.PSObject.Properties["path"]) { [string]$ModelEntry.path } else { $null }
+    $UseQwen36MtpDefaults = Test-Qwen36MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $UserArguments
+    $DefaultTemperature = if ($UseQwen36MtpDefaults) { "0.6" } else { "0.35" }
     $Generation = $null
     if ($ModelEntry -and $ModelEntry.PSObject.Properties["generation"] -and $null -ne $ModelEntry.generation) {
         $Generation = $ModelEntry.generation
@@ -3378,6 +3589,9 @@ function Get-ModelGenerationArgs {
     elseif ($Generation -and $Generation.PSObject.Properties["presencePenalty"]) {
         $PresencePenaltyValue = $Generation.presencePenalty
     }
+    elseif ($UseQwen36MtpDefaults) {
+        $PresencePenaltyValue = 0
+    }
 
     if ($null -ne $PresencePenaltyValue -and -not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--presence-penalty(?:=|$)'))) {
         $Value = ConvertTo-LlamaScalarArgumentValue -Value $PresencePenaltyValue
@@ -3385,6 +3599,13 @@ function Get-ModelGenerationArgs {
             $Arguments.Add("--presence-penalty")
             $Arguments.Add($Value)
         }
+    }
+
+    if ($UseQwen36MtpDefaults) {
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--top-p(?:=|$)') -Flag "--top-p" -Value "0.95"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--top-k(?:=|$)') -Flag "--top-k" -Value "20"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--min-p(?:=|$)') -Flag "--min-p" -Value "0.0"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--repeat-penalty(?:=|$)') -Flag "--repeat-penalty" -Value "1"
     }
 
     return @($Arguments)
@@ -3484,21 +3705,62 @@ function Split-ArgumentLine {
     return @($Tokens)
 }
 
+function Remove-LlamaArgumentsByPatterns {
+    param(
+        [string[]]$Arguments,
+        [string[]]$Patterns
+    )
+
+    if (-not $Arguments) {
+        return @()
+    }
+
+    $FilteredArguments = New-Object System.Collections.Generic.List[string]
+    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
+        $Argument = [string]$Arguments[$Index]
+        $ShouldRemove = $false
+        foreach ($Pattern in $Patterns) {
+            if ($Argument -match $Pattern) {
+                $ShouldRemove = $true
+                break
+            }
+        }
+
+        if ($ShouldRemove) {
+            if ($Argument -notmatch '=' -and ($Index + 1) -lt $Arguments.Count) {
+                $NextToken = [string]$Arguments[$Index + 1]
+                if ($NextToken -notmatch '^-') {
+                    $Index++
+                }
+            }
+            continue
+        }
+
+        $FilteredArguments.Add($Argument)
+    }
+
+    return $FilteredArguments.ToArray()
+}
+
 function Convert-ForwardArgsToMenuConfig {
     param(
         [string[]]$Arguments
     )
 
     $Config = [ordered]@{
-        ContextSize = ""
-        Host        = "127.0.0.1"
-        Metrics     = $false
-        ApiKey      = ""
-        Device      = ""
-        SplitMode   = ""
-        TensorSplit = ""
-        Fit         = ""
-        ExtraArgs   = ""
+        ContextSize     = ""
+        Host            = "127.0.0.1"
+        Metrics         = $false
+        ApiKey          = ""
+        Device          = ""
+        SplitMode       = ""
+        TensorSplit     = ""
+        Fit             = ""
+        ReasoningMode   = "auto"
+        ThinkLevel      = "Auto"
+        MtpEnabled      = $null
+        SpecDraftNMax   = "2"
+        ExtraArgs       = ""
     }
 
     if (-not $Arguments) {
@@ -3534,6 +3796,30 @@ function Convert-ForwardArgsToMenuConfig {
             }
             '^--fit(?:=(.+))?$' {
                 $Config.Fit = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:-rea|--reasoning)(?:=(.+))?$' {
+                $Config.ReasoningMode = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^--reasoning-budget(?:=(.+))?$' {
+                $ReasoningBudget = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+                $Config.ThinkLevel = Convert-ReasoningBudgetToThinkLevel -ReasoningBudget $ReasoningBudget
+            }
+            '^--spec-type(?:=(.+))?$' {
+                $SpecTypeValue = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+                $SpecTypes = @(
+                    [string]$SpecTypeValue -split ',' |
+                        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                )
+                if ($SpecTypes -contains "draft-mtp") {
+                    $Config.MtpEnabled = $true
+                }
+                elseif ($SpecTypes.Count -gt 0) {
+                    $Config.MtpEnabled = $false
+                }
+            }
+            '^--spec-draft-n-max(?:=(.+))?$' {
+                $Config.SpecDraftNMax = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
             default {
                 $Remaining.Add($Argument)
@@ -3589,6 +3875,29 @@ function Convert-MenuConfigToForwardArgs {
     if ($Config.Fit) {
         $Arguments.Add("--fit")
         $Arguments.Add([string]$Config.Fit)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ReasoningMode) -and [string]$Config.ReasoningMode -ne "auto") {
+        $Arguments.Add("--reasoning")
+        $Arguments.Add([string]$Config.ReasoningMode)
+    }
+
+    $ReasoningBudget = Convert-ThinkLevelToReasoningBudget -ThinkLevel ([string]$Config.ThinkLevel)
+    if (-not [string]::IsNullOrWhiteSpace($ReasoningBudget) -and [string]$Config.ReasoningMode -ne "off") {
+        $Arguments.Add("--reasoning-budget")
+        $Arguments.Add($ReasoningBudget)
+    }
+
+    $ModelUsesQwen36MtpDefaults = Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    if ([bool]$Config.MtpEnabled) {
+        $Arguments.Add("--spec-type")
+        $Arguments.Add("draft-mtp")
+        $Arguments.Add("--spec-draft-n-max")
+        $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { "2" } else { [string]$Config.SpecDraftNMax }))
+    }
+    elseif ($ModelUsesQwen36MtpDefaults) {
+        $Arguments.Add("--spec-type")
+        $Arguments.Add("none")
     }
 
     foreach ($ExtraArgument in (Split-ArgumentLine -Line $Config.ExtraArgs)) {
@@ -3661,6 +3970,415 @@ function Save-TuningProfileData {
     }
 
     $Payload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Ensure-SavedLaunchProfileFile {
+    param(
+        [string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        return
+    }
+
+    $Bootstrap = [ordered]@{
+        version  = 1
+        profiles = @()
+    }
+
+    $Bootstrap | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Get-SavedLaunchProfileData {
+    param(
+        [string]$Path
+    )
+
+    Ensure-SavedLaunchProfileFile -Path $Path
+    $Json = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        return [pscustomobject]@{
+            version  = 1
+            profiles = @()
+        }
+    }
+
+    $Data = $Json | ConvertFrom-Json
+    if (-not $Data.profiles) {
+        $Data | Add-Member -NotePropertyName profiles -NotePropertyValue @() -Force
+    }
+
+    return $Data
+}
+
+function Save-SavedLaunchProfileData {
+    param(
+        [string]$Path,
+        [object[]]$Profiles
+    )
+
+    $Payload = [ordered]@{
+        version  = 1
+        profiles = @($Profiles)
+    }
+
+    $Payload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Get-SavedLaunchProfilePersistedKeys {
+    return @(
+        "VisionModelName"
+        "VisionModelPath"
+        "VisionMmprojPath"
+        "VisionSelectionMode"
+        "LaunchMode"
+        "Port"
+        "GpuLayers"
+        "ExtremeMode"
+        "AutoTune"
+        "Threads"
+        "ThreadsBatch"
+        "ReadyTimeoutSec"
+        "OpenPath"
+        "ContextSize"
+        "Host"
+        "Metrics"
+        "ApiKey"
+        "Device"
+        "SplitMode"
+        "TensorSplit"
+        "Fit"
+        "ReasoningMode"
+        "ThinkLevel"
+        "MtpEnabled"
+        "SpecDraftNMax"
+        "ExtraArgs"
+    )
+}
+
+function Get-SavedLaunchProfileConfigSnapshot {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $Snapshot = [ordered]@{}
+    foreach ($Key in @(Get-SavedLaunchProfilePersistedKeys)) {
+        $Snapshot[$Key] = $Config[$Key]
+    }
+
+    return $Snapshot
+}
+
+function Save-SavedLaunchProfile {
+    param(
+        [System.Collections.IDictionary]$Config,
+        [string]$ProfileName
+    )
+
+    $TrimmedName = [string]$ProfileName
+    if ($null -eq $TrimmedName) {
+        $TrimmedName = ""
+    }
+    $TrimmedName = $TrimmedName.Trim()
+    if ([string]::IsNullOrWhiteSpace($TrimmedName)) {
+        throw (Format-BilingualText -ChineseText "設定檔名稱不能留空。" -EnglishText "Profile name cannot be blank.")
+    }
+
+    $ResolvedModelPath = Resolve-ModelPath -Path ([string]$Config.ModelPath)
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        throw (Format-BilingualText -ChineseText "目前設定缺少有效的模型路徑，無法儲存設定檔。" -EnglishText "The current config has no valid model path, so the profile cannot be saved.")
+    }
+
+    $Data = Get-SavedLaunchProfileData -Path $SavedLaunchProfileFile
+    $ExistingProfile = @(
+        $Data.profiles |
+            Where-Object {
+                [string]::Equals((Resolve-ModelPath -Path ([string]$_.model_path)), $ResolvedModelPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+                [string]::Equals(([string]$_.name).Trim(), $TrimmedName, [System.StringComparison]::OrdinalIgnoreCase)
+            } |
+            Select-Object -First 1
+    )
+
+    $Now = (Get-Date).ToString("o")
+    $Snapshot = Get-SavedLaunchProfileConfigSnapshot -Config $Config
+    $Entry = [ordered]@{
+        id         = if ($ExistingProfile) { [string]$ExistingProfile[0].id } else { [guid]::NewGuid().ToString() }
+        name       = $TrimmedName
+        model_name = [string]$Config.ModelName
+        model_path = $ResolvedModelPath
+        created_at = if ($ExistingProfile) { [string]$ExistingProfile[0].created_at } else { $Now }
+        updated_at = $Now
+        config     = $Snapshot
+    }
+
+    $UpdatedProfiles = @(
+        $Data.profiles |
+            Where-Object { [string]$_.id -ne [string]$Entry.id }
+    )
+    $UpdatedProfiles += [pscustomobject]$Entry
+    Save-SavedLaunchProfileData -Path $SavedLaunchProfileFile -Profiles $UpdatedProfiles
+
+    return [pscustomobject]@{
+        Saved       = $true
+        Overwritten = [bool]$ExistingProfile
+        Name        = $TrimmedName
+        Path        = $SavedLaunchProfileFile
+    }
+}
+
+function Get-SavedLaunchProfilesForModel {
+    param(
+        [string]$ModelPath
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $ModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        return @()
+    }
+
+    $Data = Get-SavedLaunchProfileData -Path $SavedLaunchProfileFile
+    return @(
+        $Data.profiles |
+            Where-Object {
+                [string]::Equals((Resolve-ModelPath -Path ([string]$_.model_path)), $ResolvedModelPath, [System.StringComparison]::OrdinalIgnoreCase)
+            } |
+            Sort-Object @{ Expression = { [datetime]::Parse(([string]$_.updated_at)) }; Descending = $true }, @{ Expression = { [string]$_.name }; Descending = $false }
+    )
+}
+
+function Apply-SavedLaunchProfileToConfig {
+    param(
+        [System.Collections.IDictionary]$Config,
+        $Profile,
+        [string]$IndexPath
+    )
+
+    if (-not $Profile -or -not $Profile.config) {
+        return
+    }
+
+    foreach ($Key in @(Get-SavedLaunchProfilePersistedKeys)) {
+        if ($Profile.config.PSObject.Properties[$Key]) {
+            $Config[$Key] = $Profile.config.$Key
+        }
+    }
+
+    $Config.ModelPath = Resolve-ModelPath -Path ([string]$Config.ModelPath)
+    Sync-LaunchConfigGpuFields -Config $Config
+    Sync-LaunchConfigReasoningFields -Config $Config
+    Sync-LaunchConfigMtpFields -Config $Config
+    Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $IndexPath
+}
+
+function Format-SavedLaunchProfileSummary {
+    param(
+        $Profile
+    )
+
+    if (-not $Profile -or -not $Profile.config) {
+        return ""
+    }
+
+    $LaunchModeText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.LaunchMode)) { "Background Service" } else { [string]$Profile.config.LaunchMode }
+    $GpuText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.GpuLayers)) { "auto" } else { [string]$Profile.config.GpuLayers }
+    $ReasoningText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ReasoningMode)) { "auto" } else { [string]$Profile.config.ReasoningMode }
+    $MtpText = if ($null -eq $Profile.config.MtpEnabled) { "auto" } elseif ([bool]$Profile.config.MtpEnabled) { "on" } else { "off" }
+    $UpdatedAtText = ""
+    if (-not [string]::IsNullOrWhiteSpace([string]$Profile.updated_at)) {
+        try {
+            $UpdatedAtText = (Get-Date ([datetime]::Parse([string]$Profile.updated_at)) -Format "yyyy-MM-dd HH:mm")
+        }
+        catch {
+            $UpdatedAtText = [string]$Profile.updated_at
+        }
+    }
+
+    return Format-BilingualText `
+        -ChineseText ("{0} | GPU {1} | 推理 {2} | MTP {3}{4}" -f $LaunchModeText, $GpuText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })) `
+        -EnglishText ("{0} | GPU {1} | reasoning {2} | MTP {3}{4}" -f $LaunchModeText, $GpuText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" }))
+}
+
+function Show-QuickStartSavedProfileMenu {
+    param(
+        $ModelEntry
+    )
+
+    $Profiles = @(Get-SavedLaunchProfilesForModel -ModelPath ([string]$ModelEntry.path))
+    if ($Profiles.Count -eq 0) {
+        return [pscustomobject]@{
+            Action  = "Default"
+            Profile = $null
+        }
+    }
+
+    $Items = New-Object System.Collections.Generic.List[object]
+    $Items.Add([pscustomobject]@{
+            Name        = Format-BilingualText -ChineseText "使用預設快速啟動" -EnglishText "Use Default Quick Start"
+            Description = Format-BilingualText -ChineseText "不要套用已儲存設定檔，照原本 Quick Start 流程選啟動模式。" -EnglishText "Do not apply a saved profile. Continue with the normal Quick Start launch-mode flow."
+            Value       = [pscustomobject]@{
+                Action  = "Default"
+                Profile = $null
+            }
+        })
+
+    foreach ($Profile in $Profiles) {
+        $Items.Add([pscustomobject]@{
+                Name        = [string]$Profile.name
+                Description = Format-SavedLaunchProfileSummary -Profile $Profile
+                Value       = [pscustomobject]@{
+                    Action  = "UseProfile"
+                    Profile = $Profile
+                }
+            })
+    }
+
+    $Selection = Show-ListMenu `
+        -Title (Format-BilingualText -ChineseText "快速啟動設定檔" -EnglishText "Quick Start Profiles") `
+        -Subtitle (Format-BilingualText -ChineseText ("為 {0} 選擇預設快速啟動或已儲存設定檔。" -f $ModelEntry.name) -EnglishText ("Choose default Quick Start or a saved profile for {0}." -f $ModelEntry.name)) `
+        -Items $Items.ToArray()
+
+    if (-not $Selection) {
+        return [pscustomobject]@{
+            Action  = "Back"
+            Profile = $null
+        }
+    }
+
+    return $Selection
+}
+
+function Prompt-SavedLaunchProfileName {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    Write-Host ""
+    Write-Host (Format-BilingualText -ChineseText "儲存自訂設定檔" -EnglishText "Save Custom Profile") -ForegroundColor Cyan
+    Write-Host ((Format-BilingualText -ChineseText "模型" -EnglishText "Model") + ": " + [string]$Config.ModelName) -ForegroundColor DarkGray
+    Write-Host ((Format-BilingualText -ChineseText "說明" -EnglishText "Note") + ": " + (Format-BilingualText -ChineseText "輸入設定檔名稱；留空代表取消。相同模型下同名會覆寫。" -EnglishText "Enter a profile name; leave blank to cancel. The same name on the same model overwrites the older one.")) -ForegroundColor DarkGray
+    return (Read-Host (Format-BilingualText -ChineseText "設定檔名稱" -EnglishText "Profile Name"))
+}
+
+function Get-AutoTuneLookupConfig {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $LookupConfig = [ordered]@{}
+    foreach ($Key in @($Config.Keys)) {
+        $LookupConfig[$Key] = $Config[$Key]
+    }
+
+    $LookupConfig.Fit = ""
+    $LookupConfig.ExtraArgs = ConvertTo-ArgumentString -Arguments (Remove-LlamaArgumentsByPatterns -Arguments (Split-ArgumentLine -Line ([string]$Config.ExtraArgs)) -Patterns @(
+            '^(?:--fit-target|-fitt)(?:=.*)?$'
+            '^(?:--cache-ram|-cram)(?:=.*)?$'
+            '^(?:--parallel|-np)(?:=.*)?$'
+            '^(?:--fit|-fit)(?:=.*)?$'
+        ))
+    return $LookupConfig
+}
+
+function Get-MatchingAutoTuneProfileForConfig {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path ([string]$Config.ModelPath)
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        return [pscustomobject]@{
+            Profile    = $null
+            SkipReason = "model path is not available"
+        }
+    }
+
+    $AcceleratorInventory = @(Get-AcceleratorInventory)
+    $LookupConfig = Get-AutoTuneLookupConfig -Config $Config
+    $LookupArgs = Convert-MenuConfigToForwardArgs -Config $LookupConfig
+    $TuningContext = Get-LaunchTuningContext -ResolvedModelPath $ResolvedModelPath -Arguments $LookupArgs -UseExtremeMode ([bool]$Config.ExtremeMode) -AcceleratorInventory $AcceleratorInventory
+    return Get-SavedAutoTuneProfile -TuningContext $TuningContext
+}
+
+function Apply-AutoTuneLearnedValuesToConfig {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $ProfileResult = Get-MatchingAutoTuneProfileForConfig -Config $Config
+    if (-not $ProfileResult.Profile) {
+        $Reason = if ([string]::IsNullOrWhiteSpace([string]$ProfileResult.SkipReason)) {
+            Format-BilingualText -ChineseText "目前沒有可套用的 auto-tune learned profile。" -EnglishText "No auto-tune learned profile is currently available for this config."
+        }
+        else {
+            Format-BilingualText -ChineseText ("目前找不到可套用的 auto-tune learned profile：{0}" -f $ProfileResult.SkipReason) -EnglishText ("No matching auto-tune learned profile is available right now: {0}" -f $ProfileResult.SkipReason)
+        }
+
+        return [pscustomobject]@{
+            Applied = $false
+            Message = $Reason
+            Profile = $null
+        }
+    }
+
+    $Profile = $ProfileResult.Profile
+    if (-not [string]::IsNullOrWhiteSpace([string]$Profile.gpu_layers)) {
+        $Config.GpuLayers = [string]$Profile.gpu_layers
+        Sync-LaunchConfigGpuFields -Config $Config
+    }
+
+    $Config.Fit = "on"
+
+    $ExtraArguments = Remove-LlamaArgumentsByPatterns -Arguments (Split-ArgumentLine -Line ([string]$Config.ExtraArgs)) -Patterns @(
+        '^(?:--fit-target|-fitt)(?:=.*)?$'
+        '^(?:--cache-ram|-cram)(?:=.*)?$'
+        '^(?:--parallel|-np)(?:=.*)?$'
+        '^(?:--fit|-fit)(?:=.*)?$'
+    )
+
+    $UpdatedExtraArguments = New-Object System.Collections.Generic.List[string]
+    foreach ($Argument in @($ExtraArguments)) {
+        $UpdatedExtraArguments.Add([string]$Argument)
+    }
+
+    if ($null -ne $Profile.fit_target_mib) {
+        $UpdatedExtraArguments.Add("--fit-target")
+        $UpdatedExtraArguments.Add([string]$Profile.fit_target_mib)
+    }
+    if ($null -ne $Profile.cache_ram_mib) {
+        $UpdatedExtraArguments.Add("--cache-ram")
+        $UpdatedExtraArguments.Add([string]$Profile.cache_ram_mib)
+    }
+    if ($null -ne $Profile.parallel_slots) {
+        $UpdatedExtraArguments.Add("--parallel")
+        $UpdatedExtraArguments.Add([string]$Profile.parallel_slots)
+    }
+
+    $Config.ExtraArgs = ConvertTo-ArgumentString -Arguments $UpdatedExtraArguments.ToArray()
+
+    $SummaryPartsZh = New-Object System.Collections.Generic.List[string]
+    $SummaryPartsEn = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace([string]$Profile.gpu_layers)) {
+        $SummaryPartsZh.Add("GPU Layers=$([string]$Profile.gpu_layers)")
+        $SummaryPartsEn.Add("GPU Layers=$([string]$Profile.gpu_layers)")
+    }
+    if ($null -ne $Profile.fit_target_mib) {
+        $SummaryPartsZh.Add("fit-target=$([string]$Profile.fit_target_mib)")
+        $SummaryPartsEn.Add("fit-target=$([string]$Profile.fit_target_mib)")
+    }
+    if ($null -ne $Profile.cache_ram_mib) {
+        $SummaryPartsZh.Add("cache-ram=$([string]$Profile.cache_ram_mib)")
+        $SummaryPartsEn.Add("cache-ram=$([string]$Profile.cache_ram_mib)")
+    }
+    if ($null -ne $Profile.parallel_slots) {
+        $SummaryPartsZh.Add("parallel=$([string]$Profile.parallel_slots)")
+        $SummaryPartsEn.Add("parallel=$([string]$Profile.parallel_slots)")
+    }
+
+    return [pscustomobject]@{
+        Applied = $true
+        Message = Format-BilingualText -ChineseText ("已套用 auto-tune learned values：{0}" -f ($SummaryPartsZh -join ', ')) -EnglishText ("Applied auto-tune learned values: {0}" -f ($SummaryPartsEn -join ', '))
+        Profile = $Profile
+    }
 }
 
 function Get-LaunchTuningContext {
@@ -3807,36 +4525,131 @@ function Get-FitText {
     return $SafeText.Substring(0, $Width - 3) + "..."
 }
 
+function Format-BilingualText {
+    param(
+        [string]$ChineseText,
+        [string]$EnglishText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ChineseText)) {
+        return $EnglishText
+    }
+
+    if ([string]::IsNullOrWhiteSpace($EnglishText)) {
+        return $ChineseText
+    }
+
+    return "{0} / {1}" -f $ChineseText, $EnglishText
+}
+
+function Format-BilingualField {
+    param(
+        [string]$ChineseLabel,
+        [string]$EnglishLabel,
+        [string]$ChineseValue,
+        [string]$EnglishValue
+    )
+
+    $LabelText = Format-BilingualText -ChineseText $ChineseLabel -EnglishText $EnglishLabel
+    $ValueText = Format-BilingualText -ChineseText $ChineseValue -EnglishText $EnglishValue
+    return "{0}: {1}" -f $LabelText, $ValueText
+}
+
+function Write-BilingualField {
+    param(
+        [string]$ChineseLabel,
+        [string]$EnglishLabel,
+        [string]$ChineseValue,
+        [string]$EnglishValue,
+        [string]$ForegroundColor = $null
+    )
+
+    $Line = Format-BilingualField -ChineseLabel $ChineseLabel -EnglishLabel $EnglishLabel -ChineseValue $ChineseValue -EnglishValue $EnglishValue
+    if ([string]::IsNullOrWhiteSpace($ForegroundColor)) {
+        Write-Host $Line
+    }
+    else {
+        Write-Host $Line -ForegroundColor $ForegroundColor
+    }
+}
+
+function Get-WrappedTextLines {
+    param(
+        [string]$Text,
+        [int]$Width
+    )
+
+    $SafeText = if ($null -eq $Text) { "" } else { [string]$Text }
+    if ($Width -lt 8) {
+        return @($SafeText)
+    }
+
+    $Lines = New-Object System.Collections.Generic.List[string]
+    foreach ($SourceLine in ($SafeText -split "\r?\n")) {
+        $WorkingLine = $SourceLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($WorkingLine)) {
+            $Lines.Add("")
+            continue
+        }
+
+        while ($WorkingLine.Length -gt $Width) {
+            $Slice = $WorkingLine.Substring(0, $Width)
+            $BreakIndex = $Slice.LastIndexOf(" ")
+            if ($BreakIndex -lt [Math]::Max(10, [Math]::Floor($Width * 0.45))) {
+                $BreakIndex = $Width
+            }
+
+            $Lines.Add($WorkingLine.Substring(0, $BreakIndex).TrimEnd())
+            $WorkingLine = $WorkingLine.Substring($BreakIndex).TrimStart()
+        }
+
+        $Lines.Add($WorkingLine)
+    }
+
+    return @($Lines.ToArray())
+}
+
+function Write-WrappedInfoLine {
+    param(
+        [string]$Prefix,
+        [string]$Text,
+        [string]$PrefixColor = "Cyan",
+        [string]$TextColor = "Gray"
+    )
+
+    $Width = Get-ConsoleWidth
+    $SafePrefix = if ($null -eq $Prefix) { "" } else { [string]$Prefix }
+    $ContentWidth = [Math]::Max(20, $Width - $SafePrefix.Length - 2)
+    $Lines = @(Get-WrappedTextLines -Text $Text -Width $ContentWidth)
+
+    if ($Lines.Count -eq 0) {
+        $Lines = @("")
+    }
+
+    for ($Index = 0; $Index -lt $Lines.Count; $Index++) {
+        $CurrentPrefix = if ($Index -eq 0) { $SafePrefix } else { (" " * $SafePrefix.Length) }
+        Write-Host $CurrentPrefix -NoNewline -ForegroundColor $PrefixColor
+        Write-Host $Lines[$Index] -ForegroundColor $TextColor
+    }
+}
+
 function Read-ConsoleKey {
     return $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
 function Wait-StatusViewAction {
-    param(
-        [int]$RefreshIntervalSec = 15
-    )
-
-    $RefreshIntervalSec = [Math]::Max(1, $RefreshIntervalSec)
-    $Deadline = (Get-Date).AddSeconds($RefreshIntervalSec)
-
-    while ((Get-Date) -lt $Deadline) {
-        try {
-            if ((Test-InteractiveConsole) -and [Console]::KeyAvailable) {
-                $Key = Read-ConsoleKey
-                switch ($Key.VirtualKeyCode) {
-                    13 { return "Exit" }
-                    27 { return "Exit" }
-                    default { }
+    while ($true) {
+        $Key = Read-ConsoleKey
+        switch ($Key.VirtualKeyCode) {
+            13 { return "Exit" }
+            27 { return "Exit" }
+            default {
+                if ($Key.Character -match '^[Rr]$') {
+                    return "Refresh"
                 }
             }
         }
-        catch {
-        }
-
-        Start-Sleep -Milliseconds 200
     }
-
-    return "Refresh"
 }
 
 function Show-MenuHeader {
@@ -3884,7 +4697,7 @@ function Show-ListMenu {
         }
 
         Write-Host ""
-        Write-Host "Use Up/Down to move. Press Enter or Space to confirm. Esc returns." -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "使用上下方向鍵移動，按 Enter 或 Space 確認，Esc 返回。" -EnglishText "Use Up/Down to move. Press Enter or Space to confirm. Esc returns.") -ForegroundColor Yellow
         $Key = Read-ConsoleKey
 
         switch ($Key.VirtualKeyCode) {
@@ -4190,7 +5003,7 @@ function Show-ModelSeriesMenu {
     }
 
     while ($true) {
-        Show-MenuHeader -Title "Select Model Series" -Subtitle "Choose a base model family first. Press E to edit the index file."
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "選擇模型系列" -EnglishText "Select Model Series") -Subtitle (Format-BilingualText -ChineseText "先選擇基礎模型家族，按 E 可編輯索引檔。" -EnglishText "Choose a base model family first. Press E to edit the index file.")
 
         for ($Index = 0; $Index -lt $Series.Count; $Index++) {
             $SeriesEntry = $Series[$Index]
@@ -4208,7 +5021,7 @@ function Show-ModelSeriesMenu {
         }
 
         Write-Host ""
-        Write-Host "Use Up/Down to move. Enter or Space opens the series. E edits model-index.json. Esc returns." -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "使用上下方向鍵移動，Enter 或 Space 開啟系列，E 編輯 model-index.json，Esc 返回。" -EnglishText "Use Up/Down to move. Enter or Space opens the series. E edits model-index.json. Esc returns.") -ForegroundColor Yellow
         $Key = Read-ConsoleKey
 
         switch ($Key.VirtualKeyCode) {
@@ -4256,7 +5069,7 @@ function Show-ModelVariantMenu {
     }
 
     while ($true) {
-        Show-MenuHeader -Title "Select Model Variant" -Subtitle ("Choose a variant for {0}. Press E to edit the index file." -f $SeriesEntry.Name)
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "選擇模型版本" -EnglishText "Select Model Variant") -Subtitle (Format-BilingualText -ChineseText ("為 {0} 選擇版本，按 E 可編輯索引檔。" -f $SeriesEntry.Name) -EnglishText ("Choose a variant for {0}. Press E to edit the index file." -f $SeriesEntry.Name))
 
         for ($Index = 0; $Index -lt $SeriesEntry.Models.Count; $Index++) {
             $Model = $SeriesEntry.Models[$Index]
@@ -4294,7 +5107,7 @@ function Show-ModelVariantMenu {
             Write-Host ("Notes        : {0}" -f $SelectedModel.notes) -ForegroundColor DarkGray
         }
         Write-Host ""
-        Write-Host "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns to series." -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "使用上下方向鍵移動，Enter 或 Space 確認，E 編輯 model-index.json，Esc 返回系列清單。" -EnglishText "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns to series.") -ForegroundColor Yellow
 
         $Key = Read-ConsoleKey
         switch ($Key.VirtualKeyCode) {
@@ -4620,7 +5433,7 @@ function Show-VisionCandidateMenu {
     }
 
     while ($true) {
-        Show-MenuHeader -Title "Select Vision Mmproj" -Subtitle "Choose a vision projector file (mmproj). Press E to edit the index file."
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "選擇視覺 Mmproj" -EnglishText "Select Vision Mmproj") -Subtitle (Format-BilingualText -ChineseText "選擇視覺 projector 檔案（mmproj），按 E 可編輯索引檔。" -EnglishText "Choose a vision projector file (mmproj). Press E to edit the index file.")
 
         for ($Index = 0; $Index -lt $VisionCandidates.Count; $Index++) {
             $VisionCandidate = $VisionCandidates[$Index]
@@ -4639,11 +5452,11 @@ function Show-VisionCandidateMenu {
         $SelectedCandidate = $VisionCandidates[$SelectedIndex]
         $SelectedMmprojPath = [string]$SelectedCandidate.MmprojPath
         Write-Host ""
-        Write-Host ("Primary Model: {0}" -f $(if ([string]::IsNullOrWhiteSpace($PrimaryModelPath)) { "(none)" } else { [System.IO.Path]::GetFileName($PrimaryModelPath) })) -ForegroundColor Cyan
-        Write-Host ("Mmproj       : {0}" -f $(if ([string]::IsNullOrWhiteSpace($SelectedMmprojPath)) { "(none)" } else { $SelectedMmprojPath })) -ForegroundColor Green
-        Write-Host ("Size         : {0}" -f ((Get-ModelFileSizeLabel -Path $SelectedMmprojPath).TrimStart("[").TrimEnd("]")))
+        Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "主模型" -EnglishText "Primary Model"), $(if ([string]::IsNullOrWhiteSpace($PrimaryModelPath)) { "(none)" } else { [System.IO.Path]::GetFileName($PrimaryModelPath) })) -ForegroundColor Cyan
+        Write-Host ("{0}: {1}" -f "Mmproj", $(if ([string]::IsNullOrWhiteSpace($SelectedMmprojPath)) { "(none)" } else { $SelectedMmprojPath })) -ForegroundColor Green
+        Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "大小" -EnglishText "Size"), ((Get-ModelFileSizeLabel -Path $SelectedMmprojPath).TrimStart("[").TrimEnd("]")))
         Write-Host ""
-        Write-Host "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns." -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "使用上下方向鍵移動，Enter 或 Space 確認，E 編輯 model-index.json，Esc 返回。" -EnglishText "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns.") -ForegroundColor Yellow
 
         $Key = Read-ConsoleKey
         switch ($Key.VirtualKeyCode) {
@@ -4712,28 +5525,28 @@ function Edit-VisionModelSelection {
 
         $Options = @(
             [pscustomobject]@{
-                Name = "Use Auto Match"
-                Description = if ($AutoCandidate) { "Use the closest mmproj file for the selected primary model: $AutoLabel." } else { "No close mmproj match was found. Leave vision disabled." }
+                Name = Format-BilingualText -ChineseText "使用自動配對" -EnglishText "Use Auto Match"
+                Description = if ($AutoCandidate) { (Format-BilingualText -ChineseText ("對目前主模型使用最接近的 mmproj：{0}" -f $AutoLabel) -EnglishText ("Use the closest mmproj file for the selected primary model: {0}." -f $AutoLabel)) } else { (Format-BilingualText -ChineseText "找不到合適的 mmproj 配對，維持停用視覺。" -EnglishText "No close mmproj match was found. Leave vision disabled.") }
                 Value = "Auto"
             },
             [pscustomobject]@{
-                Name = "Choose Manually"
-                Description = "Pick a mmproj file manually."
+                Name = Format-BilingualText -ChineseText "手動選擇" -EnglishText "Choose Manually"
+                Description = Format-BilingualText -ChineseText "手動指定 mmproj 檔案。" -EnglishText "Pick a mmproj file manually."
                 Value = "Manual"
             },
             [pscustomobject]@{
-                Name = "Disable Vision"
-                Description = "Start only the primary llama.cpp server and skip mmproj vision."
+                Name = Format-BilingualText -ChineseText "停用視覺" -EnglishText "Disable Vision"
+                Description = Format-BilingualText -ChineseText "只啟動主 llama.cpp 服務，略過 mmproj 視覺能力。" -EnglishText "Start only the primary llama.cpp server and skip mmproj vision."
                 Value = "Disable"
             },
             [pscustomobject]@{
-                Name = "Back"
-                Description = "Keep the current vision selection."
+                Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"
+                Description = Format-BilingualText -ChineseText "保留目前的視覺設定。" -EnglishText "Keep the current vision selection."
                 Value = "Back"
             }
         )
 
-        $Selection = Show-ListMenu -Title "Vision Mmproj" -Subtitle "Choose how the vision projector should be selected for the primary server." -Items $Options
+        $Selection = Show-ListMenu -Title (Format-BilingualText -ChineseText "視覺 Mmproj" -EnglishText "Vision Mmproj") -Subtitle (Format-BilingualText -ChineseText "選擇主服務要如何決定視覺 projector。" -EnglishText "Choose how the vision projector should be selected for the primary server.") -Items $Options
         switch ($Selection) {
             "Auto" {
                 Set-LaunchConfigVisionSelection -Config $Config -VisionCandidate $AutoCandidate -SelectionMode "auto"
@@ -4759,25 +5572,25 @@ function Edit-VisionModelSelection {
 
 function Show-LaunchModeMenu {
     $Options = @(
-        [pscustomobject]@{ Name = "Background Service"; Description = "Start llama-server.exe in the background without opening a browser."; Value = "Background Service" },
-        [pscustomobject]@{ Name = "Open Web UI"; Description = "Start the server and open the built-in Web UI in your browser."; Value = "Open Web UI" },
-        [pscustomobject]@{ Name = "Back"; Description = "Return to the previous menu."; Value = "Back" }
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "背景服務" -EnglishText "Background Service"; Description = Format-BilingualText -ChineseText "在背景啟動 llama-server.exe，不自動開瀏覽器。" -EnglishText "Start llama-server.exe in the background without opening a browser."; Value = "Background Service" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "開啟 Web UI" -EnglishText "Open Web UI"; Description = Format-BilingualText -ChineseText "啟動服務並在瀏覽器開啟內建 Web UI。" -EnglishText "Start the server and open the built-in Web UI in your browser."; Value = "Open Web UI" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"; Description = Format-BilingualText -ChineseText "回到上一層選單。" -EnglishText "Return to the previous menu."; Value = "Back" }
     )
 
-    return Show-ListMenu -Title "Launch Mode" -Subtitle "Choose how you want to start the server." -Items $Options
+    return Show-ListMenu -Title (Format-BilingualText -ChineseText "啟動模式" -EnglishText "Launch Mode") -Subtitle (Format-BilingualText -ChineseText "選擇你要如何啟動服務。" -EnglishText "Choose how you want to start the server.") -Items $Options
 }
 
 function Show-MainLauncherMenu {
     $Options = @(
-        [pscustomobject]@{ Name = "Quick Start"; Description = "Pick a model, then choose background service or Web UI."; Value = "QuickStart" },
-        [pscustomobject]@{ Name = "Tune And Launch"; Description = "Pick a model, edit a parameter matrix, then start."; Value = "TuneLaunch" },
-        [pscustomobject]@{ Name = "Server Status"; Description = "Show tracked server status, runtime settings, and GPU offload summary."; Value = "Status" },
-        [pscustomobject]@{ Name = "Stop Running Server"; Description = "Stop the currently tracked llama.cpp server."; Value = "Stop" },
-        [pscustomobject]@{ Name = "llama-server Help"; Description = "Show the exact --help output from the installed llama-server.exe."; Value = "Help" },
-        [pscustomobject]@{ Name = "Exit"; Description = "Leave the launcher without changing anything."; Value = "Exit" }
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "快速啟動" -EnglishText "Quick Start"; Description = Format-BilingualText -ChineseText "先選模型，再選背景服務或 Web UI。" -EnglishText "Pick a model, then choose background service or Web UI."; Value = "QuickStart" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch"; Description = Format-BilingualText -ChineseText "先選模型，再編輯參數矩陣後啟動。" -EnglishText "Pick a model, edit a parameter matrix, then start."; Value = "TuneLaunch" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "服務狀態" -EnglishText "Server Status"; Description = Format-BilingualText -ChineseText "顯示追蹤中的服務狀態、執行參數與 GPU 卸載摘要。" -EnglishText "Show tracked server status, runtime settings, and GPU offload summary."; Value = "Status" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "停止目前服務" -EnglishText "Stop Running Server"; Description = Format-BilingualText -ChineseText "停止目前被追蹤的 llama.cpp 服務。" -EnglishText "Stop the currently tracked llama.cpp server."; Value = "Stop" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "llama-server 說明" -EnglishText "llama-server Help"; Description = Format-BilingualText -ChineseText "顯示目前已安裝 llama-server.exe 的完整 --help 輸出。" -EnglishText "Show the exact --help output from the installed llama-server.exe."; Value = "Help" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "離開" -EnglishText "Exit"; Description = Format-BilingualText -ChineseText "不做變更直接離開啟動器。" -EnglishText "Leave the launcher without changing anything."; Value = "Exit" }
     )
 
-    return Show-ListMenu -Title "llama.cpp Launcher" -Subtitle "Choose Quick Start or Tune And Launch first. Utility actions stay here too." -Items $Options
+    return Show-ListMenu -Title (Format-BilingualText -ChineseText "llama.cpp 啟動器" -EnglishText "llama.cpp Launcher") -Subtitle (Format-BilingualText -ChineseText "先選擇快速啟動或調校後啟動，工具型功能也保留在這裡。" -EnglishText "Choose Quick Start or Tune And Launch first. Utility actions stay here too.") -Items $Options
 }
 
 function New-LaunchConfig {
@@ -4817,39 +5630,51 @@ function New-LaunchConfig {
         SplitMode         = [string]$ForwardConfig.SplitMode
         TensorSplit       = [string]$ForwardConfig.TensorSplit
         Fit               = [string]$ForwardConfig.Fit
+        ReasoningMode     = [string]$ForwardConfig.ReasoningMode
+        ThinkLevel        = [string]$ForwardConfig.ThinkLevel
+        MtpEnabled        = $ForwardConfig.MtpEnabled
+        SpecDraftNMax     = [string]$ForwardConfig.SpecDraftNMax
         ExtraArgs         = [string]$ForwardConfig.ExtraArgs
     }
 
     Sync-LaunchConfigGpuFields -Config $Config
+    Sync-LaunchConfigReasoningFields -Config $Config
+    Sync-LaunchConfigMtpFields -Config $Config
     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $ModelIndexPath
     return $Config
 }
 
 function Get-LaunchConfigItems {
     return @(
-        [pscustomobject]@{ Key = "Model"; Label = "Model"; Type = "model" },
-        [pscustomobject]@{ Key = "VisionModel"; Label = "Vision Model"; Type = "visionModel" },
-        [pscustomobject]@{ Key = "LaunchMode"; Label = "Launch"; Type = "choice"; Choices = @("Background Service", "Open Web UI") },
+        [pscustomobject]@{ Key = "Model"; Label = (Format-BilingualText -ChineseText "模型" -EnglishText "Model"); Type = "model" },
+        [pscustomobject]@{ Key = "VisionModel"; Label = (Format-BilingualText -ChineseText "視覺模型" -EnglishText "Vision Model"); Type = "visionModel" },
+        [pscustomobject]@{ Key = "LaunchMode"; Label = (Format-BilingualText -ChineseText "啟動" -EnglishText "Launch"); Type = "choice"; Choices = @("Background Service", "Open Web UI") },
         [pscustomobject]@{ Key = "Port"; Label = "Port"; Type = "number"; Hint = "1-65535" },
-        [pscustomobject]@{ Key = "OpenPath"; Label = "Open Path"; Type = "text"; Hint = "For Web UI use /" },
-        [pscustomobject]@{ Key = "GpuLayers"; Label = "GPU Layers"; Type = "text"; Hint = "auto, all, or number" },
-        [pscustomobject]@{ Key = "RepeatingLayers"; Label = "Repeating Layers"; Type = "text"; Hint = "auto, all, or number of repeating layers" },
-        [pscustomobject]@{ Key = "ExtremeMode"; Label = "Extreme VRAM"; Type = "bool" },
-        [pscustomobject]@{ Key = "AutoTune"; Label = "Auto Tune"; Type = "bool" },
-        [pscustomobject]@{ Key = "Threads"; Label = "Threads"; Type = "number"; Hint = "-1 or positive integer" },
-        [pscustomobject]@{ Key = "ThreadsBatch"; Label = "Threads Batch"; Type = "number"; Hint = "-1 or positive integer" },
-        [pscustomobject]@{ Key = "ReadyTimeoutSec"; Label = "Ready Timeout"; Type = "number"; Hint = "seconds" },
-        [pscustomobject]@{ Key = "ContextSize"; Label = "Context Size"; Type = "numberOrBlank"; Hint = "blank uses managed default 131072" },
+        [pscustomobject]@{ Key = "OpenPath"; Label = (Format-BilingualText -ChineseText "開啟路徑" -EnglishText "Open Path"); Type = "text"; Hint = (Format-BilingualText -ChineseText "Web UI 通常使用 /" -EnglishText "For Web UI use /") },
+        [pscustomobject]@{ Key = "GpuLayers"; Label = "GPU Layers"; Type = "text"; Hint = (Format-BilingualText -ChineseText "輸入 auto、all 或數字" -EnglishText "auto, all, or number") },
+        [pscustomobject]@{ Key = "RepeatingLayers"; Label = (Format-BilingualText -ChineseText "重複層數" -EnglishText "Repeating Layers"); Type = "text"; Hint = (Format-BilingualText -ChineseText "輸入 auto、all 或重複層數" -EnglishText "auto, all, or number of repeating layers") },
+        [pscustomobject]@{ Key = "ExtremeMode"; Label = (Format-BilingualText -ChineseText "極限顯存" -EnglishText "Extreme VRAM"); Type = "bool" },
+        [pscustomobject]@{ Key = "AutoTune"; Label = (Format-BilingualText -ChineseText "自動調校" -EnglishText "Auto Tune"); Type = "bool" },
+        [pscustomobject]@{ Key = "Threads"; Label = "Threads"; Type = "number"; Hint = (Format-BilingualText -ChineseText "輸入 -1 或正整數" -EnglishText "-1 or positive integer") },
+        [pscustomobject]@{ Key = "ThreadsBatch"; Label = (Format-BilingualText -ChineseText "批次執行緒" -EnglishText "Threads Batch"); Type = "number"; Hint = (Format-BilingualText -ChineseText "輸入 -1 或正整數" -EnglishText "-1 or positive integer") },
+        [pscustomobject]@{ Key = "ReadyTimeoutSec"; Label = (Format-BilingualText -ChineseText "就緒逾時" -EnglishText "Ready Timeout"); Type = "number"; Hint = (Format-BilingualText -ChineseText "單位：秒" -EnglishText "seconds") },
+        [pscustomobject]@{ Key = "ReasoningMode"; Label = (Format-BilingualText -ChineseText "推理模式" -EnglishText "Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
+        [pscustomobject]@{ Key = "ThinkLevel"; Label = (Format-BilingualText -ChineseText "思考等級" -EnglishText "Think Level"); Type = "choice"; Choices = (Get-ThinkLevelChoices) },
+        [pscustomobject]@{ Key = "MtpEnabled"; Label = "MTP"; Type = "bool" },
+        [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數，Unsloth 預設為 2" -EnglishText "positive integer; Unsloth default is 2") },
+        [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
         [pscustomobject]@{ Key = "Host"; Label = "Host"; Type = "text"; Hint = "127.0.0.1 or 0.0.0.0" },
         [pscustomobject]@{ Key = "Metrics"; Label = "Metrics"; Type = "bool" },
         [pscustomobject]@{ Key = "ApiKey"; Label = "API Key"; Type = "text" },
-        [pscustomobject]@{ Key = "Device"; Label = "Device"; Type = "text"; Hint = "blank uses auto; example: CUDA0,CUDA1" },
-        [pscustomobject]@{ Key = "SplitMode"; Label = "Split Mode"; Type = "choice"; Choices = @("", "layer", "row", "none") },
-        [pscustomobject]@{ Key = "TensorSplit"; Label = "Tensor Split"; Type = "text"; Hint = "blank uses auto; example: 3,2" },
+        [pscustomobject]@{ Key = "Device"; Label = "Device"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 CUDA0,CUDA1" -EnglishText "blank uses auto; example: CUDA0,CUDA1") },
+        [pscustomobject]@{ Key = "SplitMode"; Label = (Format-BilingualText -ChineseText "分割模式" -EnglishText "Split Mode"); Type = "choice"; Choices = @("", "layer", "row", "none") },
+        [pscustomobject]@{ Key = "TensorSplit"; Label = (Format-BilingualText -ChineseText "張量分配" -EnglishText "Tensor Split"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 3,2" -EnglishText "blank uses auto; example: 3,2") },
         [pscustomobject]@{ Key = "Fit"; Label = "Fit"; Type = "choice"; Choices = @("", "on", "off") },
-        [pscustomobject]@{ Key = "ExtraArgs"; Label = "Extra Args"; Type = "text"; Hint = "blank means no extra args" },
-        [pscustomobject]@{ Key = "Start"; Label = "Start Launch"; Type = "actionStart" },
-        [pscustomobject]@{ Key = "Back"; Label = "Back"; Type = "actionBack" }
+        [pscustomobject]@{ Key = "ExtraArgs"; Label = (Format-BilingualText -ChineseText "額外參數" -EnglishText "Extra Args"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空代表不加額外參數" -EnglishText "blank means no extra args") },
+        [pscustomobject]@{ Key = "ApplyAutoTune"; Label = (Format-BilingualText -ChineseText "套用自動調校學習值" -EnglishText "Apply Auto Tune Learned Values"); Type = "actionAutoTuneApply" },
+        [pscustomobject]@{ Key = "SaveProfile"; Label = (Format-BilingualText -ChineseText "儲存設定檔" -EnglishText "Save Profile"); Type = "actionSave" },
+        [pscustomobject]@{ Key = "Start"; Label = (Format-BilingualText -ChineseText "開始啟動" -EnglishText "Start Launch"); Type = "actionStart" },
+        [pscustomobject]@{ Key = "Back"; Label = (Format-BilingualText -ChineseText "返回" -EnglishText "Back"); Type = "actionBack" }
     )
 }
 
@@ -4877,6 +5702,10 @@ function Get-LaunchConfigDefaultText {
         "AutoTune" { return "off" }
         "Threads" { return "auto -> $([Math]::Max(1, $LogicalThreads - 2))" }
         "ThreadsBatch" { return "auto -> $LogicalThreads" }
+        "ReasoningMode" { return "auto" }
+        "ThinkLevel" { return "Auto (no explicit budget)" }
+        "MtpEnabled" { return $(if (Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for Qwen3.6 MTP GGUF" } else { "off" }) }
+        "SpecDraftNMax" { return "2" }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
         "ApiKey" { return "none" }
         "Device" { return "auto" }
@@ -4916,6 +5745,15 @@ function Get-LaunchConfigValueText {
         "Metrics" { return $(if ($Config.Metrics) { "On" } else { "Off" }) }
         "ExtremeMode" { return $(if ($Config.ExtremeMode) { "On" } else { "Off" }) }
         "AutoTune" { return $(if ($Config.AutoTune) { "On" } else { "Off" }) }
+        "ReasoningMode" { return ([string]$Config.ReasoningMode).ToUpperInvariant() }
+        "ThinkLevel" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.ThinkLevel
+        }
+        "MtpEnabled" { return $(if ($Config.MtpEnabled) { "On" } else { "Off" }) }
         "RepeatingLayers" {
             if ([string]::IsNullOrWhiteSpace([string]$Config.RepeatingLayers) -or [string]$Config.RepeatingLayers -eq "auto") {
                 return "auto -> derived from GPU Layers"
@@ -4949,6 +5787,13 @@ function Get-LaunchConfigValueText {
 
             return [string]$Config.ThreadsBatch
         }
+        "SpecDraftNMax" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.SpecDraftNMax
+        }
         "ApiKey" {
             if ([string]::IsNullOrWhiteSpace($Config.ApiKey)) {
                 return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
@@ -4970,6 +5815,8 @@ function Get-LaunchConfigValueText {
 
             return [string]$Config.Fit
         }
+        "ApplyAutoTune" { return (Format-BilingualText -ChineseText "按 Enter 套用" -EnglishText "Press Enter to apply") }
+        "SaveProfile" { return (Format-BilingualText -ChineseText "儲存目前設定" -EnglishText "Save current settings") }
         "Start" { return "Launch now" }
         "Back" { return "Return" }
         default {
@@ -4983,6 +5830,198 @@ function Get-LaunchConfigValueText {
     }
 }
 
+function Get-LaunchConfigItemHelp {
+    param(
+        [System.Collections.IDictionary]$Config,
+        $Item
+    )
+
+    $IsQwen36MtpModel = Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+
+    switch ([string]$Item.Key) {
+        "Model" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "選擇這次啟動要載入的主要 GGUF 模型。" -EnglishText "Selects the primary GGUF that llama.cpp will load for this launch."
+                Recommendation = Format-BilingualText -ChineseText "先選定你真正要跑的量化版本和微調模型，其他設定都應該跟著這個模型一起調，不要直接盲目沿用到其他 GGUF。" -EnglishText "Pick the exact quant and finetune you want first. Other settings should be tuned against this model, not reused blindly across different GGUFs."
+            }
+        }
+        "VisionModel" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "控制主服務是否同時掛載 mmproj 視覺 projector。" -EnglishText "Controls whether the main server also mounts an mmproj vision projector."
+                Recommendation = Format-BilingualText -ChineseText "除非你很確定對應的 mmproj 檔案，否則保持自動配對。純文字使用時可停用，降低風險與啟動負擔。" -EnglishText "Leave this on auto unless you know the exact matching mmproj. Disable it for text-only runs to reduce risk and startup cost."
+            }
+        }
+        "LaunchMode" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "選擇要把服務留在背景執行，還是直接開啟內建 Web UI。" -EnglishText "Chooses whether the launcher leaves the server running in the background or opens the built-in Web UI."
+                Recommendation = Format-BilingualText -ChineseText "API 使用或長時間本機後端請選背景服務。只有在你想立刻用瀏覽器互動時，才選 Open Web UI。" -EnglishText "Use Background Service for API use and long-running local backends. Use Open Web UI only when you want browser interaction immediately."
+            }
+        }
+        "Port" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定 llama-server 的 HTTP 埠號。" -EnglishText "Sets the HTTP port for llama-server."
+                Recommendation = Format-BilingualText -ChineseText "除非 8080 已被其他程式占用，否則維持 8080。需要並行測試時再改成 8090 這類其他空閒埠號。" -EnglishText "Keep 8080 unless another process already uses it. Use a different free port such as 8090 when you need side-by-side testing."
+            }
+        }
+        "OpenPath" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "控制服務就緒後要自動開啟的網址路徑。" -EnglishText "Controls which URL path opens after the server is ready."
+                Recommendation = Format-BilingualText -ChineseText "Web UI 通常用 `/`，只想快速確認 API 是否就緒則用 `/v1/models`。" -EnglishText "Use / for the Web UI and /v1/models for a lightweight API readiness page."
+            }
+        }
+        "GpuLayers" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "控制有多少模型層要卸載到 GPU。`auto` 會讓 wrapper 或 llama.cpp 依可用 VRAM 自動 fitting。" -EnglishText "Controls how many model layers are offloaded to GPU. auto lets the wrapper or llama.cpp fit to available VRAM."
+                Recommendation = Format-BilingualText -ChineseText "除非你已經在這台機器驗證過完整卸載 preset，否則先從 `auto` 開始。只有已知穩定的雙 GPU wrapper 才建議直接用 `all`。" -EnglishText "Start with auto unless you already validated a full offload preset on this machine. Use all only for known-good dual-GPU wrappers."
+            }
+        }
+        "RepeatingLayers" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "用另一種方式思考 GPU 卸載深度；wrapper 會自動把 repeating layers 換算成 llama.cpp 的 GPU layer 數。" -EnglishText "Alternative way to think about offload depth. The wrapper converts repeating layers into llama.cpp GPU layer count automatically."
+                Recommendation = Format-BilingualText -ChineseText "不確定時先用 `auto`。要微調 VRAM 使用量時，建議逐步增加，不要一開始就直接跳到 `all`。" -EnglishText "Use auto if you are unsure. When fine-tuning VRAM usage, raise this gradually instead of jumping straight to all."
+            }
+        }
+        "ExtremeMode" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "透過縮小 fit headroom 與 cache 預設值，讓 wrapper 更積極地吃滿 VRAM。" -EnglishText "Makes the wrapper push VRAM harder by shrinking fit headroom and cache defaults."
+                Recommendation = Format-BilingualText -ChineseText "一般使用請保持關閉。只有在你刻意要追求接近滿載 GPU 下的最大穩定 context 時才開啟。" -EnglishText "Leave it off for normal use. Turn it on only when you are deliberately chasing the largest stable context on a nearly full GPU."
+            }
+        }
+        "AutoTune" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "在成功接近滿 VRAM 的啟動後，學習並保存可重用的 GPU fitting 參數。" -EnglishText "Learns reusable GPU fitting values after successful near-full-VRAM launches."
+                Recommendation = Format-BilingualText -ChineseText "想讓 wrapper 記住穩定的自動化設定時就開啟；如果你偏好明確固定的 preset，就保持關閉。" -EnglishText "Use it when you want the wrapper to remember a stable automatic profile. Leave it off if you prefer explicit fixed presets."
+            }
+        }
+        "Threads" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定 token 生成階段使用的 CPU 執行緒數。" -EnglishText "CPU threads used for token generation."
+                Recommendation = Format-BilingualText -ChineseText "建議先維持 `-1`。在這台機器上會自動變成邏輯核心數減 2，通常是合理的起手值。" -EnglishText "Keep -1 first. On this box that resolves to logical cores minus 2, which is usually the right starting point."
+            }
+        }
+        "ThreadsBatch" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定 prompt ingest 與 batching 階段使用的 CPU 執行緒數。" -EnglishText "CPU threads used for prompt ingestion and batching work."
+                Recommendation = Format-BilingualText -ChineseText "建議先維持 `-1`。在這台機器上會自動等於全部邏輯核心，除非你有理由刻意降低 CPU 壓力。" -EnglishText "Keep -1 first. On this box it resolves to full logical core count unless you have a reason to reduce CPU pressure."
+            }
+        }
+        "ReadyTimeoutSec" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定啟動器在放棄自動開頁與 ready 檢查前最多等待多久。" -EnglishText "How long the launcher waits before giving up on auto-open and ready checks."
+                Recommendation = Format-BilingualText -ChineseText "`180` 秒通常夠用。模型很大或第一次載入很慢時可以往上調。" -EnglishText "180 is a reasonable default. Raise it for very large models or slow first loads."
+            }
+        }
+        "ReasoningMode" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "用 `--reasoning auto|on|off` 控制 llama.cpp 的 thinking / reasoning 模式。" -EnglishText "Controls llama.cpp thinking mode with --reasoning auto, on, or off."
+                Recommendation = Format-BilingualText -ChineseText "除非你要強制開啟可見推理，或為了速度與更直接的回答而硬性關閉，否則保持 `auto`。" -EnglishText "Keep auto unless you want to force visible reasoning on or hard-disable it for speed and cleaner direct answers."
+            }
+        }
+        "ThinkLevel" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 `--reasoning-budget`。等級越高，模型在被強制結束 thinking 之前可用的思考 token 越多。" -EnglishText "Maps to llama.cpp --reasoning-budget. Higher levels allow more thinking tokens before the model is forced to stop thinking."
+                Recommendation = Format-BilingualText -ChineseText "較難的任務建議先用 `Medium (4096)`。在乎延遲時用 `Low (1024)`，要更深的推理可用 `High (8192)`，只有能接受很長 thinking 時才用 `Max (-1)`。" -EnglishText "Start with Medium (4096) for harder tasks. Use Low (1024) when latency matters, High (8192) for deeper problems, and Max (-1) only if you accept potentially long reasoning."
+            }
+        }
+        "MtpEnabled" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "切換 speculative MTP 啟動。開啟後，launcher 會送出 `--spec-type draft-mtp` 與相關預設。" -EnglishText "Toggles speculative MTP startup. When enabled, the launcher emits --spec-type draft-mtp and related defaults."
+                Recommendation = if ($IsQwen36MtpModel) { (Format-BilingualText -ChineseText "如果是 Qwen3.6 MTP GGUF，建議保持開啟。只有在你要比較非 MTP 行為或做疑難排解時才關掉。" -EnglishText "For Qwen3.6 MTP GGUFs, leave this On. Turn it Off only if you want to force a plain non-MTP run for comparison or troubleshooting.") } else { (Format-BilingualText -ChineseText "除非你明確要使用 draft-mtp，且知道目前模型支援，否則保持關閉。" -EnglishText "Leave this Off unless you intentionally want draft-mtp and know the selected model supports it.") }
+            }
+        }
+        "SpecDraftNMax" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定 llama.cpp 的 `--spec-draft-n-max`，也就是每一步 speculative drafting 最多要草擬多少 token。" -EnglishText "Sets llama.cpp --spec-draft-n-max, the maximum number of speculative draft tokens per step."
+                Recommendation = Format-BilingualText -ChineseText "先從 `2` 開始。只有在你已經實測目前 MTP 模型穩定，而且更深 drafting 確實有收益時，才往上加。" -EnglishText "Start with 2. Increase only after measuring that your chosen MTP model stays stable and actually benefits from deeper drafting."
+            }
+        }
+        "ContextSize" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定總 context size。留空時會回退到 wrapper 管理的預設值。" -EnglishText "Sets total context size. Blank falls back to the wrapper managed default."
+                Recommendation = Format-BilingualText -ChineseText "除非你已經驗證過更大的 context，否則先用管理預設值。遇到 VRAM 壓力導致啟動失敗時，第一步先往下降。" -EnglishText "Start at the managed default unless you already validated a larger context. Lower it first when VRAM pressure causes startup failures."
+            }
+        }
+        "Host" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "控制 llama-server 要綁定在哪個網路介面。" -EnglishText "Controls which network interface llama-server binds to."
+                Recommendation = Format-BilingualText -ChineseText "只在本機使用時請維持 `127.0.0.1`。只有在可信任網路上，才用 `0.0.0.0`，而且要搭配 API key。" -EnglishText "Keep 127.0.0.1 for local-only use. Use 0.0.0.0 only on trusted networks and pair it with an API key."
+            }
+        }
+        "Metrics" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "啟用 Prometheus 的 `/metrics` 端點。" -EnglishText "Enables the Prometheus /metrics endpoint."
+                Recommendation = Format-BilingualText -ChineseText "除非你真的會監看這個服務，否則保持關閉。" -EnglishText "Leave it Off unless you actively monitor the server."
+            }
+        }
+        "ApiKey" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "為服務加上 API key 保護。" -EnglishText "Adds API key protection to the server."
+                Recommendation = Format-BilingualText -ChineseText "只要 Host 不是 `127.0.0.1`，或你不希望其他本機工具匿名連線時，就應該設定它。" -EnglishText "Set this whenever Host is not 127.0.0.1 or when other local tools should not have anonymous access."
+            }
+        }
+        "Device" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "指定 llama.cpp 要使用哪些加速裝置。" -EnglishText "Pins which accelerators llama.cpp should target."
+                Recommendation = Format-BilingualText -ChineseText "留空代表自動選擇。這台機器若要同時用兩張 5070 Ti，可填 `CUDA0,CUDA1`。" -EnglishText "Leave blank for automatic selection. On this machine, use CUDA0,CUDA1 when you want both 5070 Ti cards."
+            }
+        }
+        "SplitMode" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "控制 llama.cpp 在多張 GPU 之間如何分割工作。" -EnglishText "Controls how llama.cpp splits work across multiple GPUs."
+                Recommendation = Format-BilingualText -ChineseText "大多數雙 GPU 啟動建議用 `layer`。單 GPU 情況通常留空，除非你在測試特定分割策略。" -EnglishText "Use layer for most dual-GPU launches. Leave blank on single-GPU runs unless you are testing a specific split strategy."
+            }
+        }
+        "TensorSplit" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "在啟用多 GPU 分割時，定義各張 GPU 之間的張量分配比例。" -EnglishText "Defines the distribution ratio between GPUs when multi-GPU split is active."
+                Recommendation = Format-BilingualText -ChineseText "兩張規格相同的 GPU 可先用 `1,1`。只有在你確認某一張卡才是瓶頸後，才需要細調這個比例。" -EnglishText "For two equal GPUs, start with 1,1. Tune this only after you know one GPU is the bottleneck."
+            }
+        }
+        "Fit" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "在你想覆蓋預設行為時，直接控制 llama.cpp 的 fit 行為。" -EnglishText "Directly controls llama.cpp fit behavior when you want to override its default."
+                Recommendation = Format-BilingualText -ChineseText "一般由 wrapper 管理時保持留空。只有在你刻意比較 fit 行為時，才手動設成 `on` 或 `off`。" -EnglishText "Leave blank for normal wrapper-managed launches. Use on or off only when comparing fit behavior deliberately."
+            }
+        }
+        "ExtraArgs" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "傳遞那些目前沒有做成獨立欄位的原始 llama-server 參數。" -EnglishText "Passes raw llama-server arguments that are not already exposed as dedicated fields."
+                Recommendation = Format-BilingualText -ChineseText "這裡只建議放進階旗標。如果上面已經有對應欄位，優先用欄位本身，不要重複塞在這裡。" -EnglishText "Use this for advanced flags only. Prefer the dedicated fields above when an option already exists there."
+            }
+        }
+        "ApplyAutoTune" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "把目前模型對得上的 auto-tune learned profile 轉成明確的啟動值，直接寫回目前頁面。" -EnglishText "Converts the matching auto-tune learned profile for this model into explicit launch values and writes them back into the current page."
+                Recommendation = Format-BilingualText -ChineseText "按下後會套用學到的 GPU Layers，並把 fit-target、cache-ram、parallel 寫進 Extra Args。如果目前沒有匹配的 learned profile，畫面會直接告訴你原因。" -EnglishText "When you press it, the learned GPU Layers are applied and fit-target, cache-ram, and parallel are written into Extra Args. If no learned profile matches right now, the screen tells you why."
+            }
+        }
+        "SaveProfile" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "把目前頁面上的設定存成可重用的自訂設定檔。" -EnglishText "Saves the current page settings as a reusable custom profile."
+                Recommendation = Format-BilingualText -ChineseText "建議用清楚的名稱，例如模型用途、量化版本或顯卡配置。之後在 Quick Start 就能直接挑這個設定檔來啟動。" -EnglishText "Use a clear name such as the model purpose, quant, or GPU layout. After saving, Quick Start can launch directly with this profile."
+            }
+        }
+        "Start" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "用目前矩陣中的設定啟動 llama.cpp。" -EnglishText "Starts llama.cpp with the current matrix values."
+                Recommendation = Format-BilingualText -ChineseText "啟動前至少一起檢查模型、context、GPU layers、reasoning 和 MTP 設定。" -EnglishText "Launch only after checking model, context, GPU layers, reasoning, and MTP settings together."
+            }
+        }
+        "Back" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "不啟動，直接回到上一層選單。" -EnglishText "Returns to the previous menu without launching."
+                Recommendation = Format-BilingualText -ChineseText "如果你想換模型，或想在不套用目前矩陣設定的情況下離開，就用這個。" -EnglishText "Use this if you want to change models or exit without applying the current matrix."
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "調整目前模型的一個啟動參數。" -EnglishText "Adjusts one launch parameter for the current model."
+                Recommendation = Format-BilingualText -ChineseText "排查啟動或效能問題時，建議一次只改一個設定。" -EnglishText "Change one thing at a time when debugging startup or performance."
+            }
+        }
+    }
+}
+
 function Read-ConfigInput {
     param(
         [string]$Label,
@@ -4992,17 +6031,17 @@ function Read-ConfigInput {
     )
 
     Write-Host ""
-    Write-Host ("Editing {0}" -f $Label) -ForegroundColor Cyan
+    Write-Host (Format-BilingualText -ChineseText ("正在編輯 {0}" -f $Label) -EnglishText ("Editing {0}" -f $Label)) -ForegroundColor Cyan
     if ($Hint) {
-        Write-Host ("Hint: {0}" -f $Hint) -ForegroundColor DarkGray
+        Write-Host ((Format-BilingualText -ChineseText "提示" -EnglishText "Hint") + ": " + $Hint) -ForegroundColor DarkGray
     }
     if ([string]::IsNullOrWhiteSpace($CurrentValue)) {
-        Write-Host ("Current: {0}" -f $CurrentDisplayValue) -ForegroundColor DarkGray
+        Write-Host ((Format-BilingualText -ChineseText "目前值" -EnglishText "Current") + ": " + $CurrentDisplayValue) -ForegroundColor DarkGray
     }
     else {
-        Write-Host ("Current: {0}" -f $CurrentDisplayValue) -ForegroundColor DarkGray
+        Write-Host ((Format-BilingualText -ChineseText "目前值" -EnglishText "Current") + ": " + $CurrentDisplayValue) -ForegroundColor DarkGray
     }
-    $InputText = Read-Host "New value (leave blank to clear)"
+    $InputText = Read-Host (Format-BilingualText -ChineseText "輸入新值（留空代表清除）" -EnglishText "New value (leave blank to clear)")
     return $InputText
 }
 
@@ -5021,6 +6060,8 @@ function Edit-LaunchConfigItem {
                 $Config.ModelPath = Resolve-ModelPath -Path $SelectedModel.path
                 $Config.ModelCapabilities = Format-ModelCapabilities -ModelEntry $SelectedModel
                 Sync-LaunchConfigGpuFields -Config $Config
+                $Config.MtpEnabled = Test-IsQwen36MtpModel -ModelEntry $SelectedModel -ResolvedModelPath $Config.ModelPath
+                Sync-LaunchConfigMtpFields -Config $Config
                 if ([string]$Config.VisionSelectionMode -eq "auto") {
                     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $IndexPath
                 }
@@ -5046,6 +6087,9 @@ function Edit-LaunchConfigItem {
                 elseif ($Config.LaunchMode -eq "Background Service" -and ($Config.OpenPath -eq "/" -or [string]::IsNullOrWhiteSpace($Config.OpenPath))) {
                     $Config.OpenPath = "/v1/models"
                 }
+            }
+            elseif ($Item.Key -eq "ReasoningMode" -and [string]$Config.ReasoningMode -eq "off") {
+                $Config.ThinkLevel = "Auto"
             }
         }
         "bool" {
@@ -5112,6 +6156,11 @@ function Edit-LaunchConfigItem {
                         throw "Ready Timeout must be a positive integer."
                     }
                 }
+                "SpecDraftNMax" {
+                    if ([int]$Value -lt 1) {
+                        throw "SPEC_DRAFT_N_MAX must be a positive integer."
+                    }
+                }
             }
 
             $Config[$Item.Key] = [string]$Value
@@ -5148,10 +6197,12 @@ function Show-LaunchConfigGrid {
     $SelectedIndex = 0
 
     while ($true) {
-        Show-MenuHeader -Title "Tune And Launch" -Subtitle "Use arrow keys to move. Press Enter or Space to edit the selected cell."
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle (Format-BilingualText -ChineseText "使用方向鍵移動，按 Enter 或 Space 編輯目前欄位。" -EnglishText "Use arrow keys to move. Press Enter or Space to edit the selected cell.")
         $Width = Get-ConsoleWidth
         $CellWidth = [Math]::Max(36, [Math]::Floor(($Width - 6) / 2))
         $RowCount = [Math]::Ceiling($Items.Count / 2)
+        $SelectedItem = $Items[$SelectedIndex]
+        $SelectedHelp = Get-LaunchConfigItemHelp -Config $Config -Item $SelectedItem
 
         for ($Row = 0; $Row -lt $RowCount; $Row++) {
             for ($Column = 0; $Column -lt 2; $Column++) {
@@ -5175,18 +6226,22 @@ function Show-LaunchConfigGrid {
         }
 
         Write-Host ""
-        Write-Host ("Model        : {0}" -f $Config.ModelName) -ForegroundColor Cyan
+        Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "模型" -EnglishText "Model"), $Config.ModelName) -ForegroundColor Cyan
         Write-ModelCapabilitiesLine -CapabilityText $Config.ModelCapabilities
-        Write-Host ("Model Path   : {0}" -f (Get-FitText -Text $Config.ModelPath -Width ([Math]::Max(40, $Width - 16))))
+        Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "模型路徑" -EnglishText "Model Path"), (Get-FitText -Text $Config.ModelPath -Width ([Math]::Max(40, $Width - 20))))
         if ([string]::IsNullOrWhiteSpace([string]$Config.VisionMmprojPath)) {
-            Write-Host ("Vision Model : {0}" -f $(if ([string]$Config.VisionSelectionMode -eq "disabled") { "disabled" } else { "none" })) -ForegroundColor DarkGray
+            Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "視覺模型" -EnglishText "Vision Model"), $(if ([string]$Config.VisionSelectionMode -eq "disabled") { Format-BilingualText -ChineseText "已停用" -EnglishText "disabled" } else { "(none)" })) -ForegroundColor DarkGray
         }
         else {
-            Write-Host ("Vision Model : {0}" -f $Config.VisionModelName) -ForegroundColor Cyan
-            Write-Host ("Mmproj Path  : {0}" -f (Get-FitText -Text $Config.VisionMmprojPath -Width ([Math]::Max(40, $Width - 16))))
+            Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "視覺模型" -EnglishText "Vision Model"), $Config.VisionModelName) -ForegroundColor Cyan
+            Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "Mmproj 路徑" -EnglishText "Mmproj Path"), (Get-FitText -Text $Config.VisionMmprojPath -Width ([Math]::Max(40, $Width - 20))))
         }
         Write-Host ""
-        Write-Host "Esc returns to the main menu. Start Launch begins with the current settings." -ForegroundColor Yellow
+        Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "目前選取" -EnglishText "Selected"), $SelectedItem.Label) -ForegroundColor Cyan
+        Write-WrappedInfoLine -Prefix ((Format-BilingualText -ChineseText "功能" -EnglishText "What it does") + " : ") -Text $SelectedHelp.Purpose
+        Write-WrappedInfoLine -Prefix ((Format-BilingualText -ChineseText "建議" -EnglishText "Recommended") + " : ") -Text $SelectedHelp.Recommendation
+        Write-Host ""
+        Write-Host (Format-BilingualText -ChineseText "Esc 返回主選單，開始啟動會用目前設定直接啟動。" -EnglishText "Esc returns to the main menu. Start Launch begins with the current settings.") -ForegroundColor Yellow
 
         $Key = Read-ConsoleKey
         switch ($Key.VirtualKeyCode) {
@@ -5212,6 +6267,37 @@ function Show-LaunchConfigGrid {
             }
             13 {
                 $SelectedItem = $Items[$SelectedIndex]
+                if ($SelectedItem.Type -eq "actionAutoTuneApply") {
+                    try {
+                        $ApplyResult = Apply-AutoTuneLearnedValuesToConfig -Config $Config
+                        Write-Host ""
+                        Write-Host $ApplyResult.Message -ForegroundColor $(if ($ApplyResult.Applied) { "Green" } else { "Yellow" })
+                        Start-Sleep -Seconds 2
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
+                if ($SelectedItem.Type -eq "actionSave") {
+                    try {
+                        $ProfileName = Prompt-SavedLaunchProfileName -Config $Config
+                        if (-not [string]::IsNullOrWhiteSpace([string]$ProfileName)) {
+                            $SaveResult = Save-SavedLaunchProfile -Config $Config -ProfileName $ProfileName
+                            Write-Host ""
+                            Write-Host (Format-BilingualText -ChineseText ("已儲存設定檔：{0}" -f $SaveResult.Name) -EnglishText ("Saved profile: {0}" -f $SaveResult.Name)) -ForegroundColor Green
+                            Start-Sleep -Seconds 1
+                        }
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
                 if ($SelectedItem.Type -eq "actionStart") {
                     return $Config
                 }
@@ -5230,6 +6316,37 @@ function Show-LaunchConfigGrid {
             }
             32 {
                 $SelectedItem = $Items[$SelectedIndex]
+                if ($SelectedItem.Type -eq "actionAutoTuneApply") {
+                    try {
+                        $ApplyResult = Apply-AutoTuneLearnedValuesToConfig -Config $Config
+                        Write-Host ""
+                        Write-Host $ApplyResult.Message -ForegroundColor $(if ($ApplyResult.Applied) { "Green" } else { "Yellow" })
+                        Start-Sleep -Seconds 2
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
+                if ($SelectedItem.Type -eq "actionSave") {
+                    try {
+                        $ProfileName = Prompt-SavedLaunchProfileName -Config $Config
+                        if (-not [string]::IsNullOrWhiteSpace([string]$ProfileName)) {
+                            $SaveResult = Save-SavedLaunchProfile -Config $Config -ProfileName $ProfileName
+                            Write-Host ""
+                            Write-Host (Format-BilingualText -ChineseText ("已儲存設定檔：{0}" -f $SaveResult.Name) -EnglishText ("Saved profile: {0}" -f $SaveResult.Name)) -ForegroundColor Green
+                            Start-Sleep -Seconds 1
+                        }
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
                 if ($SelectedItem.Type -eq "actionStart") {
                     return $Config
                 }
@@ -5299,25 +6416,19 @@ function Apply-LaunchSelection {
 
 function Wait-MenuContinue {
     Write-Host ""
-    Write-Host "Press Enter to return to the launcher..." -ForegroundColor Yellow
+    Write-Host (Format-BilingualText -ChineseText "按 Enter 回到啟動器..." -EnglishText "Press Enter to return to the launcher...") -ForegroundColor Yellow
     Read-Host | Out-Null
 }
 
 function Show-LiveServerStatusView {
-    param(
-        [int]$RefreshIntervalSec = 15
-    )
-
-    $RefreshIntervalSec = [Math]::Max(1, $RefreshIntervalSec)
-
     while ($true) {
         $UpdatedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        Show-MenuHeader -Title "Server Status" -Subtitle ("Current tracked server state. Auto-refresh every {0}s. Updated {1}." -f $RefreshIntervalSec, $UpdatedAt)
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "服務狀態" -EnglishText "Server Status") -Subtitle (Format-BilingualText -ChineseText ("目前追蹤中的服務狀態快照，更新時間 {0}。" -f $UpdatedAt) -EnglishText ("Current tracked server snapshot. Updated {0}." -f $UpdatedAt))
         Show-ServerStatus
         Write-Host ""
-        Write-Host ("Auto-refresh every {0} seconds. Press Enter or Esc to return." -f $RefreshIntervalSec) -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "按 R 重新整理，按 Enter 或 Esc 返回。" -EnglishText "Press R to refresh. Press Enter or Esc to return.") -ForegroundColor Yellow
 
-        $Action = Wait-StatusViewAction -RefreshIntervalSec $RefreshIntervalSec
+        $Action = Wait-StatusViewAction
         if ($Action -eq "Exit") {
             return
         }
@@ -5327,17 +6438,17 @@ function Show-LiveServerStatusView {
 function Stop-TrackedServer {
     $GuardResult = Invoke-WorkspaceRuntimeGuard
     if ($GuardResult.RemainingIds.Count -gt 0) {
-        throw "Illegal runtime process(es) could not be cleared: $($GuardResult.RemainingIds -join ', ')"
+        throw (Format-BilingualText -ChineseText ("無法清除非法執行中的程序：{0}" -f ($GuardResult.RemainingIds -join ', ')) -EnglishText ("Illegal runtime process(es) could not be cleared: {0}" -f ($GuardResult.RemainingIds -join ', ')))
     }
 
     $LiveState = Get-LiveRuntimeOwnerState
     $TrackedProcess = Get-TrackedServerProcess
     if (-not $TrackedProcess) {
         if ($GuardResult.StoppedIds.Count -gt 0) {
-            Write-Host "No tracked llama.cpp server is running. Illegal runtime process(es) were cleared." -ForegroundColor Yellow
+            Write-Host (Format-BilingualText -ChineseText "目前沒有追蹤中的 llama.cpp 服務，已清除非法執行中的程序。" -EnglishText "No tracked llama.cpp server is running. Illegal runtime process(es) were cleared.") -ForegroundColor Yellow
         }
         else {
-            Write-Host "No tracked llama.cpp server is running." -ForegroundColor Yellow
+            Write-Host (Format-BilingualText -ChineseText "目前沒有追蹤中的 llama.cpp 服務。" -EnglishText "No tracked llama.cpp server is running.") -ForegroundColor Yellow
         }
         return
     }
@@ -5362,16 +6473,16 @@ function Stop-TrackedServer {
     $RemainingIds = Wait-ForProcessExit -ProcessIds @($TargetIds | Select-Object -Unique) -TimeoutSec $ServerCleanupTimeoutSec
     Remove-RuntimeOwnershipArtifacts
     if ($RemainingIds.Count -gt 0) {
-        throw "Tracked llama.cpp server is still shutting down: $($RemainingIds -join ', ')"
+        throw (Format-BilingualText -ChineseText ("追蹤中的 llama.cpp 服務仍在關閉中：{0}" -f ($RemainingIds -join ', ')) -EnglishText ("Tracked llama.cpp server is still shutting down: {0}" -f ($RemainingIds -join ', ')))
     }
 
     if (-not (Wait-ForPortRelease -TimeoutSec $ServerCleanupTimeoutSec)) {
         $Listener = Test-PortInUse
-        throw "Port $Port is still in use by PID $($Listener.OwningProcess) after stopping the tracked server."
+        throw (Format-BilingualText -ChineseText ("停止追蹤中的服務後，連接埠 $Port 仍由 PID $($Listener.OwningProcess) 佔用。" ) -EnglishText ("Port $Port is still in use by PID $($Listener.OwningProcess) after stopping the tracked server."))
     }
 
     Start-Sleep -Milliseconds $ServerCleanupSettleMs
-    Write-Host "Stopped llama.cpp server. PID: $($TrackedProcess.Id)" -ForegroundColor Green
+    Write-BilingualField -ChineseLabel "已停止服務" -EnglishLabel "Stopped Server" -ChineseValue ("PID {0}" -f $TrackedProcess.Id) -EnglishValue ("PID {0}" -f $TrackedProcess.Id) -ForegroundColor Green
 }
 
 function Invoke-InteractiveLauncher {
@@ -5393,18 +6504,29 @@ function Invoke-InteractiveLauncher {
                     continue
                 }
 
-                $LaunchMode = Show-LaunchModeMenu
-                if (-not $LaunchMode -or $LaunchMode -eq "Back") {
+                $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $LlamaArgs
+                $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
+                $SavedProfileSelection = Show-QuickStartSavedProfileMenu -ModelEntry $ModelEntry
+                if ($SavedProfileSelection.Action -eq "Back") {
                     continue
                 }
 
-                $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $LlamaArgs
-                $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
-                $Config.LaunchMode = $LaunchMode
-                if ($LaunchMode -eq "Open Web UI") {
-                    $Config.OpenPath = "/"
+                if ($SavedProfileSelection.Action -eq "UseProfile" -and $SavedProfileSelection.Profile) {
+                    Apply-SavedLaunchProfileToConfig -Config $Config -Profile $SavedProfileSelection.Profile -IndexPath $IndexPath
                 }
-                Edit-VisionModelSelection -Config $Config -IndexPath $IndexPath
+                else {
+                    $LaunchMode = Show-LaunchModeMenu
+                    if (-not $LaunchMode -or $LaunchMode -eq "Back") {
+                        continue
+                    }
+
+                    $Config.LaunchMode = $LaunchMode
+                    if ($LaunchMode -eq "Open Web UI") {
+                        $Config.OpenPath = "/"
+                    }
+
+                    Edit-VisionModelSelection -Config $Config -IndexPath $IndexPath
+                }
 
                 Apply-LaunchSelection -Config $Config
                 return $true
@@ -5430,10 +6552,10 @@ function Invoke-InteractiveLauncher {
                 return $true
             }
             "Status" {
-                Show-LiveServerStatusView -RefreshIntervalSec 15
+                Show-LiveServerStatusView
             }
             "Stop" {
-                Show-MenuHeader -Title "Stop Running Server" -Subtitle "Stopping the tracked llama.cpp server if one exists."
+                Show-MenuHeader -Title (Format-BilingualText -ChineseText "停止目前服務" -EnglishText "Stop Running Server") -Subtitle (Format-BilingualText -ChineseText "如果目前有被追蹤的 llama.cpp 服務，現在會將它停止。" -EnglishText "Stopping the tracked llama.cpp server if one exists.")
                 Stop-TrackedServer
                 Wait-MenuContinue
             }
@@ -5633,6 +6755,10 @@ function Get-TrackedServerLaunchSettings {
             Device           = ""
             SplitMode        = ""
             TensorSplit      = ""
+            ReasoningMode    = ""
+            ReasoningBudget  = ""
+            SpecType         = ""
+            SpecDraftNMax    = ""
             Temperature      = ""
             TopK             = ""
             TopP             = ""
@@ -5692,6 +6818,18 @@ function Get-TrackedServerLaunchSettings {
                 }
                 '^--tensor-split(?:=(.+))?$' {
                     $Settings.TensorSplit = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^(?:-rea|--reasoning)(?:=(.+))?$' {
+                    $Settings.ReasoningMode = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--reasoning-budget(?:=(.+))?$' {
+                    $Settings.ReasoningBudget = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--spec-type(?:=(.+))?$' {
+                    $Settings.SpecType = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--spec-draft-n-max(?:=(.+))?$' {
+                    $Settings.SpecDraftNMax = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
                 }
                 '^--temp(?:erature)?(?:=(.+))?$' {
                     $Settings.Temperature = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
@@ -6225,19 +7363,19 @@ function Stop-WorkspaceServerProcesses {
     Remove-RuntimeOwnershipArtifacts
 
     if ($StoppedIds.Count -gt 0) {
-        Write-Host "Cleaned old llama.cpp server process(es): $($StoppedIds -join ', ')" -ForegroundColor Yellow
+        Write-BilingualField -ChineseLabel "清理舊程序" -EnglishLabel "Cleanup" -ChineseValue ("已清理舊的 llama.cpp 服務程序：{0}" -f ($StoppedIds -join ', ')) -EnglishValue ("Cleaned old llama.cpp server process(es): {0}" -f ($StoppedIds -join ', ')) -ForegroundColor Yellow
     }
 
     $RemainingIds = Wait-ForProcessExit -ProcessIds $TargetIds -TimeoutSec $ServerCleanupTimeoutSec
     if ($RemainingIds.Count -gt 0) {
-        throw "Some old llama.cpp server process(es) did not exit cleanly: $($RemainingIds -join ', ')"
+        throw (Format-BilingualText -ChineseText ("部分舊的 llama.cpp 服務程序未正常結束：{0}" -f ($RemainingIds -join ', ')) -EnglishText ("Some old llama.cpp server process(es) did not exit cleanly: {0}" -f ($RemainingIds -join ', ')))
     }
 
     $UnloadedAt = Get-Date
 
     if (-not (Wait-ForPortRelease -TimeoutSec $ServerCleanupTimeoutSec)) {
         $Listener = Test-PortInUse
-        throw "Port $Port is still in use by PID $($Listener.OwningProcess) after cleaning old llama.cpp processes."
+        throw (Format-BilingualText -ChineseText ("清理舊的 llama.cpp 程序後，連接埠 $Port 仍由 PID $($Listener.OwningProcess) 佔用。" ) -EnglishText ("Port $Port is still in use by PID $($Listener.OwningProcess) after cleaning old llama.cpp processes."))
     }
 
     if ($TargetIds.Count -gt 0) {
@@ -6537,10 +7675,10 @@ function Format-BackgroundStartupStageSegment {
     )
 
     $StateText = switch ($State) {
-        "done" { "done" }
-        "loading" { "loading" }
-        "skipped" { "skipped" }
-        default { "waiting" }
+        "done" { Format-BilingualText -ChineseText "完成" -EnglishText "done" }
+        "loading" { Format-BilingualText -ChineseText "載入中" -EnglishText "loading" }
+        "skipped" { Format-BilingualText -ChineseText "略過" -EnglishText "skipped" }
+        default { Format-BilingualText -ChineseText "等待中" -EnglishText "waiting" }
     }
 
     $Segment = "{0}:{1}" -f $Label, $StateText
@@ -6559,10 +7697,10 @@ function Get-BackgroundStartupProgressPrefix {
 
     $SpinnerFrames = @("|", "/", "-", "\")
     if ($Ready) {
-        return "Ready     "
+        return Format-BilingualText -ChineseText "就緒" -EnglishText "Ready"
     }
 
-    return "Loading {0}" -f $SpinnerFrames[$Tick % $SpinnerFrames.Count]
+    return (Format-BilingualText -ChineseText ("載入中 {0}" -f $SpinnerFrames[$Tick % $SpinnerFrames.Count]) -EnglishText ("Loading {0}" -f $SpinnerFrames[$Tick % $SpinnerFrames.Count]))
 }
 
 function Get-BackgroundStartupStageSegments {
@@ -6572,19 +7710,19 @@ function Get-BackgroundStartupStageSegments {
 
     return @(
         [pscustomobject]@{
-            Text      = Format-BackgroundStartupStageSegment -Label "Disk" -State $ProgressInfo.DiskState -Detail $ProgressInfo.DiskDetail
+            Text      = Format-BackgroundStartupStageSegment -Label (Format-BilingualText -ChineseText "磁碟" -EnglishText "Disk") -State $ProgressInfo.DiskState -Detail $ProgressInfo.DiskDetail
             Highlight = $ProgressInfo.DiskState -eq "done"
         },
         [pscustomobject]@{
-            Text      = Format-BackgroundStartupStageSegment -Label "RAM" -State $ProgressInfo.MemoryState -Detail $ProgressInfo.MemoryDetail
+            Text      = Format-BackgroundStartupStageSegment -Label (Format-BilingualText -ChineseText "記憶體" -EnglishText "RAM") -State $ProgressInfo.MemoryState -Detail $ProgressInfo.MemoryDetail
             Highlight = $ProgressInfo.MemoryState -eq "done"
         },
         [pscustomobject]@{
-            Text      = Format-BackgroundStartupStageSegment -Label "GPU" -State $ProgressInfo.GpuState -Detail $ProgressInfo.GpuDetail
+            Text      = Format-BackgroundStartupStageSegment -Label (Format-BilingualText -ChineseText "GPU" -EnglishText "GPU") -State $ProgressInfo.GpuState -Detail $ProgressInfo.GpuDetail
             Highlight = $ProgressInfo.GpuState -eq "done"
         },
         [pscustomobject]@{
-            Text      = Format-BackgroundStartupStageSegment -Label "Server" -State $ProgressInfo.ServiceState -Detail $ProgressInfo.ServiceDetail
+            Text      = Format-BackgroundStartupStageSegment -Label (Format-BilingualText -ChineseText "服務" -EnglishText "Server") -State $ProgressInfo.ServiceState -Detail $ProgressInfo.ServiceDetail
             Highlight = $ProgressInfo.ServiceState -eq "done"
         }
     )
@@ -6791,12 +7929,12 @@ function Wait-ForBackgroundServerReadyWithProgress {
                 $FailureLog = Get-LogTailText -Path $StdOutLog
             }
 
-            if (-not $FailureLog) {
-                $FailureLog = "No startup log output was captured."
-            }
+        if (-not $FailureLog) {
+            $FailureLog = Format-BilingualText -ChineseText "沒有捕捉到任何啟動記錄輸出。" -EnglishText "No startup log output was captured."
+        }
 
-            Remove-TrackedPidFiles
-            throw "llama.cpp exited during model startup (PID $($Process.Id)). Last log lines:`n$FailureLog"
+        Remove-TrackedPidFiles
+        throw (Format-BilingualText -ChineseText ("llama.cpp 在模型啟動期間已結束（PID $($Process.Id)）。最後幾行記錄如下：`n$FailureLog") -EnglishText ("llama.cpp exited during model startup (PID $($Process.Id)). Last log lines:`n$FailureLog"))
         }
 
         if ($Deadline -and (Get-Date) -ge $Deadline) {
@@ -6933,11 +8071,11 @@ function Wait-ForBackgroundServerStartup {
         }
 
         if (-not $FailureLog) {
-            $FailureLog = "No startup log output was captured."
+            $FailureLog = Format-BilingualText -ChineseText "沒有捕捉到任何啟動記錄輸出。" -EnglishText "No startup log output was captured."
         }
 
         Remove-TrackedPidFiles
-        throw "llama.cpp exited during model startup (PID $($Process.Id), exit code $ObservedExitCodeLabel). Last log lines:`n$FailureLog"
+        throw (Format-BilingualText -ChineseText ("llama.cpp 在模型啟動期間已結束（PID $($Process.Id)，結束碼 $ObservedExitCodeLabel）。最後幾行記錄如下：`n$FailureLog") -EnglishText ("llama.cpp exited during model startup (PID $($Process.Id), exit code $ObservedExitCodeLabel). Last log lines:`n$FailureLog"))
     }
 
     return [pscustomobject]@{
@@ -6955,7 +8093,7 @@ function Open-BrowserWhenReady {
         Start-Process "$BaseUrl$OpenPath"
     }
     else {
-        Write-Host "Server started, but browser auto-open timed out after $ReadyTimeoutSec seconds." -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText ("服務已啟動，但瀏覽器自動開啟在 $ReadyTimeoutSec 秒後逾時。") -EnglishText ("Server started, but browser auto-open timed out after $ReadyTimeoutSec seconds.")) -ForegroundColor Yellow
     }
 }
 
@@ -7034,11 +8172,11 @@ function Test-TcpPort {
 function Show-ServerStatus {
     $GuardResult = Invoke-WorkspaceRuntimeGuard -Quiet
     if ($GuardResult.RemainingIds.Count -gt 0) {
-        throw "Illegal runtime process(es) could not be cleared: $($GuardResult.RemainingIds -join ', ')"
+        throw (Format-BilingualText -ChineseText ("無法清除非法執行中的程序：{0}" -f ($GuardResult.RemainingIds -join ', ')) -EnglishText ("Illegal runtime process(es) could not be cleared: {0}" -f ($GuardResult.RemainingIds -join ', ')))
     }
 
     if ($GuardResult.StoppedIds.Count -gt 0) {
-        Write-Host "Guard  : cleared illegal runtime process(es): $($GuardResult.StoppedIds -join ', ')" -ForegroundColor Yellow
+        Write-BilingualField -ChineseLabel "守護檢查" -EnglishLabel "Guard" -ChineseValue ("已清除非法執行中的程序：{0}" -f ($GuardResult.StoppedIds -join ', ')) -EnglishValue ("cleared illegal runtime process(es): {0}" -f ($GuardResult.StoppedIds -join ', ')) -ForegroundColor Yellow
     }
 
     $TrackedProcess = Get-TrackedServerProcess
@@ -7062,63 +8200,79 @@ function Show-ServerStatus {
         $TrackedRuntimeProperties = Get-TrackedServerRuntimeProperties -ServerBaseUrl $TrackedBaseUrl
         $TrackedGpuOffloadInfo = Get-GpuOffloadInfo -Process $TrackedProcess
         $TrackedTokenSnapshot = Get-LlamaRuntimeTokenSnapshot -LogPath $TrackedLogPaths.StdErrLog
-        Write-Host "Status : running$(if ($IsUntrackedWorkspaceServer) { ' (untracked)' } else { '' })" -ForegroundColor Green
-        Write-Host "PID    : $($TrackedProcess.Id)"
+        Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "Status" -ChineseValue $("運行中" + $(if ($IsUntrackedWorkspaceServer) { "（未追蹤）" } else { "" })) -EnglishValue $("running" + $(if ($IsUntrackedWorkspaceServer) { " (untracked)" } else { "" })) -ForegroundColor Green
+        Write-BilingualField -ChineseLabel "程序編號" -EnglishLabel "PID" -ChineseValue ([string]$TrackedProcess.Id) -EnglishValue ([string]$TrackedProcess.Id)
         if ($IsUntrackedWorkspaceServer) {
-            Write-Host "Track  : PID file missing; discovered workspace llama-server.exe process."
+            Write-Host (Format-BilingualField -ChineseLabel "追蹤" -EnglishLabel "Track" -ChineseValue "PID 檔遺失；已發現工作目錄中的 llama-server.exe 程序。" -EnglishValue "PID file missing; discovered workspace llama-server.exe process.")
         }
-        Write-Host "URL    : $TrackedBaseUrl"
-        Write-Host "Port   : $TrackedPort"
-        Write-Host "Server : $ServerExe"
+        Write-BilingualField -ChineseLabel "網址" -EnglishLabel "URL" -ChineseValue $TrackedBaseUrl -EnglishValue $TrackedBaseUrl
+        Write-BilingualField -ChineseLabel "連接埠" -EnglishLabel "Port" -ChineseValue ([string]$TrackedPort) -EnglishValue ([string]$TrackedPort)
+        Write-BilingualField -ChineseLabel "伺服器" -EnglishLabel "Server" -ChineseValue $ServerExe -EnglishValue $ServerExe
         if ($TrackedModelPath) {
-            Write-Host "Model  : $TrackedModelPath"
+            Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue $TrackedModelPath -EnglishValue $TrackedModelPath
         }
         if ($TrackedRuntimeProperties -and -not [string]::IsNullOrWhiteSpace([string]$TrackedRuntimeProperties.model_alias)) {
-            Write-Host "Alias  : $($TrackedRuntimeProperties.model_alias) (runtime model alias)"
+            Write-BilingualField -ChineseLabel "別名" -EnglishLabel "Alias" -ChineseValue ("{0}（執行期模型別名）" -f $TrackedRuntimeProperties.model_alias) -EnglishValue ("{0} (runtime model alias)" -f $TrackedRuntimeProperties.model_alias)
         }
         if ($TrackedSettings) {
             $GenerationSettings = Get-TrackedServerGenerationSettings -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties
-            Write-Host "Ctx    : $(Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties)"
+            Write-BilingualField -ChineseLabel "上下文" -EnglishLabel "Ctx" -ChineseValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties) -EnglishValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties)
             if ($TrackedTokenSnapshot) {
-                Write-Host "Tokens : $(Format-TrackedServerTokenUsageValue -TokenSnapshot $TrackedTokenSnapshot -RuntimeProperties $TrackedRuntimeProperties) last real prompt seen by llama.cpp"
+                $TokenValue = Format-TrackedServerTokenUsageValue -TokenSnapshot $TrackedTokenSnapshot -RuntimeProperties $TrackedRuntimeProperties
+                Write-BilingualField -ChineseLabel "Token" -EnglishLabel "Tokens" -ChineseValue ("{0}，llama.cpp 最近一次看到的真實提示詞" -f $TokenValue) -EnglishValue ("{0} last real prompt seen by llama.cpp" -f $TokenValue)
             }
-            Write-Host "GPU    : $(Format-TrackedServerGpuValue -TrackedSettings $TrackedSettings -GpuOffloadInfo $TrackedGpuOffloadInfo)"
+            $GpuValue = Format-TrackedServerGpuValue -TrackedSettings $TrackedSettings -GpuOffloadInfo $TrackedGpuOffloadInfo
+            Write-BilingualField -ChineseLabel "GPU" -EnglishLabel "GPU" -ChineseValue $GpuValue -EnglishValue $GpuValue
             if ($TrackedGpuOffloadInfo) {
                 $BufferSummary = Format-TrackedServerBufferValue -GpuOffloadInfo $TrackedGpuOffloadInfo
                 if (-not [string]::IsNullOrWhiteSpace($BufferSummary)) {
-                    Write-Host "Buffer : $BufferSummary"
+                    Write-BilingualField -ChineseLabel "緩衝區" -EnglishLabel "Buffer" -ChineseValue $BufferSummary -EnglishValue $BufferSummary
                 }
             }
-            Write-Host "Threads: $(Format-TrackedServerSettingValue -Value $TrackedSettings.Threads -WhenMissing 'server default') CPU threads for token generation (--threads)"
-            Write-Host "Batch  : $(Format-TrackedServerSettingValue -Value $TrackedSettings.ThreadsBatch -WhenMissing 'server default') CPU threads for batch/prefill (--threads-batch)"
+            $ThreadsValue = Format-TrackedServerSettingValue -Value $TrackedSettings.Threads -WhenMissing 'server default'
+            Write-BilingualField -ChineseLabel "執行緒" -EnglishLabel "Threads" -ChineseValue ("{0}，token 生成使用的 CPU 執行緒數（--threads）" -f $ThreadsValue) -EnglishValue ("{0} CPU threads for token generation (--threads)" -f $ThreadsValue)
+            $ThreadsBatchValue = Format-TrackedServerSettingValue -Value $TrackedSettings.ThreadsBatch -WhenMissing 'server default'
+            Write-BilingualField -ChineseLabel "批次執行緒" -EnglishLabel "Batch" -ChineseValue ("{0}，batch/prefill 使用的 CPU 執行緒數（--threads-batch）" -f $ThreadsBatchValue) -EnglishValue ("{0} CPU threads for batch/prefill (--threads-batch)" -f $ThreadsBatchValue)
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.Host)) {
-                Write-Host "Host   : $($TrackedSettings.Host) bind address (--host)"
+                Write-BilingualField -ChineseLabel "綁定位址" -EnglishLabel "Host" -ChineseValue ("{0}（--host）" -f $TrackedSettings.Host) -EnglishValue ("{0} bind address (--host)" -f $TrackedSettings.Host)
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.MmprojPath)) {
-                Write-Host "Mmproj : $($TrackedSettings.MmprojPath) vision projector (--mmproj)"
+                Write-BilingualField -ChineseLabel "Mmproj" -EnglishLabel "Mmproj" -ChineseValue ("{0}，vision projector（--mmproj）" -f $TrackedSettings.MmprojPath) -EnglishValue ("{0} vision projector (--mmproj)" -f $TrackedSettings.MmprojPath)
             }
             $SlotsSummary = Format-TrackedServerSlotsValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties
             if (-not [string]::IsNullOrWhiteSpace($SlotsSummary)) {
-                Write-Host "Slots  : $SlotsSummary"
+                Write-BilingualField -ChineseLabel "並行槽位" -EnglishLabel "Slots" -ChineseValue $SlotsSummary -EnglishValue $SlotsSummary
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.FitTarget)) {
-                Write-Host "Fit    : $($TrackedSettings.FitTarget) MiB target free-VRAM margin (--fit-target)"
+                Write-BilingualField -ChineseLabel "顯存保留" -EnglishLabel "Fit" -ChineseValue ("{0} MiB 目標剩餘 VRAM 邊界（--fit-target）" -f $TrackedSettings.FitTarget) -EnglishValue ("{0} MiB target free-VRAM margin (--fit-target)" -f $TrackedSettings.FitTarget)
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.CacheRam)) {
-                Write-Host "Cache  : $($TrackedSettings.CacheRam) MiB prompt cache RAM limit (--cache-ram)"
+                Write-BilingualField -ChineseLabel "快取" -EnglishLabel "Cache" -ChineseValue ("{0} MiB 提示詞快取 RAM 上限（--cache-ram）" -f $TrackedSettings.CacheRam) -EnglishValue ("{0} MiB prompt cache RAM limit (--cache-ram)" -f $TrackedSettings.CacheRam)
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.Device)) {
-                Write-Host "Device : $($TrackedSettings.Device) target accelerator selection (--device)"
+                Write-BilingualField -ChineseLabel "裝置" -EnglishLabel "Device" -ChineseValue ("{0}，目標加速器選擇（--device）" -f $TrackedSettings.Device) -EnglishValue ("{0} target accelerator selection (--device)" -f $TrackedSettings.Device)
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SplitMode)) {
-                Write-Host "Split  : $($TrackedSettings.SplitMode) multi-GPU split mode (--split-mode)"
+                Write-BilingualField -ChineseLabel "分割模式" -EnglishLabel "Split" -ChineseValue ("{0}，多 GPU 分割模式（--split-mode）" -f $TrackedSettings.SplitMode) -EnglishValue ("{0} multi-GPU split mode (--split-mode)" -f $TrackedSettings.SplitMode)
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.TensorSplit)) {
-                Write-Host "Tensor : $($TrackedSettings.TensorSplit) tensor distribution (--tensor-split)"
+                Write-BilingualField -ChineseLabel "Tensor 分配" -EnglishLabel "Tensor" -ChineseValue ("{0}，tensor 分布（--tensor-split）" -f $TrackedSettings.TensorSplit) -EnglishValue ("{0} tensor distribution (--tensor-split)" -f $TrackedSettings.TensorSplit)
             }
-            Write-Host "Metrics: $(if ($TrackedSettings.Metrics) { 'on' } else { 'off' }) (Prometheus /metrics endpoint)"
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ReasoningMode)) {
+                Write-BilingualField -ChineseLabel "推理模式" -EnglishLabel "Think" -ChineseValue ("{0}，推理模式（--reasoning）" -f $TrackedSettings.ReasoningMode) -EnglishValue ("{0} reasoning mode (--reasoning)" -f $TrackedSettings.ReasoningMode)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ReasoningBudget)) {
+                Write-BilingualField -ChineseLabel "思考預算" -EnglishLabel "Budget" -ChineseValue ("{0}，思考 token 預算（--reasoning-budget）" -f $TrackedSettings.ReasoningBudget) -EnglishValue ("{0} thinking token budget (--reasoning-budget)" -f $TrackedSettings.ReasoningBudget)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecType)) {
+                Write-BilingualField -ChineseLabel "MTP" -EnglishLabel "MTP" -ChineseValue ("{0}，推測式解碼模式（--spec-type）" -f $TrackedSettings.SpecType) -EnglishValue ("{0} speculative decoding mode (--spec-type)" -f $TrackedSettings.SpecType)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftNMax)) {
+                Write-BilingualField -ChineseLabel "草稿 Token 上限" -EnglishLabel "Draft" -ChineseValue ("{0}，最大推測 token 數（--spec-draft-n-max）" -f $TrackedSettings.SpecDraftNMax) -EnglishValue ("{0} max speculative tokens (--spec-draft-n-max)" -f $TrackedSettings.SpecDraftNMax)
+            }
+            Write-BilingualField -ChineseLabel "監控指標" -EnglishLabel "Metrics" -ChineseValue $(if ($TrackedSettings.Metrics) { "開啟（Prometheus /metrics 端點）" } else { "關閉（Prometheus /metrics 端點）" }) -EnglishValue $(if ($TrackedSettings.Metrics) { "on (Prometheus /metrics endpoint)" } else { "off (Prometheus /metrics endpoint)" })
             if ($TrackedSettings.ApiKey) {
-                Write-Host "API Key: set (request authentication enabled)"
+                Write-BilingualField -ChineseLabel "API 金鑰" -EnglishLabel "API Key" -ChineseValue "已設定（已啟用請求驗證）" -EnglishValue "set (request authentication enabled)"
             }
             $SamplingParts = New-Object System.Collections.Generic.List[string]
             $TemperatureText = Format-TrackedServerScalarValue -Value $GenerationSettings.Temperature
@@ -7138,7 +8292,7 @@ function Show-ServerStatus {
                 $SamplingParts.Add("min-p $MinPText")
             }
             if ($SamplingParts.Count -gt 0) {
-                Write-Host "Sample : $($SamplingParts -join ' | ')"
+                Write-BilingualField -ChineseLabel "取樣" -EnglishLabel "Sample" -ChineseValue ($SamplingParts -join ' | ') -EnglishValue ($SamplingParts -join ' | ')
             }
 
             $PenaltyParts = New-Object System.Collections.Generic.List[string]
@@ -7161,52 +8315,52 @@ function Show-ServerStatus {
                 }
             }
             if ($PenaltyParts.Count -gt 0) {
-                Write-Host "Penalty: $($PenaltyParts -join ' | ')"
+                Write-BilingualField -ChineseLabel "懲罰" -EnglishLabel "Penalty" -ChineseValue ($PenaltyParts -join ' | ') -EnglishValue ($PenaltyParts -join ' | ')
             }
 
             $SeedText = Format-TrackedServerScalarValue -Value $GenerationSettings.Seed
             if (-not [string]::IsNullOrWhiteSpace($SeedText)) {
-                Write-Host "Seed   : $SeedText RNG seed"
+                Write-BilingualField -ChineseLabel "隨機種子" -EnglishLabel "Seed" -ChineseValue ("{0}，RNG 種子" -f $SeedText) -EnglishValue ("{0} RNG seed" -f $SeedText)
             }
 
             $StreamText = Format-TrackedServerScalarValue -Value $GenerationSettings.Stream
             if (-not [string]::IsNullOrWhiteSpace($StreamText)) {
-                Write-Host "Stream : $StreamText token streaming"
+                Write-BilingualField -ChineseLabel "串流" -EnglishLabel "Stream" -ChineseValue ("{0}，token 串流" -f $StreamText) -EnglishValue ("{0} token streaming" -f $StreamText)
             }
 
             if (-not [string]::IsNullOrWhiteSpace([string]$GenerationSettings.SamplerChain)) {
-                Write-Host "Sampler: $($GenerationSettings.SamplerChain)"
+                Write-BilingualField -ChineseLabel "取樣器鏈" -EnglishLabel "Sampler" -ChineseValue $GenerationSettings.SamplerChain -EnglishValue $GenerationSettings.SamplerChain
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ExtraArgs)) {
-                Write-Host "Extra  : $($TrackedSettings.ExtraArgs)"
+                Write-BilingualField -ChineseLabel "額外參數" -EnglishLabel "Extra" -ChineseValue $TrackedSettings.ExtraArgs -EnglishValue $TrackedSettings.ExtraArgs
             }
         }
         if ($TrackedRuntimeProperties) {
-            Write-Host "Web UI : $(if ($TrackedRuntimeProperties.webui) { 'on' } else { 'off' }) (built-in browser UI)"
-            Write-Host "State  : $(if ($TrackedRuntimeProperties.is_sleeping) { 'sleeping' } else { 'awake' })"
+            Write-BilingualField -ChineseLabel "Web UI" -EnglishLabel "Web UI" -ChineseValue $(if ($TrackedRuntimeProperties.webui) { "開啟（內建瀏覽器介面）" } else { "關閉（內建瀏覽器介面）" }) -EnglishValue $(if ($TrackedRuntimeProperties.webui) { "on (built-in browser UI)" } else { "off (built-in browser UI)" })
+            Write-BilingualField -ChineseLabel "狀態細節" -EnglishLabel "State" -ChineseValue $(if ($TrackedRuntimeProperties.is_sleeping) { "休眠" } else { "喚醒" }) -EnglishValue $(if ($TrackedRuntimeProperties.is_sleeping) { "sleeping" } else { "awake" })
             if (-not [string]::IsNullOrWhiteSpace([string]$TrackedRuntimeProperties.build_info)) {
-                Write-Host "Build  : $($TrackedRuntimeProperties.build_info) (llama.cpp build)"
+                Write-BilingualField -ChineseLabel "建置" -EnglishLabel "Build" -ChineseValue ("{0}（llama.cpp 建置）" -f $TrackedRuntimeProperties.build_info) -EnglishValue ("{0} (llama.cpp build)" -f $TrackedRuntimeProperties.build_info)
             }
         }
         if ($TrackedSettings -and -not [string]::IsNullOrWhiteSpace($TrackedSettings.MmprojPath)) {
-            Write-Host "Vision : enabled on primary server | mmproj $($TrackedSettings.MmprojPath)" -ForegroundColor Green
+            Write-BilingualField -ChineseLabel "視覺" -EnglishLabel "Vision" -ChineseValue ("主服務已啟用 | mmproj $($TrackedSettings.MmprojPath)") -EnglishValue ("enabled on primary server | mmproj $($TrackedSettings.MmprojPath)") -ForegroundColor Green
         }
         else {
-            Write-Host "Vision : disabled" -ForegroundColor DarkGray
+            Write-BilingualField -ChineseLabel "視覺" -EnglishLabel "Vision" -ChineseValue "已停用" -EnglishValue "disabled" -ForegroundColor DarkGray
         }
-        Write-Host "Logs   : $($TrackedLogPaths.StdOutLog)"
-        Write-Host "Error  : $($TrackedLogPaths.StdErrLog)"
+        Write-BilingualField -ChineseLabel "輸出記錄" -EnglishLabel "Logs" -ChineseValue $TrackedLogPaths.StdOutLog -EnglishValue $TrackedLogPaths.StdOutLog
+        Write-BilingualField -ChineseLabel "錯誤記錄" -EnglishLabel "Error" -ChineseValue $TrackedLogPaths.StdErrLog -EnglishValue $TrackedLogPaths.StdErrLog
         return
     }
 
     if ($Listener) {
-        Write-Host "Status : port in use by PID $($Listener.OwningProcess), but not tracked by this script." -ForegroundColor Yellow
-        Write-Host "Port   : $Port"
+        Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "Status" -ChineseValue ("連接埠目前由 PID $($Listener.OwningProcess) 佔用，但不是由這支腳本追蹤。" ) -EnglishValue ("port in use by PID $($Listener.OwningProcess), but not tracked by this script.") -ForegroundColor Yellow
+        Write-BilingualField -ChineseLabel "連接埠" -EnglishLabel "Port" -ChineseValue ([string]$Port) -EnglishValue ([string]$Port)
         return
     }
 
-    Write-Host "Status : stopped" -ForegroundColor Yellow
-    Write-Host "Vision : no running llama.cpp server" -ForegroundColor DarkGray
+    Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "Status" -ChineseValue "已停止" -EnglishValue "stopped" -ForegroundColor Yellow
+    Write-BilingualField -ChineseLabel "視覺" -EnglishLabel "Vision" -ChineseValue "目前沒有執行中的 llama.cpp 服務" -EnglishValue "no running llama.cpp server" -ForegroundColor DarkGray
 }
 
 $PendingSwitchTimingContext = $null
@@ -7224,7 +8378,7 @@ try {
     Test-LlamaArgConflict -Arguments $LlamaArgs
 
     if (-not (Test-Path -LiteralPath $ServerExe)) {
-        throw "Cannot find llama-server.exe: $ServerExe. Put llama.cpp binaries in '$PreferredBinRoot'."
+        throw (Format-BilingualText -ChineseText ("找不到 llama-server.exe：$ServerExe。請把 llama.cpp 執行檔放到 '$PreferredBinRoot'。") -EnglishText ("Cannot find llama-server.exe: $ServerExe. Put llama.cpp binaries in '$PreferredBinRoot'."))
     }
 
     if ($LlamaHelp) {
@@ -7238,7 +8392,7 @@ try {
     }
 
     if ($ShowGpuOffload) {
-        Write-Host "Note   : -ShowGpuOffload now routes to the richer -Status view." -ForegroundColor Yellow
+        Write-Host (Format-BilingualField -ChineseLabel "說明" -EnglishLabel "Note" -ChineseValue "-ShowGpuOffload 現在會導向資訊更完整的 -Status 檢視。" -EnglishValue "-ShowGpuOffload now routes to the richer -Status view.") -ForegroundColor Yellow
         Show-ServerStatus
         return
     }
@@ -7274,10 +8428,10 @@ try {
     $ThreadsBatch = $ResolvedThreads.ThreadsBatch
     $BaseUrl = "http://127.0.0.1:$Port"
 
-    Write-Host "Checking files..." -ForegroundColor Cyan
+    Write-Host (Format-BilingualText -ChineseText "正在檢查檔案..." -EnglishText "Checking files...") -ForegroundColor Cyan
 
     if (-not (Test-Path -LiteralPath $ModelPath)) {
-        throw "Cannot find model file: $ModelPath"
+        throw (Format-BilingualText -ChineseText ("找不到模型檔案：{0}" -f $ModelPath) -EnglishText ("Cannot find model file: {0}" -f $ModelPath))
     }
 
     $ServerStopInfo = Stop-WorkspaceServerProcesses
@@ -7290,57 +8444,57 @@ try {
 
     $Listener = Test-PortInUse
     if ($Listener) {
-        throw "Port $Port is already in use by PID $($Listener.OwningProcess)."
+        throw (Format-BilingualText -ChineseText ("連接埠 $Port 已被 PID $($Listener.OwningProcess) 佔用。" ) -EnglishText ("Port $Port is already in use by PID $($Listener.OwningProcess)."))
     }
 
     $AutoLaunchTuning = Get-AutoLaunchTuning -ResolvedModelPath $ModelPath -RequestedGpuLayers $GpuLayers -Arguments $LlamaArgs -UseExtremeMode $ExtremeMode -EnableAutoTune $AutoTune
 
-    Write-Host "Starting llama.cpp server..." -ForegroundColor Green
-    Write-Host "Server : $ServerExe"
-    Write-Host "Model  : $ModelPath"
+    Write-Host (Format-BilingualText -ChineseText "正在啟動 llama.cpp 服務..." -EnglishText "Starting llama.cpp server...") -ForegroundColor Green
+    Write-BilingualField -ChineseLabel "伺服器" -EnglishLabel "Server" -ChineseValue $ServerExe -EnglishValue $ServerExe
+    Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue $ModelPath -EnglishValue $ModelPath
     $LaunchMmprojPath = Resolve-LaunchMmprojPath -ModelPath $ModelPath -ModelEntry $LaunchModelEntry
     if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
-        Write-Host "Mmproj : $LaunchMmprojPath"
+        Write-BilingualField -ChineseLabel "Mmproj" -EnglishLabel "Mmproj" -ChineseValue $LaunchMmprojPath -EnglishValue $LaunchMmprojPath
     }
-    Write-Host "Port   : $Port"
-    Write-Host "Mode   : $(if ($ExtremeMode) { 'extreme' } else { 'standard' })"
-    Write-Host "Tune   : $($AutoLaunchTuning.SourceLabel)"
+    Write-BilingualField -ChineseLabel "連接埠" -EnglishLabel "Port" -ChineseValue ([string]$Port) -EnglishValue ([string]$Port)
+    Write-BilingualField -ChineseLabel "模式" -EnglishLabel "Mode" -ChineseValue $(if ($ExtremeMode) { "極限" } else { "標準" }) -EnglishValue $(if ($ExtremeMode) { "extreme" } else { "standard" })
+    Write-BilingualField -ChineseLabel "調校來源" -EnglishLabel "Tune" -ChineseValue $AutoLaunchTuning.SourceLabel -EnglishValue $AutoLaunchTuning.SourceLabel
     if ($AutoLaunchTuning.AutoTuneEnabled) {
-        Write-Host "Learn  : on"
+        Write-BilingualField -ChineseLabel "學習" -EnglishLabel "Learn" -ChineseValue "開啟" -EnglishValue "on"
     }
     if ($AutoLaunchTuning.Source -eq "adaptive" -and -not [string]::IsNullOrWhiteSpace($AutoLaunchTuning.ProfileSkipReason)) {
-        Write-Host "Saved  : skipped for this run ($($AutoLaunchTuning.ProfileSkipReason))" -ForegroundColor Yellow
+        Write-BilingualField -ChineseLabel "已儲存設定" -EnglishLabel "Saved" -ChineseValue ("本次略過（{0}）" -f $AutoLaunchTuning.ProfileSkipReason) -EnglishValue ("skipped for this run ({0})" -f $AutoLaunchTuning.ProfileSkipReason) -ForegroundColor Yellow
     }
     if ($AutoLaunchTuning.UseManagedGpuLayers) {
-        Write-Host "GPU    : auto (wrapper-managed fit)"
+        Write-BilingualField -ChineseLabel "GPU" -EnglishLabel "GPU" -ChineseValue "自動（由包裝器管理 fit）" -EnglishValue "auto (wrapper-managed fit)"
     }
     else {
-        Write-Host "GPU    : $($AutoLaunchTuning.EffectiveGpuLayers)"
+        Write-BilingualField -ChineseLabel "GPU" -EnglishLabel "GPU" -ChineseValue ([string]$AutoLaunchTuning.EffectiveGpuLayers) -EnglishValue ([string]$AutoLaunchTuning.EffectiveGpuLayers)
     }
-    Write-Host "Threads: $Threads"
-    Write-Host "Batch  : $ThreadsBatch"
+    Write-BilingualField -ChineseLabel "執行緒" -EnglishLabel "Threads" -ChineseValue ([string]$Threads) -EnglishValue ([string]$Threads)
+    Write-BilingualField -ChineseLabel "批次執行緒" -EnglishLabel "Batch" -ChineseValue ([string]$ThreadsBatch) -EnglishValue ([string]$ThreadsBatch)
     if ($AutoLaunchTuning.AcceleratorInfo) {
-        Write-Host "VRAM   : $($AutoLaunchTuning.AcceleratorInfo.Name) free $($AutoLaunchTuning.AcceleratorInfo.FreeMiB) MiB / total $($AutoLaunchTuning.AcceleratorInfo.TotalMiB) MiB"
+        Write-BilingualField -ChineseLabel "VRAM" -EnglishLabel "VRAM" -ChineseValue ("{0} 可用 $($AutoLaunchTuning.AcceleratorInfo.FreeMiB) MiB / 總計 $($AutoLaunchTuning.AcceleratorInfo.TotalMiB) MiB" -f $AutoLaunchTuning.AcceleratorInfo.Name) -EnglishValue ("{0} free $($AutoLaunchTuning.AcceleratorInfo.FreeMiB) MiB / total $($AutoLaunchTuning.AcceleratorInfo.TotalMiB) MiB" -f $AutoLaunchTuning.AcceleratorInfo.Name)
     }
     if ($AutoLaunchTuning.MemoryInfo) {
-        Write-Host "RAM    : free $($AutoLaunchTuning.MemoryInfo.FreeMiB) MiB / total $($AutoLaunchTuning.MemoryInfo.TotalMiB) MiB"
+        Write-BilingualField -ChineseLabel "RAM" -EnglishLabel "RAM" -ChineseValue ("可用 $($AutoLaunchTuning.MemoryInfo.FreeMiB) MiB / 總計 $($AutoLaunchTuning.MemoryInfo.TotalMiB) MiB") -EnglishValue ("free $($AutoLaunchTuning.MemoryInfo.FreeMiB) MiB / total $($AutoLaunchTuning.MemoryInfo.TotalMiB) MiB")
     }
     if ($null -ne $AutoLaunchTuning.FitTargetMiB) {
-        Write-Host "Fit    : target margin $($AutoLaunchTuning.FitTargetMiB) MiB"
+        Write-BilingualField -ChineseLabel "顯存保留" -EnglishLabel "Fit" -ChineseValue ("目標保留邊界 $($AutoLaunchTuning.FitTargetMiB) MiB") -EnglishValue ("target margin $($AutoLaunchTuning.FitTargetMiB) MiB")
     }
     if ($null -ne $AutoLaunchTuning.CacheRamMiB) {
-        Write-Host "Cache  : prompt cache limit $($AutoLaunchTuning.CacheRamMiB) MiB"
+        Write-BilingualField -ChineseLabel "快取" -EnglishLabel "Cache" -ChineseValue ("提示詞快取上限 $($AutoLaunchTuning.CacheRamMiB) MiB") -EnglishValue ("prompt cache limit $($AutoLaunchTuning.CacheRamMiB) MiB")
     }
     if ($null -ne $AutoLaunchTuning.ParallelSlots) {
-        Write-Host "Slots  : $($AutoLaunchTuning.ParallelSlots)"
+        Write-BilingualField -ChineseLabel "並行槽位" -EnglishLabel "Slots" -ChineseValue ([string]$AutoLaunchTuning.ParallelSlots) -EnglishValue ([string]$AutoLaunchTuning.ParallelSlots)
     }
     if ($script:ModelGenerationArgs.Count -gt 0) {
-        Write-Host "Sample : $($script:ModelGenerationArgs -join ' ')"
+        Write-BilingualField -ChineseLabel "取樣" -EnglishLabel "Sample" -ChineseValue ($script:ModelGenerationArgs -join ' ') -EnglishValue ($script:ModelGenerationArgs -join ' ')
     }
     if ($LlamaArgs) {
-        Write-Host "Extra  : $($LlamaArgs -join ' ')"
+        Write-BilingualField -ChineseLabel "額外參數" -EnglishLabel "Extra" -ChineseValue ($LlamaArgs -join ' ') -EnglishValue ($LlamaArgs -join ' ')
     }
-    Write-Host "Open   : $BaseUrl$OpenPath"
+    Write-BilingualField -ChineseLabel "開啟網址" -EnglishLabel "Open" -ChineseValue "$BaseUrl$OpenPath" -EnglishValue "$BaseUrl$OpenPath"
     Write-Host ""
 
     $ServerArgs = Get-ServerArgs -AutoTuning $AutoLaunchTuning
@@ -7419,7 +8573,7 @@ try {
 
             try {
                 if ($WrapperControlsPause) {
-                    Write-Host "Waiting for server readiness confirmation..." -ForegroundColor Cyan
+                    Write-Host (Format-BilingualText -ChineseText "正在等待服務就緒確認..." -EnglishText "Waiting for server readiness confirmation...") -ForegroundColor Cyan
                     $StartupResult = Wait-ForBackgroundServerReadyWithProgress -Process $BackgroundProcess -ServerBaseUrl $BaseUrl -BaselineProcessIds $BaselineWorkspaceServerIds -TargetModelPath $ModelPath
                 }
                 else {
@@ -7442,7 +8596,7 @@ try {
                     throw
                 }
 
-                Write-Host "Background start exited before any logs were captured. Retrying once..." -ForegroundColor Yellow
+                Write-Host (Format-BilingualText -ChineseText "背景啟動在尚未捕捉到任何記錄前就結束，正在重試一次..." -EnglishText "Background start exited before any logs were captured. Retrying once...") -ForegroundColor Yellow
                 Remove-TrackedPidFiles
                 Start-Sleep -Seconds 2
             }
@@ -7456,14 +8610,14 @@ try {
 
         if ($AutoLaunchTuning.AutoTuneEnabled -and $StartupState -ne "Ready") {
             $RemainingReadyWaitSec = [Math]::Max(1, $ReadyTimeoutSec - $StartupCheckSec)
-            Write-Host "AutoTune: waiting for server readiness before evaluating the learned profile..." -ForegroundColor Cyan
+            Write-Host ((Format-BilingualText -ChineseText "自動調校" -EnglishText "AutoTune") + ": " + (Format-BilingualText -ChineseText "正在等待服務就緒後再評估學習到的設定檔..." -EnglishText "waiting for server readiness before evaluating the learned profile...")) -ForegroundColor Cyan
             if (Wait-ForServerReady -ServerBaseUrl $BaseUrl -TimeoutSec $RemainingReadyWaitSec) {
                 $StartupState = "Ready"
             }
             else {
                 $AutoTuneSaveResult = [pscustomobject]@{
                     Saved   = $false
-                    Message = "Auto-tune could not save a profile because the server was not ready within $ReadyTimeoutSec seconds."
+                    Message = Format-BilingualText -ChineseText ("因為服務未在 $ReadyTimeoutSec 秒內就緒，自動調校無法儲存設定檔。") -EnglishText ("Auto-tune could not save a profile because the server was not ready within $ReadyTimeoutSec seconds.")
                     Profile = $null
                 }
             }
@@ -7488,52 +8642,52 @@ try {
             }
         }
 
-        Write-Host "Background server started." -ForegroundColor Green
-        Write-Host "PID    : $(if ($TrackedBackgroundPid) { $TrackedBackgroundPid } else { $BackgroundProcess.Id })"
+        Write-Host (Format-BilingualText -ChineseText "背景服務已啟動。" -EnglishText "Background server started.") -ForegroundColor Green
+        Write-BilingualField -ChineseLabel "程序編號" -EnglishLabel "PID" -ChineseValue ([string]$(if ($TrackedBackgroundPid) { $TrackedBackgroundPid } else { $BackgroundProcess.Id })) -EnglishValue ([string]$(if ($TrackedBackgroundPid) { $TrackedBackgroundPid } else { $BackgroundProcess.Id }))
         if ($StartupState -eq "Ready") {
-            Write-Host "State  : ready"
+            Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "State" -ChineseValue "就緒" -EnglishValue "ready"
         }
         else {
-            Write-Host "State  : loading" -ForegroundColor Yellow
-            Write-Host "Note   : llama.cpp is still starting after $StartupCheckSec seconds. No startup failure has been detected." -ForegroundColor Yellow
-            Write-Host "Check  : use -Status, watch $StdErrLog, or open $BaseUrl$OpenPath once the server finishes loading." -ForegroundColor Yellow
+            Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "State" -ChineseValue "載入中" -EnglishValue "loading" -ForegroundColor Yellow
+            Write-BilingualField -ChineseLabel "說明" -EnglishLabel "Note" -ChineseValue ("llama.cpp 在 $StartupCheckSec 秒後仍在啟動中，目前未偵測到啟動失敗。") -EnglishValue ("llama.cpp is still starting after $StartupCheckSec seconds. No startup failure has been detected.") -ForegroundColor Yellow
+            Write-BilingualField -ChineseLabel "檢查方式" -EnglishLabel "Check" -ChineseValue ("可用 -Status、查看 $StdErrLog，或等載入完成後開啟 $BaseUrl$OpenPath。") -EnglishValue ("use -Status, watch $StdErrLog, or open $BaseUrl$OpenPath once the server finishes loading.") -ForegroundColor Yellow
         }
-        Write-Host "URL    : $BaseUrl"
-        Write-Host "Logs   : $StdOutLog"
-        Write-Host "Error  : $StdErrLog"
+        Write-BilingualField -ChineseLabel "網址" -EnglishLabel "URL" -ChineseValue $BaseUrl -EnglishValue $BaseUrl
+        Write-BilingualField -ChineseLabel "輸出記錄" -EnglishLabel "Logs" -ChineseValue $StdOutLog -EnglishValue $StdOutLog
+        Write-BilingualField -ChineseLabel "錯誤記錄" -EnglishLabel "Error" -ChineseValue $StdErrLog -EnglishValue $StdErrLog
         $AuditLaunchPid = if ($TrackedBackgroundPid) { [Nullable[int]]$TrackedBackgroundPid } else { [Nullable[int]]$BackgroundProcess.Id }
         Write-LaunchAuditRecord -ServerArgs $ServerArgs -AutoTuning $AutoLaunchTuning -LaunchMode "background" -LaunchedProcessId $AuditLaunchPid -StartupState $StartupState
         if ($AutoLaunchTuning.Source -eq "saved-profile") {
-            Write-Host "Saved  : reused learned profile from $TuningProfileFile" -ForegroundColor Cyan
+            Write-BilingualField -ChineseLabel "已儲存設定" -EnglishLabel "Saved" -ChineseValue ("已重用學習到的設定檔：$TuningProfileFile") -EnglishValue ("reused learned profile from $TuningProfileFile") -ForegroundColor Cyan
         }
         if ($AutoTuneSaveResult) {
             if ($AutoTuneSaveResult.Saved) {
-                Write-Host "AutoTune: $($AutoTuneSaveResult.Message)" -ForegroundColor Green
+                Write-Host ((Format-BilingualText -ChineseText "自動調校" -EnglishText "AutoTune") + ": " + $AutoTuneSaveResult.Message) -ForegroundColor Green
             }
             elseif (-not [string]::IsNullOrWhiteSpace($AutoTuneSaveResult.Message)) {
-                Write-Host "AutoTune: $($AutoTuneSaveResult.Message)" -ForegroundColor Yellow
+                Write-Host ((Format-BilingualText -ChineseText "自動調校" -EnglishText "AutoTune") + ": " + $AutoTuneSaveResult.Message) -ForegroundColor Yellow
             }
         }
         if (-not $NoBrowser) {
             if ($StartupState -eq "Ready") {
-                Write-Host "Browser: server is ready. Opening the Web UI now." -ForegroundColor Cyan
+                Write-Host ((Format-BilingualText -ChineseText "瀏覽器" -EnglishText "Browser") + ": " + (Format-BilingualText -ChineseText "服務已就緒，現在開啟 Web UI。" -EnglishText "server is ready. Opening the Web UI now.")) -ForegroundColor Cyan
                 Start-Process "$BaseUrl$OpenPath"
             }
             else {
-                Write-Host "Browser: the Web UI will open automatically after the server becomes ready." -ForegroundColor Cyan
+                Write-Host ((Format-BilingualText -ChineseText "瀏覽器" -EnglishText "Browser") + ": " + (Format-BilingualText -ChineseText "服務就緒後會自動開啟 Web UI。" -EnglishText "the Web UI will open automatically after the server becomes ready.")) -ForegroundColor Cyan
                 Start-BrowserWhenReadyDetached
             }
         }
         if ($WrapperControlsPause) {
             if ($StartupState -eq "Ready") {
-                Write-Host "Server is ready. Closing the launcher window..." -ForegroundColor Cyan
+                Write-Host (Format-BilingualText -ChineseText "服務已就緒，正在關閉啟動器視窗..." -EnglishText "Server is ready. Closing the launcher window...") -ForegroundColor Cyan
             }
             else {
-                Write-Host "Server is still loading in the background. Closing the launcher window..." -ForegroundColor Cyan
+                Write-Host (Format-BilingualText -ChineseText "服務仍在背景載入中，正在關閉啟動器視窗..." -EnglishText "Server is still loading in the background. Closing the launcher window...") -ForegroundColor Cyan
             }
         }
         else {
-            Write-Host "You can close this PowerShell window." -ForegroundColor Cyan
+            Write-Host (Format-BilingualText -ChineseText "你可以關閉這個 PowerShell 視窗。" -EnglishText "You can close this PowerShell window.") -ForegroundColor Cyan
         }
         return
     }
@@ -7579,7 +8733,7 @@ try {
     Write-LaunchAuditRecord -ServerArgs $ServerArgs -AutoTuning $AutoLaunchTuning -LaunchMode "foreground" -StartupState "invoking"
     & $PowerShellHostPath @SupervisorArgumentList
     if ($LASTEXITCODE -ne 0) {
-        throw "llama.cpp exited with code $LASTEXITCODE."
+        throw (Format-BilingualText -ChineseText ("llama.cpp 已結束，結束碼為 $LASTEXITCODE。") -EnglishText ("llama.cpp exited with code $LASTEXITCODE."))
     }
 }
 catch {
@@ -7588,7 +8742,7 @@ catch {
         Clear-ModelSwitchTimingPending -TargetModelPath $PendingSwitchTimingContext.TargetModelPath -LaunchPid $PendingSwitchTimingLaunchPid
     }
     Write-Host ""
-    Write-Host "Error:" -ForegroundColor Red
+    Write-Host (Format-BilingualText -ChineseText "錯誤：" -EnglishText "Error:") -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red
 }
 finally {
@@ -7603,7 +8757,7 @@ finally {
     $ShouldPause = (-not $NoPause) -and (-not $WrapperControlsPause) -and (-not $Status) -and (-not $ShowGpuOffload) -and (-not $Stop) -and (-not $LlamaHelp) -and ($EncounteredFatalError -or ((-not $Background) -and (-not $UsedInteractiveMenu)))
     if ($ShouldPause) {
         Write-Host ""
-        Write-Host "Press Enter to exit..." -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "按 Enter 離開..." -EnglishText "Press Enter to exit...") -ForegroundColor Yellow
         Read-Host | Out-Null
     }
 
