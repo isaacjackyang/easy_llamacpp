@@ -252,7 +252,7 @@ $ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
 $SupervisorScriptPath = Join-Path $Ps1Root "llama_supervisor.ps1"
 $WatchdogScriptPath = Join-Path $Ps1Root "llama_watchdog.ps1"
 # Edit this line to force model scanning from a specific GGUF folder on each interactive launch.
-$ConfiguredModelScanPath = "D:\LLM Model"
+$ConfiguredModelScanPath = "C:\Users\USER\Documents\GitHub\easy_llamacpp\Model"
 $BaseUrl = "http://127.0.0.1:$Port"
 $BrowserJob = $null
 $UsedInteractiveMenu = $false
@@ -3561,7 +3561,7 @@ function Get-ModelGenerationArgs {
 
     $ResolvedModelPath = if ($ModelEntry -and $ModelEntry.PSObject.Properties["path"]) { [string]$ModelEntry.path } else { $null }
     $UseQwen36MtpDefaults = Test-Qwen36MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $UserArguments
-    $DefaultTemperature = if ($UseQwen36MtpDefaults) { "0.6" } else { "0.35" }
+    $DefaultTemperature = if ($UseQwen36MtpDefaults) { "0.3" } else { "0.35" }
     $Generation = $null
     if ($ModelEntry -and $ModelEntry.PSObject.Properties["generation"] -and $null -ne $ModelEntry.generation) {
         $Generation = $ModelEntry.generation
@@ -3756,6 +3756,7 @@ function Convert-ForwardArgsToMenuConfig {
         SplitMode       = ""
         TensorSplit     = ""
         Fit             = ""
+        FlashAttention2 = "auto"
         ReasoningMode   = "auto"
         ThinkLevel      = "Auto"
         MtpEnabled      = $null
@@ -3796,6 +3797,31 @@ function Convert-ForwardArgsToMenuConfig {
             }
             '^--fit(?:=(.+))?$' {
                 $Config.Fit = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:-fa|--flash-attn)(?:=(.+))?$' {
+                $FlashAttnValue = if ($Matches[1]) {
+                    [string]$Matches[1]
+                }
+                elseif ((($Index + 1) -lt $Arguments.Count) -and ([string]$Arguments[$Index + 1] -notmatch '^-')) {
+                    [string]$Arguments[++$Index]
+                }
+                else {
+                    "on"
+                }
+
+                $NormalizedFlashAttn = $FlashAttnValue.Trim().ToLowerInvariant()
+                if ([string]::IsNullOrWhiteSpace($NormalizedFlashAttn) -or @("1", "true", "on", "yes", "y") -contains $NormalizedFlashAttn) {
+                    $Config.FlashAttention2 = "on"
+                }
+                elseif (@("0", "false", "off", "no", "n") -contains $NormalizedFlashAttn) {
+                    $Config.FlashAttention2 = "off"
+                }
+                elseif ($NormalizedFlashAttn -eq "auto") {
+                    $Config.FlashAttention2 = "auto"
+                }
+                else {
+                    $Config.FlashAttention2 = "on"
+                }
             }
             '^(?:-rea|--reasoning)(?:=(.+))?$' {
                 $Config.ReasoningMode = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
@@ -3875,6 +3901,12 @@ function Convert-MenuConfigToForwardArgs {
     if ($Config.Fit) {
         $Arguments.Add("--fit")
         $Arguments.Add([string]$Config.Fit)
+    }
+
+    $FlashAttention2 = if ([string]::IsNullOrWhiteSpace([string]$Config.FlashAttention2)) { "auto" } else { ([string]$Config.FlashAttention2).Trim().ToLowerInvariant() }
+    if ($FlashAttention2 -eq "on" -or $FlashAttention2 -eq "off") {
+        $Arguments.Add("--flash-attn")
+        $Arguments.Add($FlashAttention2)
     }
 
     if (-not [string]::IsNullOrWhiteSpace([string]$Config.ReasoningMode) -and [string]$Config.ReasoningMode -ne "auto") {
@@ -4048,6 +4080,7 @@ function Get-SavedLaunchProfilePersistedKeys {
         "SplitMode"
         "TensorSplit"
         "Fit"
+        "FlashAttention2"
         "ReasoningMode"
         "ThinkLevel"
         "MtpEnabled"
@@ -5630,6 +5663,7 @@ function New-LaunchConfig {
         SplitMode         = [string]$ForwardConfig.SplitMode
         TensorSplit       = [string]$ForwardConfig.TensorSplit
         Fit               = [string]$ForwardConfig.Fit
+        FlashAttention2   = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.FlashAttention2)) { "auto" } else { [string]$ForwardConfig.FlashAttention2 }
         ReasoningMode     = [string]$ForwardConfig.ReasoningMode
         ThinkLevel        = [string]$ForwardConfig.ThinkLevel
         MtpEnabled        = $ForwardConfig.MtpEnabled
@@ -5670,9 +5704,11 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "SplitMode"; Label = (Format-BilingualText -ChineseText "分割模式" -EnglishText "Split Mode"); Type = "choice"; Choices = @("", "layer", "row", "none") },
         [pscustomobject]@{ Key = "TensorSplit"; Label = (Format-BilingualText -ChineseText "張量分配" -EnglishText "Tensor Split"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 3,2" -EnglishText "blank uses auto; example: 3,2") },
         [pscustomobject]@{ Key = "Fit"; Label = "Fit"; Type = "choice"; Choices = @("", "on", "off") },
+        [pscustomobject]@{ Key = "FlashAttention2"; Label = "Flash Attention 2"; Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "ExtraArgs"; Label = (Format-BilingualText -ChineseText "額外參數" -EnglishText "Extra Args"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空代表不加額外參數" -EnglishText "blank means no extra args") },
         [pscustomobject]@{ Key = "ApplyAutoTune"; Label = (Format-BilingualText -ChineseText "套用自動調校學習值" -EnglishText "Apply Auto Tune Learned Values"); Type = "actionAutoTuneApply" },
         [pscustomobject]@{ Key = "SaveProfile"; Label = (Format-BilingualText -ChineseText "儲存設定檔" -EnglishText "Save Profile"); Type = "actionSave" },
+        [pscustomobject]@{ Key = "ExportCommand"; Label = (Format-BilingualText -ChineseText "輸出啟動命令" -EnglishText "Export Launch Command"); Type = "actionExportCommand" },
         [pscustomobject]@{ Key = "Start"; Label = (Format-BilingualText -ChineseText "開始啟動" -EnglishText "Start Launch"); Type = "actionStart" },
         [pscustomobject]@{ Key = "Back"; Label = (Format-BilingualText -ChineseText "返回" -EnglishText "Back"); Type = "actionBack" }
     )
@@ -5712,6 +5748,13 @@ function Get-LaunchConfigDefaultText {
         "SplitMode" { return "llama.cpp default" }
         "TensorSplit" { return "auto" }
         "Fit" { return "llama.cpp default" }
+        "FlashAttention2" {
+            if (Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) {
+                return "auto -> on for Qwen3.6 MTP GGUF"
+            }
+
+            return "auto"
+        }
         "ExtraArgs" { return "none" }
         default { return "(default)" }
     }
@@ -5815,8 +5858,16 @@ function Get-LaunchConfigValueText {
 
             return [string]$Config.Fit
         }
+        "FlashAttention2" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.FlashAttention2) -or [string]$Config.FlashAttention2 -eq "auto") {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.FlashAttention2
+        }
         "ApplyAutoTune" { return (Format-BilingualText -ChineseText "按 Enter 套用" -EnglishText "Press Enter to apply") }
         "SaveProfile" { return (Format-BilingualText -ChineseText "儲存目前設定" -EnglishText "Save current settings") }
+        "ExportCommand" { return (Format-BilingualText -ChineseText "按 Enter 輸出" -EnglishText "Press Enter to export") }
         "Start" { return "Launch now" }
         "Back" { return "Return" }
         default {
@@ -5983,6 +6034,12 @@ function Get-LaunchConfigItemHelp {
                 Recommendation = Format-BilingualText -ChineseText "一般由 wrapper 管理時保持留空。只有在你刻意比較 fit 行為時，才手動設成 `on` 或 `off`。" -EnglishText "Leave blank for normal wrapper-managed launches. Use on or off only when comparing fit behavior deliberately."
             }
         }
+        "FlashAttention2" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "控制 llama.cpp 的 Flash Attention 2（`--flash-attn`）模式。" -EnglishText "Controls llama.cpp Flash Attention 2 mode (`--flash-attn`)."
+                Recommendation = Format-BilingualText -ChineseText "建議先用 `auto`。想強制啟用時用 `on`；若要排除相容性或穩定性問題，可改 `off`。" -EnglishText "Start with auto. Use on to force-enable it. Switch to off when troubleshooting compatibility or stability issues."
+            }
+        }
         "ExtraArgs" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "傳遞那些目前沒有做成獨立欄位的原始 llama-server 參數。" -EnglishText "Passes raw llama-server arguments that are not already exposed as dedicated fields."
@@ -5999,6 +6056,12 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "把目前頁面上的設定存成可重用的自訂設定檔。" -EnglishText "Saves the current page settings as a reusable custom profile."
                 Recommendation = Format-BilingualText -ChineseText "建議用清楚的名稱，例如模型用途、量化版本或顯卡配置。之後在 Quick Start 就能直接挑這個設定檔來啟動。" -EnglishText "Use a clear name such as the model purpose, quant, or GPU layout. After saving, Quick Start can launch directly with this profile."
+            }
+        }
+        "ExportCommand" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "把目前頁面的設定轉成一行 `llama-server.exe` 命令，可直接貼到 PowerShell 執行。" -EnglishText "Converts the current page settings into a one-line `llama-server.exe` command you can paste into PowerShell."
+                Recommendation = Format-BilingualText -ChineseText "適合拿去做純 llama.cpp 直啟、捷徑、排程或自動化腳本。輸出後會自動複製到剪貼簿（如果系統支援）。" -EnglishText "Use this for direct llama.cpp startup, shortcuts, scheduled tasks, or automation scripts. The command is copied to clipboard automatically when supported."
             }
         }
         "Start" {
@@ -6187,6 +6250,234 @@ function Edit-LaunchConfigItem {
     return $null
 }
 
+function ConvertTo-PowerShellSingleQuotedToken {
+    param(
+        [AllowNull()]$Value
+    )
+
+    if ($null -eq $Value) {
+        return "''"
+    }
+
+    return ("'{0}'" -f ([string]$Value).Replace("'", "''"))
+}
+
+function ConvertTo-PowerShellCommandToken {
+    param(
+        [AllowNull()]$Value
+    )
+
+    if ($null -eq $Value) {
+        return "''"
+    }
+
+    $Text = [string]$Value
+    if ($Text -match '^[A-Za-z0-9_./:\\,+=-]+$') {
+        return $Text
+    }
+
+    return ConvertTo-PowerShellSingleQuotedToken -Value $Text
+}
+
+function Resolve-LaunchConfigVisionMmprojPathForCommand {
+    param(
+        [System.Collections.IDictionary]$Config,
+        $LaunchModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    if ([string]$Config.VisionSelectionMode -eq "disabled") {
+        return [pscustomobject]@{
+            Path             = $null
+            AutoResolvedPath = $null
+        }
+    }
+
+    $ResolvedFromConfig = Resolve-ModelPath -Path ([string]$Config.VisionMmprojPath)
+    if (-not [string]::IsNullOrWhiteSpace($ResolvedFromConfig) -and (Test-Path -LiteralPath $ResolvedFromConfig -PathType Leaf)) {
+        return [pscustomobject]@{
+            Path             = $ResolvedFromConfig
+            AutoResolvedPath = $null
+        }
+    }
+
+    if ([string]$Config.VisionSelectionMode -eq "auto") {
+        $AutoCandidate = Resolve-DefaultVisionModelCandidate -IndexPath $ModelIndexPath -PrimaryModelEntry $LaunchModelEntry -PrimaryModelPath $ResolvedModelPath
+        if ($AutoCandidate -and -not [string]::IsNullOrWhiteSpace([string]$AutoCandidate.MmprojPath)) {
+            $ResolvedAutoPath = Resolve-ModelPath -Path ([string]$AutoCandidate.MmprojPath)
+            if (-not [string]::IsNullOrWhiteSpace($ResolvedAutoPath) -and (Test-Path -LiteralPath $ResolvedAutoPath -PathType Leaf)) {
+                return [pscustomobject]@{
+                    Path             = $ResolvedAutoPath
+                    AutoResolvedPath = $ResolvedAutoPath
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Path             = $null
+        AutoResolvedPath = $null
+    }
+}
+
+function Get-LlamaServerArgsFromLaunchConfig {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path ([string]$Config.ModelPath)
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        throw (Format-BilingualText -ChineseText "目前頁面缺少有效模型路徑，無法輸出 llama.cpp 命令。" -EnglishText "The current page has no valid model path, so a llama.cpp command cannot be exported.")
+    }
+
+    [int]$RequestedThreads = -1
+    [int]$RequestedThreadsBatch = -1
+    [void][int]::TryParse([string]$Config.Threads, [ref]$RequestedThreads)
+    [void][int]::TryParse([string]$Config.ThreadsBatch, [ref]$RequestedThreadsBatch)
+    $ResolvedThreads = Resolve-RequestedThreads -RequestedThreads $RequestedThreads -RequestedThreadsBatch $RequestedThreadsBatch
+
+    $ForwardArgs = @(Remove-LlamaParallelArgs -Arguments @(Convert-MenuConfigToForwardArgs -Config $Config))
+    $LaunchModelEntry = Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $ResolvedModelPath
+    $ModelGenerationArgs = @(Get-ModelGenerationArgs -ModelEntry $LaunchModelEntry -UserArguments $ForwardArgs)
+    $AutoLaunchTuning = Get-AutoLaunchTuning `
+        -ResolvedModelPath $ResolvedModelPath `
+        -RequestedGpuLayers ([string]$Config.GpuLayers) `
+        -Arguments $ForwardArgs `
+        -UseExtremeMode ([bool]$Config.ExtremeMode) `
+        -EnableAutoTune ([bool]$Config.AutoTune)
+
+    $VisionResolution = Resolve-LaunchConfigVisionMmprojPathForCommand -Config $Config -LaunchModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath
+    $Arguments = New-Object System.Collections.Generic.List[string]
+    $Arguments.Add("-m")
+    $Arguments.Add($ResolvedModelPath)
+    $Arguments.Add("--port")
+    $Arguments.Add([string]$Config.Port)
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$VisionResolution.Path)) {
+        $Arguments.Add("--mmproj")
+        $Arguments.Add([string]$VisionResolution.Path)
+        $Arguments.Add("--jinja")
+    }
+
+    if (-not $AutoLaunchTuning.UseManagedGpuLayers) {
+        $Arguments.Add("--gpu-layers")
+        $Arguments.Add([string]$AutoLaunchTuning.EffectiveGpuLayers)
+    }
+
+    $Arguments.Add("--threads")
+    $Arguments.Add([string]$ResolvedThreads.Threads)
+    $Arguments.Add("--threads-batch")
+    $Arguments.Add([string]$ResolvedThreads.ThreadsBatch)
+
+    $CombinedArgs = @()
+    foreach ($Argument in $ModelGenerationArgs) {
+        $CombinedArgs += [string]$Argument
+    }
+    foreach ($Argument in $ForwardArgs) {
+        $CombinedArgs += [string]$Argument
+    }
+
+    if (Test-Qwen36MtpDefaultsEnabled -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $CombinedArgs) {
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value "2"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-fa|--flash-attn)(?:=|$)') -Flag "--flash-attn" -Value "on"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctv|--cache-type-v)(?:=|$)') -Flag "--cache-type-v" -Value "q8_0"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
+    }
+
+    if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
+        $Arguments.Add("--ctx-size")
+        $Arguments.Add([string]$script:ManagedDefaultContextSize)
+    }
+
+    if ($null -ne $AutoLaunchTuning.FitTargetMiB) {
+        $Arguments.Add("--fit-target")
+        $Arguments.Add([string]$AutoLaunchTuning.FitTargetMiB)
+    }
+    if ($null -ne $AutoLaunchTuning.CacheRamMiB) {
+        $Arguments.Add("--cache-ram")
+        $Arguments.Add([string]$AutoLaunchTuning.CacheRamMiB)
+    }
+    if ($null -ne $AutoLaunchTuning.ParallelSlots) {
+        $Arguments.Add("--parallel")
+        $Arguments.Add([string]$AutoLaunchTuning.ParallelSlots)
+    }
+
+    foreach ($Argument in $ModelGenerationArgs) {
+        $Arguments.Add([string]$Argument)
+    }
+    foreach ($Argument in $ForwardArgs) {
+        $Arguments.Add([string]$Argument)
+    }
+
+    return [pscustomobject]@{
+        Arguments          = @($Arguments.ToArray())
+        AutoLaunchTuning   = $AutoLaunchTuning
+        ResolvedModelPath  = $ResolvedModelPath
+        ResolvedMmprojPath = [string]$VisionResolution.Path
+        AutoMmprojPath     = [string]$VisionResolution.AutoResolvedPath
+    }
+}
+
+function Get-LaunchConfigCommandExport {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $LlamaPreview = Get-LlamaServerArgsFromLaunchConfig -Config $Config
+    $CommandTokens = New-Object System.Collections.Generic.List[string]
+
+    $CommandTokens.Add("&")
+    $CommandTokens.Add((ConvertTo-PowerShellSingleQuotedToken -Value $ServerExe))
+    foreach ($LlamaArgument in @($LlamaPreview.Arguments)) {
+        $CommandTokens.Add((ConvertTo-PowerShellCommandToken -Value ([string]$LlamaArgument)))
+    }
+
+    $WarningParts = New-Object System.Collections.Generic.List[string]
+    $WarningParts.Add((Format-BilingualText -ChineseText "已改為直接輸出 llama.cpp（llama-server.exe）指令，不再是 Start_LCPP.ps1 包裝命令。" -EnglishText "This now exports a direct llama.cpp (llama-server.exe) command instead of a Start_LCPP.ps1 wrapper command."))
+    $WarningParts.Add((Format-BilingualText -ChineseText "Launch Mode、Open Path、Ready Timeout 是啟動器行為，不屬於 llama-server 參數，因此不會出現在這行命令中。" -EnglishText "Launch Mode, Open Path, and Ready Timeout are launcher behaviors, not llama-server flags, so they are not included in this command."))
+
+    if ([bool]$Config.AutoTune) {
+        $WarningParts.Add((Format-BilingualText -ChineseText "AutoTune 的「學習並寫回設定檔」屬於啟動器流程，純 llama-server 命令本身不會執行這段學習流程。" -EnglishText "AutoTune profile learning/saving is a launcher workflow. A plain llama-server command does not perform that learning step by itself."))
+    }
+    if ([string]$Config.GpuLayers -eq "auto" -and $LlamaPreview.AutoLaunchTuning) {
+        $WarningParts.Add((Format-BilingualText -ChineseText "因為 GPU Layers=auto，已依目前機器狀態把 fit/cache/parallel 轉成明確參數；不同機器或不同時機輸出的值可能不同。" -EnglishText "Because GPU Layers is set to auto, fit/cache/parallel were resolved from current machine state; values may differ on another machine or at another time."))
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$LlamaPreview.AutoMmprojPath)) {
+        $WarningParts.Add((Format-BilingualText -ChineseText ("視覺模型目前是自動配對，這次命令已解析成 mmproj：{0}" -f [string]$LlamaPreview.AutoMmprojPath) -EnglishText ("Vision model is currently auto-matched; this export resolved mmproj to: {0}" -f [string]$LlamaPreview.AutoMmprojPath)))
+    }
+
+    return [pscustomobject]@{
+        CommandLine = ($CommandTokens -join " ")
+        Warning     = ($WarningParts -join " ")
+    }
+}
+
+function Show-LaunchConfigCommandExport {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $Export = Get-LaunchConfigCommandExport -Config $Config
+    Write-Host ""
+    Write-Host (Format-BilingualText -ChineseText "一行 llama.cpp 啟動命令（可直接貼到 PowerShell）" -EnglishText "One-line llama.cpp launch command (paste into PowerShell directly)") -ForegroundColor Cyan
+    Write-WrappedInfoLine -Prefix "CMD : " -Text $Export.CommandLine -PrefixColor Cyan -TextColor Green
+    if (-not [string]::IsNullOrWhiteSpace([string]$Export.Warning)) {
+        Write-WrappedInfoLine -Prefix ((Format-BilingualText -ChineseText "注意" -EnglishText "Note") + " : ") -Text $Export.Warning -PrefixColor Yellow -TextColor Yellow
+    }
+
+    try {
+        Set-Clipboard -Value $Export.CommandLine
+        Write-Host (Format-BilingualText -ChineseText "命令已複製到剪貼簿。" -EnglishText "Command copied to clipboard.") -ForegroundColor Yellow
+    }
+    catch {
+    }
+
+    Write-Host (Format-BilingualText -ChineseText "按 Enter 返回調校頁面..." -EnglishText "Press Enter to return to tune page...") -ForegroundColor Yellow
+    Read-Host | Out-Null
+}
+
 function Show-LaunchConfigGrid {
     param(
         [System.Collections.IDictionary]$Config,
@@ -6199,14 +6490,23 @@ function Show-LaunchConfigGrid {
     while ($true) {
         Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle (Format-BilingualText -ChineseText "使用方向鍵移動，按 Enter 或 Space 編輯目前欄位。" -EnglishText "Use arrow keys to move. Press Enter or Space to edit the selected cell.")
         $Width = Get-ConsoleWidth
-        $CellWidth = [Math]::Max(36, [Math]::Floor(($Width - 6) / 2))
-        $RowCount = [Math]::Ceiling($Items.Count / 2)
+        $ColumnGap = 2
+        $MinTwoColumnCellWidth = 28
+        $MaxTwoColumnCellWidth = 50
+        $ColumnCount = if (($Width - $ColumnGap) -ge ($MinTwoColumnCellWidth * 2)) { 2 } else { 1 }
+        if ($ColumnCount -eq 2) {
+            $CellWidth = [Math]::Max($MinTwoColumnCellWidth, [Math]::Min($MaxTwoColumnCellWidth, [Math]::Floor(($Width - $ColumnGap) / 2)))
+        }
+        else {
+            $CellWidth = [Math]::Max(24, $Width - 2)
+        }
+        $RowCount = [Math]::Ceiling($Items.Count / $ColumnCount)
         $SelectedItem = $Items[$SelectedIndex]
         $SelectedHelp = Get-LaunchConfigItemHelp -Config $Config -Item $SelectedItem
 
         for ($Row = 0; $Row -lt $RowCount; $Row++) {
-            for ($Column = 0; $Column -lt 2; $Column++) {
-                $ItemIndex = ($Row * 2) + $Column
+            for ($Column = 0; $Column -lt $ColumnCount; $Column++) {
+                $ItemIndex = ($Row * $ColumnCount) + $Column
                 if ($ItemIndex -ge $Items.Count) {
                     continue
                 }
@@ -6218,8 +6518,8 @@ function Show-LaunchConfigGrid {
                 $Foreground = if ($IsSelected) { "Black" } else { "Gray" }
                 $Background = if ($IsSelected) { "DarkCyan" } else { "Black" }
                 Write-Host $DisplayText -NoNewline -ForegroundColor $Foreground -BackgroundColor $Background
-                if ($Column -eq 0) {
-                    Write-Host "  " -NoNewline
+                if ($Column -lt ($ColumnCount - 1)) {
+                    Write-Host (" " * $ColumnGap) -NoNewline
                 }
             }
             Write-Host ""
@@ -6246,23 +6546,23 @@ function Show-LaunchConfigGrid {
         $Key = Read-ConsoleKey
         switch ($Key.VirtualKeyCode) {
             37 {
-                if (($SelectedIndex % 2) -eq 1) {
+                if ($ColumnCount -eq 2 -and ($SelectedIndex % 2) -eq 1) {
                     $SelectedIndex--
                 }
             }
             39 {
-                if (($SelectedIndex % 2) -eq 0 -and ($SelectedIndex + 1) -lt $Items.Count) {
+                if ($ColumnCount -eq 2 -and ($SelectedIndex % 2) -eq 0 -and ($SelectedIndex + 1) -lt $Items.Count) {
                     $SelectedIndex++
                 }
             }
             38 {
-                if (($SelectedIndex - 2) -ge 0) {
-                    $SelectedIndex -= 2
+                if (($SelectedIndex - $ColumnCount) -ge 0) {
+                    $SelectedIndex -= $ColumnCount
                 }
             }
             40 {
-                if (($SelectedIndex + 2) -lt $Items.Count) {
-                    $SelectedIndex += 2
+                if (($SelectedIndex + $ColumnCount) -lt $Items.Count) {
+                    $SelectedIndex += $ColumnCount
                 }
             }
             13 {
@@ -6296,6 +6596,10 @@ function Show-LaunchConfigGrid {
                         Write-Host $_.Exception.Message -ForegroundColor Red
                         Start-Sleep -Seconds 1
                     }
+                    continue
+                }
+                if ($SelectedItem.Type -eq "actionExportCommand") {
+                    Show-LaunchConfigCommandExport -Config $Config
                     continue
                 }
                 if ($SelectedItem.Type -eq "actionStart") {
@@ -6345,6 +6649,10 @@ function Show-LaunchConfigGrid {
                         Write-Host $_.Exception.Message -ForegroundColor Red
                         Start-Sleep -Seconds 1
                     }
+                    continue
+                }
+                if ($SelectedItem.Type -eq "actionExportCommand") {
+                    Show-LaunchConfigCommandExport -Config $Config
                     continue
                 }
                 if ($SelectedItem.Type -eq "actionStart") {
@@ -6755,6 +7063,7 @@ function Get-TrackedServerLaunchSettings {
             Device           = ""
             SplitMode        = ""
             TensorSplit      = ""
+            FlashAttention2  = ""
             ReasoningMode    = ""
             ReasoningBudget  = ""
             SpecType         = ""
@@ -6818,6 +7127,34 @@ function Get-TrackedServerLaunchSettings {
                 }
                 '^--tensor-split(?:=(.+))?$' {
                     $Settings.TensorSplit = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^(?:-fa|--flash-attn)(?:=(.+))?$' {
+                    $FlashAttnValue = if ($Matches[1]) {
+                        [string]$Matches[1]
+                    }
+                    elseif ((($Index + 1) -lt $Arguments.Count) -and ([string]$Arguments[$Index + 1] -notmatch '^-')) {
+                        [string]$Arguments[++$Index]
+                    }
+                    else {
+                        "on"
+                    }
+
+                    $NormalizedFlashAttn = $FlashAttnValue.Trim().ToLowerInvariant()
+                    if ([string]::IsNullOrWhiteSpace($NormalizedFlashAttn) -or @("1", "true", "on", "yes", "y") -contains $NormalizedFlashAttn) {
+                        $Settings.FlashAttention2 = "on"
+                    }
+                    elseif (@("0", "false", "off", "no", "n") -contains $NormalizedFlashAttn) {
+                        $Settings.FlashAttention2 = "off"
+                    }
+                    elseif ($NormalizedFlashAttn -eq "auto") {
+                        $Settings.FlashAttention2 = "auto"
+                    }
+                    else {
+                        $Settings.FlashAttention2 = $NormalizedFlashAttn
+                    }
+                }
+                '^--no-flash-attn$' {
+                    $Settings.FlashAttention2 = "off"
                 }
                 '^(?:-rea|--reasoning)(?:=(.+))?$' {
                     $Settings.ReasoningMode = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
@@ -8270,6 +8607,8 @@ function Show-ServerStatus {
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftNMax)) {
                 Write-BilingualField -ChineseLabel "草稿 Token 上限" -EnglishLabel "Draft" -ChineseValue ("{0}，最大推測 token 數（--spec-draft-n-max）" -f $TrackedSettings.SpecDraftNMax) -EnglishValue ("{0} max speculative tokens (--spec-draft-n-max)" -f $TrackedSettings.SpecDraftNMax)
             }
+            $FlashAttention2Value = Format-TrackedServerSettingValue -Value $TrackedSettings.FlashAttention2 -WhenMissing 'server default'
+            Write-BilingualField -ChineseLabel "FlashAttn2" -EnglishLabel "FlashAttn2" -ChineseValue ("{0}，Flash Attention 2 模式（--flash-attn）" -f $FlashAttention2Value) -EnglishValue ("{0} Flash Attention 2 mode (--flash-attn)" -f $FlashAttention2Value)
             Write-BilingualField -ChineseLabel "監控指標" -EnglishLabel "Metrics" -ChineseValue $(if ($TrackedSettings.Metrics) { "開啟（Prometheus /metrics 端點）" } else { "關閉（Prometheus /metrics 端點）" }) -EnglishValue $(if ($TrackedSettings.Metrics) { "on (Prometheus /metrics endpoint)" } else { "off (Prometheus /metrics endpoint)" })
             if ($TrackedSettings.ApiKey) {
                 Write-BilingualField -ChineseLabel "API 金鑰" -EnglishLabel "API Key" -ChineseValue "已設定（已啟用請求驗證）" -EnglishValue "set (request authentication enabled)"
