@@ -56,6 +56,20 @@ function Write-RuntimeOwnerState {
     Move-Item -LiteralPath $TempPath -Destination $RuntimeOwnerStateFile -Force
 }
 
+function ConvertFrom-Base64JsonArray {
+    param(
+        [string]$EncodedValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($EncodedValue)) {
+        return @()
+    }
+
+    $Json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EncodedValue))
+    $Decoded = $Json | ConvertFrom-Json -ErrorAction Stop
+    return @($Decoded)
+}
+
 function ConvertTo-ArgumentString {
     param(
         [string[]]$Arguments
@@ -132,7 +146,9 @@ function Stop-WatchdogProcesses {
 
     $State = Read-RuntimeOwnerState
     if ($State) {
-        $State.watchdog_pid = $null
+        $State | Add-Member -NotePropertyName watchdog_pid -NotePropertyValue $null -Force
+        $State | Add-Member -NotePropertyName watchdog_enabled -NotePropertyValue $false -Force
+        $State | Add-Member -NotePropertyName status -NotePropertyValue "running-unmanaged" -Force
         Write-RuntimeOwnerState -State $State
     }
 
@@ -145,14 +161,10 @@ function Start-WatchdogProcess {
         throw "Cannot start watchdog because runtime ownership state is missing: $RuntimeOwnerStateFile"
     }
 
-    [int]$ServerPid = 0
-    if (-not [int]::TryParse([string]$State.server_pid, [ref]$ServerPid) -or $ServerPid -le 0) {
-        throw "Runtime ownership state does not contain a valid server_pid."
-    }
-
-    $ServerProcess = Get-Process -Id $ServerPid -ErrorAction SilentlyContinue
-    if (-not $ServerProcess) {
-        throw "Cannot start watchdog because tracked llama-server.exe PID $ServerPid is not running."
+    $StateServerExe = [string]$State.server_exe
+    $StateServerArgs = @($State.server_args | ForEach-Object { [string]$_ })
+    if ([string]::IsNullOrWhiteSpace($StateServerExe) -or $StateServerArgs.Count -eq 0) {
+        throw "Runtime ownership state does not contain a valid server launch configuration."
     }
 
     $ExistingWatchdog = Get-AnyRunningWatchdogProcess
@@ -186,6 +198,8 @@ function Start-WatchdogProcess {
         $WatchdogLog
         "-ServerExeCandidatesBase64"
         $EncodedCandidates
+        "-Mode"
+        "attach"
         "-IntervalSec"
         "15"
     )
@@ -198,7 +212,11 @@ function Start-WatchdogProcess {
         throw "Watchdog process exited before startup completed."
     }
 
-    $State.watchdog_pid = [int]$StartedProcess.Id
+    $State | Add-Member -NotePropertyName watchdog_pid -NotePropertyValue ([int]$StartedProcess.Id) -Force
+    $State | Add-Member -NotePropertyName watchdog_enabled -NotePropertyValue $true -Force
+    if ([string]::Equals([string]$State.status, "running-unmanaged", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $State | Add-Member -NotePropertyName status -NotePropertyValue "running" -Force
+    }
     Write-RuntimeOwnerState -State $State
 
     return [pscustomobject]@{
@@ -220,11 +238,20 @@ if ($Status) {
         if ($State -and $State.server_pid) {
             Write-Host "Server  : $($State.server_pid)"
         }
+        if ($State -and $State.restart_count -ne $null) {
+            Write-Host "Restarts: $($State.restart_count)"
+        }
+        if ($State -and $State.status) {
+            Write-Host "Status  : $($State.status)"
+        }
     }
     else {
         Write-Host "Watchdog: stopped" -ForegroundColor Yellow
         if (-not $State) {
             Write-Host "State   : runtime ownership state missing"
+        }
+        elseif ($State.status) {
+            Write-Host "Status  : $($State.status)"
         }
     }
     return

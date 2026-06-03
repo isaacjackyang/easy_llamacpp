@@ -628,10 +628,12 @@ function Get-LiveRuntimeOwnerState {
         $RuntimeState | Add-Member -NotePropertyName watchdog_pid -NotePropertyValue $null -Force
     }
 
-    if ($HasValidServerProcess -and ($HasValidWatchdogProcess -or $StateInStartupGrace)) {
+    if ($HasValidServerProcess) {
+        $RuntimeState | Add-Member -NotePropertyName watchdog_managed -NotePropertyValue $HasValidWatchdogProcess -Force
         $RuntimeState | Add-Member -NotePropertyName startup_grace -NotePropertyValue $false -Force
     }
-    elseif ($StateInStartupGrace -and $HasLiveServerProcess) {
+    elseif ($StateInStartupGrace -and ($HasLiveServerProcess -or $HasValidWatchdogProcess)) {
+        $RuntimeState | Add-Member -NotePropertyName watchdog_managed -NotePropertyValue $HasValidWatchdogProcess -Force
         $RuntimeState | Add-Member -NotePropertyName startup_grace -NotePropertyValue $true -Force
     }
     else {
@@ -3561,7 +3563,7 @@ function Get-ModelGenerationArgs {
 
     $ResolvedModelPath = if ($ModelEntry -and $ModelEntry.PSObject.Properties["path"]) { [string]$ModelEntry.path } else { $null }
     $UseQwen36MtpDefaults = Test-Qwen36MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $UserArguments
-    $DefaultTemperature = if ($UseQwen36MtpDefaults) { "0.3" } else { "0.35" }
+    $DefaultTemperature = "0.3"
     $Generation = $null
     if ($ModelEntry -and $ModelEntry.PSObject.Properties["generation"] -and $null -ne $ModelEntry.generation) {
         $Generation = $ModelEntry.generation
@@ -3749,6 +3751,10 @@ function Convert-ForwardArgsToMenuConfig {
 
     $Config = [ordered]@{
         ContextSize     = ""
+        Temperature     = ""
+        TopK            = ""
+        TopP            = ""
+        MinP            = ""
         Host            = "127.0.0.1"
         Metrics         = $false
         ApiKey          = ""
@@ -3776,6 +3782,18 @@ function Convert-ForwardArgsToMenuConfig {
         switch -Regex ($Argument) {
             '^--ctx-size(?:=(.+))?$' {
                 $Config.ContextSize = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^--temp(?:=(.+))?$' {
+                $Config.Temperature = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^--top-k(?:=(.+))?$' {
+                $Config.TopK = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^--top-p(?:=(.+))?$' {
+                $Config.TopP = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^--min-p(?:=(.+))?$' {
+                $Config.MinP = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
             '^--host(?:=(.+))?$' {
                 $Config.Host = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
@@ -3867,6 +3885,26 @@ function Convert-MenuConfigToForwardArgs {
     if ($Config.ContextSize) {
         $Arguments.Add("--ctx-size")
         $Arguments.Add([string]$Config.ContextSize)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.Temperature)) {
+        $Arguments.Add("--temp")
+        $Arguments.Add([string]$Config.Temperature)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.TopK)) {
+        $Arguments.Add("--top-k")
+        $Arguments.Add([string]$Config.TopK)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.TopP)) {
+        $Arguments.Add("--top-p")
+        $Arguments.Add([string]$Config.TopP)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.MinP)) {
+        $Arguments.Add("--min-p")
+        $Arguments.Add([string]$Config.MinP)
     }
 
     if ($Config.Host) {
@@ -4073,6 +4111,10 @@ function Get-SavedLaunchProfilePersistedKeys {
         "ReadyTimeoutSec"
         "OpenPath"
         "ContextSize"
+        "Temperature"
+        "TopK"
+        "TopP"
+        "MinP"
         "Host"
         "Metrics"
         "ApiKey"
@@ -5656,6 +5698,10 @@ function New-LaunchConfig {
         ReadyTimeoutSec   = [string]$ReadyTimeoutSec
         OpenPath          = if ($OpenPath) { $OpenPath } else { "/" }
         ContextSize       = [string]$ForwardConfig.ContextSize
+        Temperature       = [string]$ForwardConfig.Temperature
+        TopK              = [string]$ForwardConfig.TopK
+        TopP              = [string]$ForwardConfig.TopP
+        MinP              = [string]$ForwardConfig.MinP
         Host              = if ($ForwardConfig.Host) { [string]$ForwardConfig.Host } else { "127.0.0.1" }
         Metrics           = [bool]$ForwardConfig.Metrics
         ApiKey            = [string]$ForwardConfig.ApiKey
@@ -5697,6 +5743,10 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "MtpEnabled"; Label = "MTP"; Type = "bool" },
         [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數，Unsloth 預設為 2" -EnglishText "positive integer; Unsloth default is 2") },
         [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
+        [pscustomobject]@{ Key = "Temperature"; Label = "Temp"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.3" -EnglishText "blank uses the default; example: 0.3") },
+        [pscustomobject]@{ Key = "TopK"; Label = "Top K"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 20" -EnglishText "blank uses the default; example: 20") },
+        [pscustomobject]@{ Key = "TopP"; Label = "Top P"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.95" -EnglishText "blank uses the default; example: 0.95") },
+        [pscustomobject]@{ Key = "MinP"; Label = "Min P"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0" -EnglishText "blank uses the default; example: 0") },
         [pscustomobject]@{ Key = "Host"; Label = "Host"; Type = "text"; Hint = "127.0.0.1 or 0.0.0.0" },
         [pscustomobject]@{ Key = "Metrics"; Label = "Metrics"; Type = "bool" },
         [pscustomobject]@{ Key = "ApiKey"; Label = "API Key"; Type = "text" },
@@ -5743,6 +5793,10 @@ function Get-LaunchConfigDefaultText {
         "MtpEnabled" { return $(if (Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for Qwen3.6 MTP GGUF" } else { "off" }) }
         "SpecDraftNMax" { return "2" }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
+        "Temperature" { return "0.3" }
+        "TopK" { return "20" }
+        "TopP" { return "0.95" }
+        "MinP" { return "0" }
         "ApiKey" { return "none" }
         "Device" { return "auto" }
         "SplitMode" { return "llama.cpp default" }
@@ -5836,6 +5890,34 @@ function Get-LaunchConfigValueText {
             }
 
             return [string]$Config.SpecDraftNMax
+        }
+        "Temperature" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.Temperature)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.Temperature
+        }
+        "TopK" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.TopK)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.TopK
+        }
+        "TopP" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.TopP)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.TopP
+        }
+        "MinP" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.MinP)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.MinP
         }
         "ApiKey" {
             if ([string]::IsNullOrWhiteSpace($Config.ApiKey)) {
@@ -5990,6 +6072,30 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定總 context size。留空時會回退到 wrapper 管理的預設值。" -EnglishText "Sets total context size. Blank falls back to the wrapper managed default."
                 Recommendation = Format-BilingualText -ChineseText "除非你已經驗證過更大的 context，否則先用管理預設值。遇到 VRAM 壓力導致啟動失敗時，第一步先往下降。" -EnglishText "Start at the managed default unless you already validated a larger context. Lower it first when VRAM pressure causes startup failures."
+            }
+        }
+        "Temperature" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "控制採樣溫度，決定輸出要保守還是更發散。" -EnglishText "Controls sampling temperature, which shifts output between conservative and more varied behavior."
+                Recommendation = Format-BilingualText -ChineseText "先從 `0.3` 開始。要更穩定就往下調；要更有變化再慢慢往上加，不要一次拉太高。" -EnglishText "Start at 0.3. Lower it for more stable output, or raise it gradually when you want more variation."
+            }
+        }
+        "TopK" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "限制每一步採樣時只在前 K 個候選 token 之間挑選。" -EnglishText "Restricts each sampling step to the top K candidate tokens."
+                Recommendation = Format-BilingualText -ChineseText "一般先用 `20`。想讓輸出更收斂可再降低；只有你明確想放寬候選空間時才往上加。" -EnglishText "Start with 20. Lower it for tighter output, and raise it only when you deliberately want a wider candidate pool."
+            }
+        }
+        "TopP" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "使用 nucleus sampling，根據累積機率決定保留多少候選 token。" -EnglishText "Uses nucleus sampling to keep candidates up to a cumulative probability threshold."
+                Recommendation = Format-BilingualText -ChineseText "一般先用 `0.95`。想更穩定可往下調到 `0.9` 左右；不要同時把 `temp` 和 `top-p` 都拉得太激進。" -EnglishText "Start with 0.95. Lower it toward 0.9 for more stable output, and avoid making both temp and top-p aggressive at the same time."
+            }
+        }
+        "MinP" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定最小機率門檻，用來過濾過低機率的候選 token。" -EnglishText "Sets a minimum probability threshold that filters out very low-probability token candidates."
+                Recommendation = Format-BilingualText -ChineseText "先維持 `0`。只有你已經確認模型會亂飄，才再逐步往上調。" -EnglishText "Keep this at 0 initially. Raise it gradually only after confirming the model is drifting too much."
             }
         }
         "Host" {
@@ -6185,6 +6291,30 @@ function Edit-LaunchConfigItem {
             }
             if ($Item.Key -eq "OpenPath" -and $Value -and -not $Value.StartsWith("/")) {
                 $Value = "/$Value"
+            }
+            if ($Item.Key -eq "Temperature" -and -not [string]::IsNullOrWhiteSpace($Value)) {
+                [double]$ParsedValue = 0
+                if (-not [double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$ParsedValue) -or $ParsedValue -lt 0) {
+                    throw "Temp must be blank or a non-negative number."
+                }
+            }
+            if ($Item.Key -eq "TopK" -and -not [string]::IsNullOrWhiteSpace($Value)) {
+                [int]$ParsedTopK = 0
+                if (-not [int]::TryParse($Value, [ref]$ParsedTopK) -or $ParsedTopK -lt 0) {
+                    throw "Top K must be blank or a non-negative integer."
+                }
+            }
+            if ($Item.Key -eq "TopP" -and -not [string]::IsNullOrWhiteSpace($Value)) {
+                [double]$ParsedTopP = 0
+                if (-not [double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$ParsedTopP) -or $ParsedTopP -lt 0 -or $ParsedTopP -gt 1) {
+                    throw "Top P must be blank or a number between 0 and 1."
+                }
+            }
+            if ($Item.Key -eq "MinP" -and -not [string]::IsNullOrWhiteSpace($Value)) {
+                [double]$ParsedMinP = 0
+                if (-not [double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$ParsedMinP) -or $ParsedMinP -lt 0 -or $ParsedMinP -gt 1) {
+                    throw "Min P must be blank or a number between 0 and 1."
+                }
             }
             $Config[$Item.Key] = $Value
         }
@@ -6762,13 +6892,13 @@ function Stop-TrackedServer {
     }
 
     $TargetIds = New-Object System.Collections.Generic.List[int]
-    $TargetIds.Add([int]$TrackedProcess.Id)
-    if ($LiveState -and $LiveState.supervisor_pid) {
-        $TargetIds.Add([int]$LiveState.supervisor_pid)
-    }
     if ($LiveState -and $LiveState.watchdog_pid) {
         $TargetIds.Add([int]$LiveState.watchdog_pid)
     }
+    if ($LiveState -and $LiveState.supervisor_pid) {
+        $TargetIds.Add([int]$LiveState.supervisor_pid)
+    }
+    $TargetIds.Add([int]$TrackedProcess.Id)
 
     foreach ($TargetId in @($TargetIds | Select-Object -Unique)) {
         try {
@@ -7677,14 +7807,9 @@ function Stop-WorkspaceServerProcesses {
     }
 
     $TargetIds = @(
-        $WorkspaceServerProcesses |
-            ForEach-Object { [int]$_.ProcessId } |
-            Select-Object -Unique
-    )
-    $TargetIds = @(
-        $TargetIds +
+        @($WorkspaceWatchdogProcesses | ForEach-Object { [int]$_.ProcessId }) +
         @($WorkspaceSupervisorProcesses | ForEach-Object { [int]$_.ProcessId }) +
-        @($WorkspaceWatchdogProcesses | ForEach-Object { [int]$_.ProcessId }) |
+        @($WorkspaceServerProcesses | ForEach-Object { [int]$_.ProcessId }) |
             Select-Object -Unique
     )
     $StoppedIds = New-Object System.Collections.Generic.List[int]
@@ -8840,15 +8965,19 @@ try {
     $LaunchSessionId = [guid]::NewGuid().ToString()
     $PowerShellHostPath = Get-CurrentHostExecutablePath
     $EncodedServerArgs = ConvertTo-Base64Json -Value @($ServerArgs)
-    $SupervisorArgumentList = @(
+    $WatchdogArgumentList = @(
         "-NoLogo"
         "-NoProfile"
         "-ExecutionPolicy"
         "Bypass"
         "-File"
-        $SupervisorScriptPath
+        $WatchdogScriptPath
         "-ProjectRoot"
         $ScriptRoot
+        "-Mode"
+        "launch"
+        "-ServerExeCandidatesBase64"
+        (ConvertTo-Base64Json -Value @($ServerExeCandidates))
         "-ServerExe"
         $ServerExe
         "-ServerArgsBase64"
@@ -8867,9 +8996,7 @@ try {
         $WatchdogPidFile
         "-WatchdogLog"
         $WatchdogLog
-        "-WatchdogScriptPath"
-        $WatchdogScriptPath
-        "-WatchdogIntervalSec"
+        "-IntervalSec"
         ([string]$WatchdogIntervalSec)
         "-SessionId"
         $LaunchSessionId
@@ -8881,12 +9008,12 @@ try {
         $ModelPath
     )
     if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
-        $SupervisorArgumentList += @(
+        $WatchdogArgumentList += @(
             "-MmprojPath"
             $LaunchMmprojPath
         )
     }
-    $SupervisorArgumentString = ConvertTo-ArgumentString -Arguments $SupervisorArgumentList
+    $WatchdogArgumentString = ConvertTo-ArgumentString -Arguments $WatchdogArgumentList
 
     if ($Background) {
         $StartupCheckSec = [Math]::Min($BackgroundStartupCheckSec, [Math]::Max(10, $ReadyTimeoutSec))
@@ -8905,7 +9032,7 @@ try {
             Reset-BackgroundServerLogs
             $BackgroundProcess = Start-Process `
                 -FilePath $PowerShellHostPath `
-                -ArgumentList $SupervisorArgumentString `
+                -ArgumentList $WatchdogArgumentString `
                 -WorkingDirectory $ScriptRoot `
                 -WindowStyle Hidden `
                 -PassThru
@@ -9070,7 +9197,7 @@ try {
     }
 
     Write-LaunchAuditRecord -ServerArgs $ServerArgs -AutoTuning $AutoLaunchTuning -LaunchMode "foreground" -StartupState "invoking"
-    & $PowerShellHostPath @SupervisorArgumentList
+    & $PowerShellHostPath @WatchdogArgumentList
     if ($LASTEXITCODE -ne 0) {
         throw (Format-BilingualText -ChineseText ("llama.cpp 已結束，結束碼為 $LASTEXITCODE。") -EnglishText ("llama.cpp exited with code $LASTEXITCODE."))
     }
