@@ -190,11 +190,16 @@ function Remove-RuntimeArtifactFiles {
 }
 
 function Stop-LlamaCppRuntime {
-    $Processes = @((
-        @(Get-LlamaCppProcesses) +
+    $Processes = @(
+        @(Get-ScriptProcesses -ScriptPath $WatchdogScriptPath) +
         @(Get-ScriptProcesses -ScriptPath $SupervisorScriptPath) +
-        @(Get-ScriptProcesses -ScriptPath $WatchdogScriptPath)
-    ) | Sort-Object ProcessId -Unique)
+        @(Get-LlamaCppProcesses)
+    )
+    $Processes = @(
+        $Processes |
+            Group-Object ProcessId |
+            ForEach-Object { $_.Group | Select-Object -First 1 }
+    )
     $RemovedStalePid = $false
 
     if ($Processes.Count -eq 0) {

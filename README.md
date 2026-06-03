@@ -14,6 +14,9 @@ stop.cmd
 install.cmd
 install_latest.cmd
 stop_llamacpp.cmd
+Monitor.cmd
+Monitor.vbs
+Monitor.py
 README.md
 PS1\
   Install_LCPP_Prebuilt.ps1
@@ -177,6 +180,64 @@ If you only want to install the Windows autostart scheduled task by itself, use:
 .\PS1\Install_LCPP_Autostart.ps1 -TriggerMode Startup
 ```
 
+## 服務監看 GUI / Service Monitor GUI
+
+目前 repo 內建一個單檔 GUI 監看工具：[Monitor.py](F:/Documents/GitHub/easy_llamacpp/Monitor.py)。  
+This repo now includes a single-file GUI monitor: [Monitor.py](F:/Documents/GitHub/easy_llamacpp/Monitor.py).
+
+它會集中顯示這些本機服務狀態：  
+It shows the live status of these local services in one place:
+
+- `llama.cpp`
+- `llama Watchdog`
+- `Hermes Dashboard`
+- `Hermes Gateway`
+- `Hermes Main Entry`
+- `TTS`
+- `ASR`
+
+直接啟動方式：  
+Launch it directly with:
+
+```text
+double-click Monitor.vbs
+```
+
+```bat
+.\Monitor.cmd
+```
+
+```powershell
+python .\Monitor.py
+```
+
+如果只想輸出一次 JSON 狀態快照，可用：  
+If you only want a one-shot JSON snapshot, use:
+
+```powershell
+python .\Monitor.py --snapshot
+```
+
+這個 GUI 目前提供：
+The GUI currently provides:
+
+- 中英雙行標題與內容  
+  Bilingual Chinese/English titles and details
+- `精簡 / Compact` 與 `詳細 / Detailed` 顯示模式  
+  `Compact` and `Detailed` display modes
+- 每個服務各自的 `Start / Stop` 按鈕  
+  Per-service `Start / Stop` buttons
+- 用卡片右上角的 `拖拉 / Drag` 標籤重排區塊順序，並把順序保存到下次開啟  
+  Reorder cards by dragging the `拖拉 / Drag` label in the top-right corner, with the layout persisted across launches
+- `llama Watchdog` 卡片，可查看 watchdog PID、追蹤中的 server PID、runtime 狀態與自動重啟次數  
+  A `llama Watchdog` card showing the watchdog PID, tracked server PID, runtime state, and restart count
+
+`Compact` 模式下，卡片只保留服務名稱、按鈕與 `OK / WARN / DOWN` 狀態。  
+In `Compact` mode, each card only keeps the service name, buttons, and the `OK / WARN / DOWN` badge.
+
+如果你想雙擊後直接靜默開啟 GUI、不出現黑色命令視窗，請用 [Monitor.vbs](F:/Documents/GitHub/easy_llamacpp/Monitor.vbs)。  
+If you want a double-click launcher that opens the GUI silently without a black console window, use [Monitor.vbs](F:/Documents/GitHub/easy_llamacpp/Monitor.vbs).
+
 第一層選單提供這幾個入口：  
 The first screen provides these main entry points:
 
@@ -185,8 +246,8 @@ The first screen provides these main entry points:
   Pick a model, then choose `Background Service` or `Open Web UI`. If that model already has saved custom profiles, Quick Start shows them first so you can launch with one directly.
 
 - `Tune And Launch`
-  先選模型，再進入可用鍵盤操作的參數矩陣畫面。用方向鍵移動，按 `Enter` 或 `Space` 編輯目前格子。矩陣裡包含 `GPU Layers`、`Repeating Layers`、`Reasoning`、`Think Level`、`MTP`、`SPEC_DRAFT_N_MAX`、`Auto Tune`，以及新的 `Apply Auto Tune Learned Values` 和 `Save Profile` 動作。當你用方向鍵移動高亮欄位時，畫面下方會同步顯示該選項的功能與建議數值，方便直接在選單裡判斷要不要改。`Auto Tune` 開啟後，腳本會在這次啟動真的完整塞進 GPU 且 VRAM 使用率接近目標時，把學到的參數寫進 `model-tuning.json`；`Apply Auto Tune Learned Values` 可以把匹配到的 learned profile 直接轉成這一頁的明確設定；而 `Save Profile` 會把你目前這一頁的手動設定存進 `launch-profiles.json`，供之後在 Quick Start 直接套用。  
-  Pick a model, then open a keyboard-driven parameter matrix. Use arrow keys to move and press `Enter` or `Space` to edit the current cell. The matrix now includes fields such as `GPU Layers`, `Repeating Layers`, `Reasoning`, `Think Level`, `MTP`, `SPEC_DRAFT_N_MAX`, `Auto Tune`, plus the new `Apply Auto Tune Learned Values` and `Save Profile` actions. As you move the highlight with the arrow keys, the bottom panel updates with a plain-language explanation and a recommended starting value for the selected field. When `Auto Tune` is enabled, the script saves learned parameters to `model-tuning.json` after a launch that fully fits on GPU and lands near the target VRAM usage; `Apply Auto Tune Learned Values` can materialize a matching learned profile into explicit values on the current page; `Save Profile` stores the current manual page settings in `launch-profiles.json` so Quick Start can reuse them later.
+  先選模型，再進入可用鍵盤操作的參數矩陣畫面。用方向鍵移動，按 `Enter` 或 `Space` 編輯目前格子。矩陣裡包含 `GPU Layers`、`Repeating Layers`、`Reasoning`、`Think Level`、`MTP`、`SPEC_DRAFT_N_MAX`、`Context Size`，以及可直接調整的 `Temp`、`Top K`、`Top P`、`Min P`，再加上 `Auto Tune`、`Apply Auto Tune Learned Values` 和 `Save Profile` 動作。當你用方向鍵移動高亮欄位時，畫面下方會同步顯示該選項的功能與建議數值，方便直接在選單裡判斷要不要改。`Auto Tune` 開啟後，腳本會在這次啟動真的完整塞進 GPU 且 VRAM 使用率接近目標時，把學到的參數寫進 `model-tuning.json`；`Apply Auto Tune Learned Values` 可以把匹配到的 learned profile 直接轉成這一頁的明確設定；而 `Save Profile` 會把你目前這一頁的手動設定存進 `launch-profiles.json`，供之後在 Quick Start 直接套用。  
+  Pick a model, then open a keyboard-driven parameter matrix. Use arrow keys to move and press `Enter` or `Space` to edit the current cell. The matrix now includes fields such as `GPU Layers`, `Repeating Layers`, `Reasoning`, `Think Level`, `MTP`, `SPEC_DRAFT_N_MAX`, `Context Size`, plus directly adjustable `Temp`, `Top K`, `Top P`, and `Min P`, along with `Auto Tune`, `Apply Auto Tune Learned Values`, and `Save Profile` actions. As you move the highlight with the arrow keys, the bottom panel updates with a plain-language explanation and a recommended starting value for the selected field. When `Auto Tune` is enabled, the script saves learned parameters to `model-tuning.json` after a launch that fully fits on GPU and lands near the target VRAM usage; `Apply Auto Tune Learned Values` can materialize a matching learned profile into explicit values on the current page; `Save Profile` stores the current manual page settings in `launch-profiles.json` so Quick Start can reuse them later.
 
 - `Server Status` / `Stop Running Server` / `llama-server Help`
   常用維護動作也保留在主選單。  
@@ -530,7 +591,7 @@ If no tracked server is running, the script starts a new one.
 每次進入實際啟動流程前，腳本都會先清理這個工作資料夾下舊的 `llama-server.exe` 進程，再啟動新的 server。  
 Before each actual launch, the script clears older `llama-server.exe` processes started from this workspace, then starts a fresh server.
 
-Background launches now go through a small PowerShell supervisor that writes runtime ownership state to `logs/llama-runtime-owner.json` and starts a watchdog. `-Status`, `-Stop`, `start.cmd`, and `stop.ps1` treat that ownership state as authoritative and automatically clear untracked workspace `llama-server.exe` instances.
+Background launches now go through a single PowerShell watchdog manager that writes runtime ownership state to `logs/llama-runtime-owner.json`, starts `llama-server.exe`, keeps watching it with `Wait-Process`, and automatically relaunches it if the child exits unexpectedly. `-Status`, `-Stop`, `start.cmd`, and `stop.ps1` treat that ownership state as authoritative and automatically clear untracked workspace `llama-server.exe` instances.
 
 如果 `-GpuLayers` 保持 `auto`，腳本還會在啟動時偵測目前可用的 GPU VRAM 與系統 RAM，動態調整 `--fit-target`、`--cache-ram`，目標是盡量吃滿 VRAM，但減少把壓力打到 pagefile / SSD 的機率。`llama.cpp` server slot 會固定帶 `--parallel 1`。  
 If `-GpuLayers` stays at `auto`, the script also detects currently available GPU VRAM and system RAM at launch time and adjusts `--fit-target` and `--cache-ram`, aiming to fill VRAM while reducing the chance of spilling pressure into the pagefile / SSD. The `llama.cpp` server always uses `--parallel 1`.
@@ -693,11 +754,11 @@ Rollback steps:
 - `logs/launch-audit.jsonl`：每次實際進入啟動流程時追加一筆 JSONL 審計紀錄，包含入口腳本、PowerShell / cmd 呼叫鏈、模型、埠號與完整 `llama-server.exe` 參數。  
   `logs/launch-audit.jsonl`: Appends one JSONL audit record for each real launch attempt, including the entry script, PowerShell / cmd caller chain, model, port, and full `llama-server.exe` arguments.
 
-- `logs/llama-runtime-owner.json`：目前受管 runtime 的 ownership state，包含 `server_pid`、watchdog PID、模型路徑與啟動參數。只要這份 state 消失，`-Status` / `-Stop` / watchdog 會把殘留的 workspace `llama-server.exe` 當成 untracked instance 清掉。  
-  `logs/llama-runtime-owner.json`: Ownership state for the managed runtime, including `server_pid`, watchdog PID, model path, and launch arguments. If this state disappears, `-Status`, `-Stop`, and the watchdog treat any remaining workspace `llama-server.exe` as an untracked instance and clear it.
+- `logs/llama-runtime-owner.json`：目前受管 runtime 的 ownership state，包含 `server_pid`、watchdog PID、模型路徑、啟動參數，以及自動恢復狀態（例如 `restart_count`、`last_restart_at`、`last_exit_code`）。背景模式下是 unified watchdog 直接持有 child lifecycle，並在子程序異常退出時自動重啟。只要這份 state 消失，`-Status` / `-Stop` / watchdog 會把殘留的 workspace `llama-server.exe` 當成 untracked instance 清掉。  
+  `logs/llama-runtime-owner.json`: Ownership state for the managed runtime, including `server_pid`, watchdog PID, model path, launch arguments, and auto-recovery metadata such as `restart_count`, `last_restart_at`, and `last_exit_code`. In background mode the unified watchdog directly owns the child lifecycle and automatically restarts the server if it exits unexpectedly. If this state disappears, `-Status`, `-Stop`, and the watchdog treat any remaining workspace `llama-server.exe` as an untracked instance and clear it.
 
-- `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`：背景 watchdog 的 PID 與事件紀錄。它會保留 state 指向的 managed server，並定期清除不屬於目前 owner state 的 workspace `llama-server.exe`。  
-  `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`: PID and event log for the background watchdog. It preserves the server claimed by the current owner state and periodically clears workspace `llama-server.exe` instances that do not belong to it.
+- `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`：統一 watchdog manager 的 PID 與事件紀錄。它同時負責啟動 `llama-server.exe`、定期巡檢、清除非法的 workspace server，並在 managed server 異常退出時自動恢復。  
+  `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`: PID and event log for the unified watchdog manager. It is responsible for launching `llama-server.exe`, performing periodic reconciliation, clearing illegal workspace servers, and automatically recovering the managed server after unexpected exits.
 
 - `json/model-index.json`：互動式選單使用的模型索引。  
   `json/model-index.json`: Model index used by the interactive launcher.
