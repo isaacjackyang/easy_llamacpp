@@ -63,6 +63,27 @@ def bi(zh: str, en: str) -> str:
     return f"{zh}\n{en}"
 
 
+def choose_text(zh: str, en: str, language: str) -> str:
+    if language == "zh":
+        return zh
+    if language == "en":
+        return en
+    if zh == en:
+        return zh
+    return bi(zh, en)
+
+
+def choose_bilingual_value(value: str, language: str) -> str:
+    parts = str(value).splitlines()
+    if len(parts) >= 2:
+        return choose_text(parts[0], parts[1], language)
+    return str(value)
+
+
+def is_command_detail(value: str) -> bool:
+    return str(value).startswith(("命令列:", "Command:"))
+
+
 def iso_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -827,7 +848,9 @@ def load_card_order() -> list[str]:
 def save_card_order(order: list[str]) -> None:
     JSON_ROOT.mkdir(parents=True, exist_ok=True)
     payload = {"card_order": [key for key in order if key in DEFAULT_CARD_ORDER]}
-    MONITOR_LAYOUT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = MONITOR_LAYOUT_FILE.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(MONITOR_LAYOUT_FILE)
 
 
 class MonitorApp:
@@ -841,16 +864,28 @@ class MonitorApp:
         self.stay_on_top = tk.BooleanVar(value=False)
         self.refresh_seconds = tk.StringVar(value="5")
         self.display_mode = tk.StringVar(value="detailed")
-        self.status_text = tk.StringVar(value=bi("正在收集服務狀態...", "Collecting service status..."))
+        self.language_mode = tk.StringVar(value="zh")
+        self.status_text = tk.StringVar(value=self.t("正在收集服務狀態...", "Collecting service status..."))
         self.card_widgets: dict[str, dict[str, Any]] = {}
         self.card_order = load_card_order()
         self.after_id: str | None = None
         self.snapshot: dict[str, Any] | None = None
         self.busy_services: set[str] = set()
         self.dragging_key: str | None = None
+        self.layout_dirty = False
+        self.refresh_in_progress = False
+        self.pending_refresh = False
+        self.canvas_window_id: int | None = None
+        self.current_columns = 2
 
         self._build_ui()
         self.refresh()
+
+    def t(self, zh: str, en: str) -> str:
+        return choose_text(zh, en, self.language_mode.get())
+
+    def tv(self, value: str) -> str:
+        return choose_bilingual_value(value, self.language_mode.get())
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -867,26 +902,30 @@ class MonitorApp:
 
         ttk.Label(
             toolbar,
-            text=bi("PYTHON THINKER 服務監看器", "PYTHON THINKER Service Monitor"),
+            text=self.t("PYTHON THINKER 服務監看器", "PYTHON THINKER Service Monitor"),
             style="Meta.TLabel",
             font=("Segoe UI", 18, "bold"),
             justify="left",
         ).pack(side="left")
 
-        ttk.Button(toolbar, text=bi("立即更新", "Refresh Now"), command=self.refresh).pack(side="right", padx=(8, 0))
-        ttk.Button(toolbar, text=bi("開啟 llama 記錄", "Open llama Logs"), command=lambda: self.open_path(EASY_LOGS)).pack(side="right", padx=(8, 0))
-        ttk.Button(toolbar, text=bi("開啟 Hermes 記錄", "Open Hermes Logs"), command=lambda: self.open_path(HERMES_HOME / "logs")).pack(side="right", padx=(8, 0))
-        ttk.Button(toolbar, text=bi("開啟儀表板", "Open Dashboard"), command=lambda: webbrowser.open("http://127.0.0.1:9119")).pack(side="right")
+        ttk.Button(toolbar, text=self.t("立即更新", "Refresh"), command=self.refresh).pack(side="right", padx=(8, 0))
+        ttk.Button(toolbar, text=self.t("llama 記錄", "llama Logs"), command=lambda: self.open_path(EASY_LOGS)).pack(side="right", padx=(8, 0))
+        ttk.Button(toolbar, text=self.t("Hermes 記錄", "Hermes Logs"), command=lambda: self.open_path(HERMES_HOME / "logs")).pack(side="right", padx=(8, 0))
+        ttk.Button(toolbar, text=self.t("儀表板", "Dashboard"), command=lambda: webbrowser.open("http://127.0.0.1:9119")).pack(side="right")
 
         controls = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 0, 12, 8))
         controls.pack(fill="x")
-        ttk.Checkbutton(controls, text=bi("自動更新", "Auto refresh"), variable=self.auto_refresh, command=self._schedule_refresh).pack(side="left")
-        ttk.Label(controls, text=bi("更新秒數", "Interval seconds"), style="Meta.TLabel").pack(side="left", padx=(16, 6))
+        ttk.Checkbutton(controls, text=self.t("自動更新", "Auto refresh"), variable=self.auto_refresh, command=self._schedule_refresh).pack(side="left")
+        ttk.Label(controls, text=self.t("更新秒數", "Interval"), style="Meta.TLabel").pack(side="left", padx=(16, 6))
         ttk.Entry(controls, textvariable=self.refresh_seconds, width=6).pack(side="left")
-        ttk.Checkbutton(controls, text=bi("視窗置頂", "Stay on top"), variable=self.stay_on_top, command=self._apply_topmost).pack(side="left", padx=(16, 0))
-        ttk.Label(controls, text=bi("顯示模式", "Display mode"), style="Meta.TLabel").pack(side="left", padx=(16, 6))
-        ttk.Radiobutton(controls, text=bi("精簡", "Compact"), value="compact", variable=self.display_mode, command=self._render_snapshot).pack(side="left")
-        ttk.Radiobutton(controls, text=bi("詳細", "Detailed"), value="detailed", variable=self.display_mode, command=self._render_snapshot).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(controls, text=self.t("視窗置頂", "Topmost"), variable=self.stay_on_top, command=self._apply_topmost).pack(side="left", padx=(16, 0))
+        ttk.Label(controls, text=self.t("顯示", "View"), style="Meta.TLabel").pack(side="left", padx=(16, 6))
+        ttk.Radiobutton(controls, text=self.t("精簡", "Compact"), value="compact", variable=self.display_mode, command=self._render_snapshot).pack(side="left")
+        ttk.Radiobutton(controls, text=self.t("詳細", "Detailed"), value="detailed", variable=self.display_mode, command=self._render_snapshot).pack(side="left", padx=(6, 0))
+        ttk.Label(controls, text=self.t("語言", "Language"), style="Meta.TLabel").pack(side="left", padx=(16, 6))
+        ttk.Radiobutton(controls, text="中", value="zh", variable=self.language_mode, command=self._render_snapshot).pack(side="left")
+        ttk.Radiobutton(controls, text="EN", value="en", variable=self.language_mode, command=self._render_snapshot).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(controls, text=self.t("雙語", "Both"), value="both", variable=self.language_mode, command=self._render_snapshot).pack(side="left", padx=(6, 0))
         ttk.Label(controls, textvariable=self.status_text, style="Meta.TLabel", justify="right").pack(side="right")
 
         canvas_holder = ttk.Frame(self.root, style="Toolbar.TFrame")
@@ -896,12 +935,13 @@ class MonitorApp:
         scrollbar = ttk.Scrollbar(canvas_holder, orient="vertical", command=self.canvas.yview)
         self.cards_frame = ttk.Frame(self.canvas, style="Toolbar.TFrame")
         self.cards_frame.bind("<Configure>", lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
+        self.canvas_window_id = self.canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=scrollbar.set)
 
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
 
         for key in DEFAULT_CARD_ORDER:
             self._create_card(key)
@@ -920,29 +960,31 @@ class MonitorApp:
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(0, weight=1)
 
-        title_label = ttk.Label(header, text=bi("載入中", "Loading"), style="Title.TLabel", font=("Segoe UI", 12, "bold"), justify="left")
+        title_label = ttk.Label(header, text=self.t("載入中", "Loading"), style="Title.TLabel", font=("Segoe UI", 12, "bold"), justify="left")
         title_label.grid(row=0, column=0, sticky="w")
 
         button_frame = ttk.Frame(header, style="Card.TFrame")
         button_frame.grid(row=0, column=1, sticky="e")
-        drag_label = ttk.Label(button_frame, text=bi("拖拉", "Drag"), style="Body.TLabel", justify="center", cursor="fleur")
+        drag_label = ttk.Label(button_frame, text=self.t("拖拉", "Drag"), style="Body.TLabel", justify="center", cursor="fleur")
         drag_label.pack(side="left", padx=(0, 8))
-        start_button = ttk.Button(button_frame, text=bi("啟動", "Start"), command=lambda service_key=key: self.trigger_action(service_key, "start"))
-        stop_button = ttk.Button(button_frame, text=bi("停止", "Stop"), command=lambda service_key=key: self.trigger_action(service_key, "stop"))
+        copy_button = ttk.Button(button_frame, text=self.t("複製命令", "Copy Cmd"), command=lambda service_key=key: self.copy_command(service_key))
+        start_button = ttk.Button(button_frame, text=self.t("啟動", "Start"), command=lambda service_key=key: self.trigger_action(service_key, "start"))
+        stop_button = ttk.Button(button_frame, text=self.t("停止", "Stop"), command=lambda service_key=key: self.trigger_action(service_key, "stop"))
         start_button.pack(side="left", padx=(0, 6))
         stop_button.pack(side="left")
+        copy_button.pack(side="left", padx=(6, 0))
 
-        badge = tk.Label(frame, text=bi("待定", "PENDING"), bg="#475569", fg="white", font=("Segoe UI", 10, "bold"), padx=10, pady=4, justify="center")
+        badge = tk.Label(frame, text=self.t("待定", "PENDING"), bg="#475569", fg="white", font=("Segoe UI", 10, "bold"), padx=10, pady=4, justify="center")
         badge.grid(row=1, column=0, sticky="w", pady=(10, 0))
 
-        summary = ttk.Label(frame, text=bi("等待第一次更新...", "Waiting for first refresh..."), style="Body.TLabel", font=("Segoe UI", 11, "bold"), wraplength=540, justify="left")
+        summary = ttk.Label(frame, text=self.t("等待第一次更新...", "Waiting for first refresh..."), style="Body.TLabel", font=("Segoe UI", 11, "bold"), wraplength=540, justify="left")
         summary.grid(row=2, column=0, sticky="w", pady=(10, 6))
 
         details = tk.Text(frame, height=10, wrap="word", bg="#111827", fg="#dbeafe", insertbackground="#dbeafe", relief="flat", font=("Consolas", 10))
         details.grid(row=3, column=0, sticky="nsew")
         details.configure(state="disabled")
 
-        meta = ttk.Label(frame, text=bi("更新時間: -", "Updated: -"), style="Body.TLabel", justify="left")
+        meta = ttk.Label(frame, text=self.t("更新時間: -", "Updated: -"), style="Body.TLabel", justify="left")
         meta.grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         drag_label.bind("<ButtonPress-1>", lambda event, service_key=key: self._on_card_drag_start(service_key))
@@ -958,16 +1000,24 @@ class MonitorApp:
             "meta": meta,
             "start": start_button,
             "stop": stop_button,
+            "copy": copy_button,
             "drag": drag_label,
+            "command": "",
         }
 
     def _reflow_cards(self) -> None:
+        for widgets in self.card_widgets.values():
+            widgets["frame"].grid_forget()
+
+        for col in range(2):
+            self.cards_frame.grid_columnconfigure(col, weight=1 if col < self.current_columns else 0)
+
         for index, key in enumerate(self.card_order):
             widgets = self.card_widgets.get(key)
             if not widgets:
                 continue
-            row = index // 2
-            column = index % 2
+            row = index // self.current_columns
+            column = index % self.current_columns
             widgets["frame"].grid(row=row, column=column, sticky="nsew", padx=8, pady=8)
 
     def _move_card(self, dragged_key: str, target_key: str, insert_after: bool) -> None:
@@ -985,13 +1035,13 @@ class MonitorApp:
             return
 
         self.card_order = new_order
-        save_card_order(self.card_order)
+        self.layout_dirty = True
         self._reflow_cards()
 
     def _on_card_drag_start(self, service_key: str) -> None:
         self.dragging_key = service_key
         self.status_text.set(
-            bi(
+            self.t(
                 f"正在拖拉 {service_key.upper()}，移到其他卡片上方或下方即可重排。",
                 f"Dragging {service_key.upper()}. Move over another card to reorder it.",
             )
@@ -1011,9 +1061,17 @@ class MonitorApp:
             return
         released_key = self.dragging_key
         self.dragging_key = None
+        if self.layout_dirty:
+            try:
+                save_card_order(self.card_order)
+            except OSError as exc:
+                self.status_text.set(self.t(f"卡片順序儲存失敗：{exc}", f"Failed to save card order: {exc}"))
+                return
+            finally:
+                self.layout_dirty = False
         counts = self.snapshot["counts"] if self.snapshot else {"ok": 0, "warn": 0, "down": 0}
         self.status_text.set(
-            bi(
+            self.t(
                 f"已更新 {released_key.upper()} 的卡片順序 | OK {counts['ok']} WARN {counts['warn']} DOWN {counts['down']}",
                 f"Updated card order for {released_key.upper()} | OK {counts['ok']} WARN {counts['warn']} DOWN {counts['down']}",
             )
@@ -1024,6 +1082,20 @@ class MonitorApp:
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        if self.canvas_window_id is not None:
+            self.canvas.itemconfigure(self.canvas_window_id, width=event.width)
+
+        next_columns = 1 if event.width < 980 else 2
+        usable_width = max(360, event.width - 48)
+        wraplength = int((usable_width / next_columns) - 90)
+        for widgets in self.card_widgets.values():
+            widgets["summary"].configure(wraplength=max(280, wraplength))
+
+        if next_columns != self.current_columns:
+            self.current_columns = next_columns
+            self._reflow_cards()
 
     def _schedule_refresh(self) -> None:
         if self.after_id:
@@ -1044,15 +1116,49 @@ class MonitorApp:
             webbrowser.open(path.as_uri())
 
     def refresh(self) -> None:
-        self.snapshot = collect_snapshot()
-        counts = self.snapshot["counts"]
-        self.status_text.set(
-            bi(
-                f"已更新 {self.snapshot['collected_at']} | OK {counts['ok']} WARN {counts['warn']} DOWN {counts['down']}",
-                f"Refreshed {self.snapshot['collected_at']} | OK {counts['ok']} WARN {counts['warn']} DOWN {counts['down']}",
+        if self.refresh_in_progress:
+            self.pending_refresh = True
+            self.status_text.set(self.t("上一輪更新仍在進行中...", "Previous refresh is still running..."))
+            return
+
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+            self.after_id = None
+
+        self.refresh_in_progress = True
+        self.status_text.set(self.t("正在收集服務狀態...", "Collecting service status..."))
+
+        def worker() -> None:
+            try:
+                snapshot = collect_snapshot()
+                error = None
+            except Exception as exc:
+                snapshot = None
+                error = exc
+            self.root.after(0, lambda: self._finish_refresh(snapshot, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_refresh(self, snapshot: dict[str, Any] | None, error: Exception | None) -> None:
+        self.refresh_in_progress = False
+        if error:
+            self.status_text.set(self.t(f"更新失敗：{error}", f"Refresh failed: {error}"))
+        elif snapshot:
+            self.snapshot = snapshot
+            counts = self.snapshot["counts"]
+            self.status_text.set(
+                self.t(
+                    f"已更新 {self.snapshot['collected_at']} | OK {counts['ok']} WARN {counts['warn']} DOWN {counts['down']}",
+                    f"Refreshed {self.snapshot['collected_at']} | OK {counts['ok']} WARN {counts['warn']} DOWN {counts['down']}",
+                )
             )
-        )
-        self._render_snapshot()
+            self._render_snapshot()
+
+        if self.pending_refresh:
+            self.pending_refresh = False
+            self.refresh()
+            return
+
         self._schedule_refresh()
 
     def _render_snapshot(self) -> None:
@@ -1072,13 +1178,13 @@ class MonitorApp:
         stop_button = widgets["stop"]
 
         colors = {
-            "ok": ("#16a34a", bi("正常", "OK")),
-            "warn": ("#d97706", bi("警告", "WARN")),
-            "down": ("#dc2626", bi("停止", "DOWN")),
+            "ok": ("#16a34a", self.t("正常", "OK")),
+            "warn": ("#d97706", self.t("警告", "WARN")),
+            "down": ("#dc2626", self.t("停止", "DOWN")),
         }
-        color, label = colors.get(service["state"], ("#475569", bi(service["state"], service["state"].upper())))
+        color, label = colors.get(service["state"], ("#475569", self.t(service["state"], service["state"].upper())))
         badge.configure(text=label, bg=color)
-        title.configure(text=bi(service["title_zh"], service["title_en"]))
+        title.configure(text=self.t(service["title_zh"], service["title_en"]))
 
         is_compact = self.display_mode.get() == "compact"
         if is_compact:
@@ -1089,14 +1195,20 @@ class MonitorApp:
             summary.grid()
             details.grid()
             meta.grid()
-            summary.configure(text=bi(service["summary_zh"], service["summary_en"]))
+            summary.configure(text=self.t(service["summary_zh"], service["summary_en"]))
             detail_items = service.get("details") or service.get("compact_details") or []
-            body = "\n\n".join(f"- {item.replace(chr(10), chr(10) + '  ')}" for item in detail_items)
+            command_items = [item for item in detail_items if is_command_detail(item)]
+            regular_items = [item for item in detail_items if not is_command_detail(item)]
+            widgets["command"] = self._extract_command(command_items[0]) if command_items else ""
+            body = "\n".join(f"- {self.tv(item).replace(chr(10), chr(10) + '  ')}" for item in regular_items)
+            if widgets["command"]:
+                body = "\n".join(part for part in (body, f"- {self.t('命令列已收合，可用右上角按鈕複製。', 'Command is collapsed; use the top-right button to copy it.')}") if part)
             details.configure(state="normal")
             details.delete("1.0", "end")
             details.insert("1.0", body)
             details.configure(state="disabled")
-            meta.configure(text=bi(f"更新時間: {service['updated_at']}", f"Updated: {service['updated_at']}"))
+            meta.configure(text=self.t(f"更新時間: {service['updated_at']}", f"Updated: {service['updated_at']}"))
+            widgets["copy"].configure(state="normal" if widgets["command"] else "disabled")
 
         widgets["frame"].configure(padding=10 if is_compact else 14)
         busy = service["key"] in self.busy_services
@@ -1106,7 +1218,7 @@ class MonitorApp:
     def trigger_action(self, service_key: str, action: str) -> None:
         handler = ACTION_MAP.get(service_key, {}).get(action)
         if not handler:
-            self.status_text.set(bi("這個服務沒有對應的操作。", "No action is mapped for this service."))
+            self.status_text.set(self.t("這個服務沒有對應的操作。", "No action is mapped for this service."))
             return
         if service_key in self.busy_services:
             return
@@ -1115,7 +1227,7 @@ class MonitorApp:
         self._render_snapshot()
         service_label = service_key.upper()
         self.status_text.set(
-            bi(
+            self.t(
                 f"正在執行 {service_label} 的 {action} 操作...",
                 f"Running {action} for {service_label}...",
             )
@@ -1125,7 +1237,7 @@ class MonitorApp:
             try:
                 message = handler()
             except Exception as exc:
-                message = bi(
+                message = self.t(
                     f"{service_label} 操作失敗：{exc}",
                     f"{service_label} action failed: {exc}",
                 )
@@ -1137,6 +1249,21 @@ class MonitorApp:
         self.busy_services.discard(service_key)
         self.status_text.set(message)
         self.refresh()
+
+    def _extract_command(self, item: str) -> str:
+        lines = str(item).splitlines()
+        preferred = lines[0] if self.language_mode.get() != "en" else (lines[1] if len(lines) > 1 else lines[0])
+        return re.sub(r"^(命令列|Command):\s*", "", preferred).strip()
+
+    def copy_command(self, service_key: str) -> None:
+        widgets = self.card_widgets.get(service_key)
+        command = str(widgets.get("command") if widgets else "").strip()
+        if not command:
+            self.status_text.set(self.t("這張卡目前沒有可複製的命令列。", "This card has no command to copy."))
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(command)
+        self.status_text.set(self.t(f"已複製 {service_key.upper()} 命令列。", f"Copied {service_key.upper()} command."))
 
 
 def parse_args() -> argparse.Namespace:
