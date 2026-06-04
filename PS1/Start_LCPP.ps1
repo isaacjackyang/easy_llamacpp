@@ -4582,6 +4582,43 @@ function Get-ConsoleWidth {
     }
 }
 
+function Get-ConsolePageSize {
+    try {
+        return [Math]::Max(8, $Host.UI.RawUI.WindowSize.Height - 12)
+    }
+    catch {
+        return 14
+    }
+}
+
+function Get-TextDisplayWidth {
+    param(
+        [string]$Text
+    )
+
+    $SafeText = if ($null -eq $Text) { "" } else { [string]$Text }
+    $Width = 0
+    foreach ($Char in $SafeText.ToCharArray()) {
+        $Code = [int][char]$Char
+        if (
+            ($Code -ge 0x1100 -and $Code -le 0x115F) -or
+            ($Code -ge 0x2E80 -and $Code -le 0xA4CF) -or
+            ($Code -ge 0xAC00 -and $Code -le 0xD7A3) -or
+            ($Code -ge 0xF900 -and $Code -le 0xFAFF) -or
+            ($Code -ge 0xFE10 -and $Code -le 0xFE6F) -or
+            ($Code -ge 0xFF00 -and $Code -le 0xFF60) -or
+            ($Code -ge 0xFFE0 -and $Code -le 0xFFE6)
+        ) {
+            $Width += 2
+        }
+        else {
+            $Width += 1
+        }
+    }
+
+    return $Width
+}
+
 function Get-FitText {
     param(
         [string]$Text,
@@ -4593,11 +4630,23 @@ function Get-FitText {
         return $SafeText
     }
 
-    if ($SafeText.Length -le $Width) {
+    if ((Get-TextDisplayWidth -Text $SafeText) -le $Width) {
         return $SafeText
     }
 
-    return $SafeText.Substring(0, $Width - 3) + "..."
+    $Builder = New-Object System.Text.StringBuilder
+    $CurrentWidth = 0
+    $Limit = [Math]::Max(1, $Width - 3)
+    foreach ($Char in $SafeText.ToCharArray()) {
+        $CharWidth = Get-TextDisplayWidth -Text ([string]$Char)
+        if (($CurrentWidth + $CharWidth) -gt $Limit) {
+            break
+        }
+        [void]$Builder.Append($Char)
+        $CurrentWidth += $CharWidth
+    }
+
+    return $Builder.ToString() + "..."
 }
 
 function Format-BilingualText {
@@ -4639,13 +4688,16 @@ function Write-BilingualField {
         [string]$ForegroundColor = $null
     )
 
-    $Line = Format-BilingualField -ChineseLabel $ChineseLabel -EnglishLabel $EnglishLabel -ChineseValue $ChineseValue -EnglishValue $EnglishValue
-    if ([string]::IsNullOrWhiteSpace($ForegroundColor)) {
-        Write-Host $Line
+    $LabelText = Format-BilingualText -ChineseText $ChineseLabel -EnglishText $EnglishLabel
+    $ValueText = Format-BilingualText -ChineseText $ChineseValue -EnglishText $EnglishValue
+    $Line = "{0}: {1}" -f $LabelText, $ValueText
+    if ((Get-TextDisplayWidth -Text $Line) -gt ((Get-ConsoleWidth) - 2)) {
+        $TextColor = if ([string]::IsNullOrWhiteSpace($ForegroundColor)) { "Gray" } else { $ForegroundColor }
+        Write-WrappedInfoLine -Prefix ("{0}: " -f $LabelText) -Text $ValueText -PrefixColor "Cyan" -TextColor $TextColor
+        return
     }
-    else {
-        Write-Host $Line -ForegroundColor $ForegroundColor
-    }
+
+    if ([string]::IsNullOrWhiteSpace($ForegroundColor)) { Write-Host $Line } else { Write-Host $Line -ForegroundColor $ForegroundColor }
 }
 
 function Get-WrappedTextLines {
@@ -5068,6 +5120,7 @@ function Show-ModelSeriesMenu {
     }
 
     $SelectedIndex = 0
+    $SearchText = ""
     if (-not [string]::IsNullOrWhiteSpace($CurrentSeriesKey)) {
         for ($Index = 0; $Index -lt $Series.Count; $Index++) {
             if ([string]::Equals([string]$Series[$Index].Key, $CurrentSeriesKey, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -5078,10 +5131,37 @@ function Show-ModelSeriesMenu {
     }
 
     while ($true) {
-        Show-MenuHeader -Title (Format-BilingualText -ChineseText "選擇模型系列" -EnglishText "Select Model Series") -Subtitle (Format-BilingualText -ChineseText "先選擇基礎模型家族，按 E 可編輯索引檔。" -EnglishText "Choose a base model family first. Press E to edit the index file.")
+        $FilteredSeries = @(
+            if ([string]::IsNullOrWhiteSpace($SearchText)) {
+                $Series
+            }
+            else {
+                $Series | Where-Object {
+                    ([string]$_.Name -like "*$SearchText*") -or
+                    ([string]$_.Key -like "*$SearchText*")
+                }
+            }
+        )
+        if ($FilteredSeries.Count -eq 0) {
+            $FilteredSeries = @($Series)
+            $SearchText = ""
+        }
+        if ($SelectedIndex -ge $FilteredSeries.Count) {
+            $SelectedIndex = $FilteredSeries.Count - 1
+        }
+        if ($SelectedIndex -lt 0) {
+            $SelectedIndex = 0
+        }
 
-        for ($Index = 0; $Index -lt $Series.Count; $Index++) {
-            $SeriesEntry = $Series[$Index]
+        $PageSize = Get-ConsolePageSize
+        $PageStart = [Math]::Floor($SelectedIndex / $PageSize) * $PageSize
+        $VisibleSeries = @($FilteredSeries | Select-Object -Skip $PageStart -First $PageSize)
+        $SearchLabel = if ([string]::IsNullOrWhiteSpace($SearchText)) { "" } else { " | filter: $SearchText" }
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "選擇模型系列" -EnglishText "Select Model Series") -Subtitle (Format-BilingualText -ChineseText ("先選擇基礎模型家族，/ 搜尋，PageUp/PageDown 翻頁，按 E 可編輯索引檔。{0}" -f $SearchLabel) -EnglishText ("Choose a base model family. / searches, PageUp/PageDown pages, E edits the index.{0}" -f $SearchLabel))
+
+        for ($VisibleIndex = 0; $VisibleIndex -lt $VisibleSeries.Count; $VisibleIndex++) {
+            $Index = $PageStart + $VisibleIndex
+            $SeriesEntry = $VisibleSeries[$VisibleIndex]
             $IsSelected = $Index -eq $SelectedIndex
             $Prefix = if ($IsSelected) { ">" } else { " " }
             $Foreground = if ($IsSelected) { "Black" } else { "Gray" }
@@ -5096,24 +5176,33 @@ function Show-ModelSeriesMenu {
         }
 
         Write-Host ""
-        Write-Host (Format-BilingualText -ChineseText "使用上下方向鍵移動，Enter 或 Space 開啟系列，E 編輯 model-index.json，Esc 返回。" -EnglishText "Use Up/Down to move. Enter or Space opens the series. E edits model-index.json. Esc returns.") -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText ("位置 {0}/{1}，顯示 {2}-{3}。上下移動，/ 搜尋，PageUp/PageDown 翻頁，Enter 開啟，E 編輯，Esc 返回。" -f ($SelectedIndex + 1), $FilteredSeries.Count, ($PageStart + 1), ($PageStart + $VisibleSeries.Count)) -EnglishText ("Item {0}/{1}, showing {2}-{3}. Up/Down moves, / searches, PageUp/PageDown pages, Enter opens, E edits, Esc returns." -f ($SelectedIndex + 1), $FilteredSeries.Count, ($PageStart + 1), ($PageStart + $VisibleSeries.Count))) -ForegroundColor Yellow
         $Key = Read-ConsoleKey
 
         switch ($Key.VirtualKeyCode) {
-            38 { $SelectedIndex = if ($SelectedIndex -le 0) { $Series.Count - 1 } else { $SelectedIndex - 1 } }
-            40 { $SelectedIndex = if ($SelectedIndex -ge ($Series.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
-            13 { return [pscustomobject]@{ Action = "Open"; Group = $Series[$SelectedIndex] } }
-            32 { return [pscustomobject]@{ Action = "Open"; Group = $Series[$SelectedIndex] } }
+            33 { $SelectedIndex = [Math]::Max(0, $SelectedIndex - $PageSize) }
+            34 { $SelectedIndex = [Math]::Min($FilteredSeries.Count - 1, $SelectedIndex + $PageSize) }
+            38 { $SelectedIndex = if ($SelectedIndex -le 0) { $FilteredSeries.Count - 1 } else { $SelectedIndex - 1 } }
+            40 { $SelectedIndex = if ($SelectedIndex -ge ($FilteredSeries.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
+            13 { return [pscustomobject]@{ Action = "Open"; Group = $FilteredSeries[$SelectedIndex] } }
+            32 { return [pscustomobject]@{ Action = "Open"; Group = $FilteredSeries[$SelectedIndex] } }
             27 { return [pscustomobject]@{ Action = "Back"; Group = $null } }
             default {
+                if ($Key.Character -eq '/') {
+                    Write-Host ""
+                    $SearchText = Read-Host (Format-BilingualText -ChineseText "搜尋模型系列（留空清除）" -EnglishText "Search model series (blank clears)")
+                    $SelectedIndex = 0
+                    continue
+                }
+
                 if ($Key.Character -match '^[Ee]$') {
                     return [pscustomobject]@{ Action = "Edit"; Group = $null }
                 }
 
                 if ($Key.Character -match '^\d$') {
                     $HotIndex = [int]$Key.Character.ToString() - 1
-                    if ($HotIndex -ge 0 -and $HotIndex -lt $Series.Count) {
-                        return [pscustomobject]@{ Action = "Open"; Group = $Series[$HotIndex] }
+                    if ($HotIndex -ge 0 -and $HotIndex -lt $VisibleSeries.Count) {
+                        return [pscustomobject]@{ Action = "Open"; Group = $VisibleSeries[$HotIndex] }
                     }
                 }
             }
@@ -5133,6 +5222,7 @@ function Show-ModelVariantMenu {
 
     $ResolvedCurrentPath = Resolve-ModelPath -Path $CurrentModelPath
     $SelectedIndex = 0
+    $SearchText = ""
     if ($ResolvedCurrentPath) {
         for ($Index = 0; $Index -lt $SeriesEntry.Models.Count; $Index++) {
             $CandidatePath = Resolve-ModelPath -Path $SeriesEntry.Models[$Index].path
@@ -5144,10 +5234,38 @@ function Show-ModelVariantMenu {
     }
 
     while ($true) {
-        Show-MenuHeader -Title (Format-BilingualText -ChineseText "選擇模型版本" -EnglishText "Select Model Variant") -Subtitle (Format-BilingualText -ChineseText ("為 {0} 選擇版本，按 E 可編輯索引檔。" -f $SeriesEntry.Name) -EnglishText ("Choose a variant for {0}. Press E to edit the index file." -f $SeriesEntry.Name))
+        $FilteredModels = @(
+            if ([string]::IsNullOrWhiteSpace($SearchText)) {
+                $SeriesEntry.Models
+            }
+            else {
+                $SeriesEntry.Models | Where-Object {
+                    ([string]$_.name -like "*$SearchText*") -or
+                    ([string]$_.path -like "*$SearchText*") -or
+                    ([string]$_.notes -like "*$SearchText*")
+                }
+            }
+        )
+        if ($FilteredModels.Count -eq 0) {
+            $FilteredModels = @($SeriesEntry.Models)
+            $SearchText = ""
+        }
+        if ($SelectedIndex -ge $FilteredModels.Count) {
+            $SelectedIndex = $FilteredModels.Count - 1
+        }
+        if ($SelectedIndex -lt 0) {
+            $SelectedIndex = 0
+        }
 
-        for ($Index = 0; $Index -lt $SeriesEntry.Models.Count; $Index++) {
-            $Model = $SeriesEntry.Models[$Index]
+        $PageSize = Get-ConsolePageSize
+        $PageStart = [Math]::Floor($SelectedIndex / $PageSize) * $PageSize
+        $VisibleModels = @($FilteredModels | Select-Object -Skip $PageStart -First $PageSize)
+        $SearchLabel = if ([string]::IsNullOrWhiteSpace($SearchText)) { "" } else { " | filter: $SearchText" }
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "選擇模型版本" -EnglishText "Select Model Variant") -Subtitle (Format-BilingualText -ChineseText ("為 {0} 選擇版本，/ 搜尋，PageUp/PageDown 翻頁，按 E 可編輯索引檔。{1}" -f $SeriesEntry.Name, $SearchLabel) -EnglishText ("Choose a variant for {0}. / searches, PageUp/PageDown pages, E edits the index.{1}" -f $SeriesEntry.Name, $SearchLabel))
+
+        for ($VisibleIndex = 0; $VisibleIndex -lt $VisibleModels.Count; $VisibleIndex++) {
+            $Index = $PageStart + $VisibleIndex
+            $Model = $VisibleModels[$VisibleIndex]
             $IsSelected = $Index -eq $SelectedIndex
             $ModelPathResolved = Resolve-ModelPath -Path $Model.path
             $Exists = Test-Path -LiteralPath $ModelPathResolved
@@ -5167,7 +5285,7 @@ function Show-ModelVariantMenu {
             }
         }
 
-        $SelectedModel = $SeriesEntry.Models[$SelectedIndex]
+        $SelectedModel = $FilteredModels[$SelectedIndex]
         $SelectedModelPath = Resolve-ModelPath -Path $SelectedModel.path
         Write-Host ""
         Write-Host ("Series       : {0}" -f $SeriesEntry.Name) -ForegroundColor Cyan
@@ -5182,24 +5300,33 @@ function Show-ModelVariantMenu {
             Write-Host ("Notes        : {0}" -f $SelectedModel.notes) -ForegroundColor DarkGray
         }
         Write-Host ""
-        Write-Host (Format-BilingualText -ChineseText "使用上下方向鍵移動，Enter 或 Space 確認，E 編輯 model-index.json，Esc 返回系列清單。" -EnglishText "Use Up/Down to move. Enter or Space confirms. E edits model-index.json. Esc returns to series.") -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText ("位置 {0}/{1}，顯示 {2}-{3}。上下移動，/ 搜尋，PageUp/PageDown 翻頁，Enter 確認，E 編輯，Esc 返回。" -f ($SelectedIndex + 1), $FilteredModels.Count, ($PageStart + 1), ($PageStart + $VisibleModels.Count)) -EnglishText ("Item {0}/{1}, showing {2}-{3}. Up/Down moves, / searches, PageUp/PageDown pages, Enter confirms, E edits, Esc returns." -f ($SelectedIndex + 1), $FilteredModels.Count, ($PageStart + 1), ($PageStart + $VisibleModels.Count))) -ForegroundColor Yellow
 
         $Key = Read-ConsoleKey
         switch ($Key.VirtualKeyCode) {
-            38 { $SelectedIndex = if ($SelectedIndex -le 0) { $SeriesEntry.Models.Count - 1 } else { $SelectedIndex - 1 } }
-            40 { $SelectedIndex = if ($SelectedIndex -ge ($SeriesEntry.Models.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
+            33 { $SelectedIndex = [Math]::Max(0, $SelectedIndex - $PageSize) }
+            34 { $SelectedIndex = [Math]::Min($FilteredModels.Count - 1, $SelectedIndex + $PageSize) }
+            38 { $SelectedIndex = if ($SelectedIndex -le 0) { $FilteredModels.Count - 1 } else { $SelectedIndex - 1 } }
+            40 { $SelectedIndex = if ($SelectedIndex -ge ($FilteredModels.Count - 1)) { 0 } else { $SelectedIndex + 1 } }
             13 { return [pscustomobject]@{ Action = "Select"; Model = $SelectedModel } }
             32 { return [pscustomobject]@{ Action = "Select"; Model = $SelectedModel } }
             27 { return [pscustomobject]@{ Action = "Back"; Model = $null } }
             default {
+                if ($Key.Character -eq '/') {
+                    Write-Host ""
+                    $SearchText = Read-Host (Format-BilingualText -ChineseText "搜尋模型版本（留空清除）" -EnglishText "Search model variants (blank clears)")
+                    $SelectedIndex = 0
+                    continue
+                }
+
                 if ($Key.Character -match '^[Ee]$') {
                     return [pscustomobject]@{ Action = "Edit"; Model = $null }
                 }
 
                 if ($Key.Character -match '^\d$') {
                     $HotIndex = [int]$Key.Character.ToString() - 1
-                    if ($HotIndex -ge 0 -and $HotIndex -lt $SeriesEntry.Models.Count) {
-                        return [pscustomobject]@{ Action = "Select"; Model = $SeriesEntry.Models[$HotIndex] }
+                    if ($HotIndex -ge 0 -and $HotIndex -lt $VisibleModels.Count) {
+                        return [pscustomobject]@{ Action = "Select"; Model = $VisibleModels[$HotIndex] }
                     }
                 }
             }
