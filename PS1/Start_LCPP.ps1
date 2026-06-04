@@ -268,6 +268,7 @@ $script:LaunchModelEntry = $null
 $script:LaunchMmprojPath = $null
 $script:ModelGenerationArgs = @()
 $script:ManagedDefaultContextSize = 131072
+$script:RequestedParallelSlots = ""
 $script:LastAutoTuneProfile = $null
 $script:BackgroundStartupProgressLineLength = 0
 $script:BackgroundStartupProgressLastText = $null
@@ -929,6 +930,45 @@ function Remove-LlamaParallelArgs {
     return $FilteredArguments.ToArray()
 }
 
+function Get-LlamaParallelSlotsFromArgs {
+    param(
+        [string[]]$Arguments
+    )
+
+    if (-not $Arguments) {
+        return ""
+    }
+
+    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
+        $Argument = [string]$Arguments[$Index]
+        if ($Argument -match '^(?:--parallel|-np)=(.+)$') {
+            return [string]$Matches[1]
+        }
+        if ($Argument -match '^(?:--parallel|-np)$' -and ($Index + 1) -lt $Arguments.Count) {
+            return [string]$Arguments[$Index + 1]
+        }
+    }
+
+    return ""
+}
+
+function Resolve-RequestedParallelSlots {
+    param(
+        [string]$RequestedSlots
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RequestedSlots)) {
+        return $FixedLlamaServerParallelSlots
+    }
+
+    [int]$ParsedSlots = 0
+    if (-not [int]::TryParse([string]$RequestedSlots, [ref]$ParsedSlots) -or $ParsedSlots -lt 1) {
+        throw "Slots must be blank or a positive integer."
+    }
+
+    return $ParsedSlots
+}
+
 function Normalize-TuningText {
     param(
         [string]$Text
@@ -1036,7 +1076,8 @@ function Get-AutoLaunchTuning {
         [string]$RequestedGpuLayers,
         [string[]]$Arguments,
         [bool]$UseExtremeMode,
-        [bool]$EnableAutoTune
+        [bool]$EnableAutoTune,
+        [string]$RequestedParallelSlots = ""
     )
 
     $ArgumentText = Get-ArgumentSearchText -Arguments $Arguments
@@ -1044,6 +1085,7 @@ function Get-AutoLaunchTuning {
     $UserProvidedCacheRam = $ArgumentText -match '(?:^|\s)(?:--cache-ram|-cram)(?:=|\s+)'
     $UserDisabledFit = $ArgumentText -match '(?:^|\s)(?:--fit|-fit)(?:=|\s+)off(?:\s|$)'
     $UseManagedGpuLayers = ([string]::IsNullOrWhiteSpace($RequestedGpuLayers) -or $RequestedGpuLayers.Trim().ToLowerInvariant() -eq 'auto')
+    $ParallelSlots = Resolve-RequestedParallelSlots -RequestedSlots $RequestedParallelSlots
 
     $AcceleratorInventory = Get-AcceleratorInventory
     $AcceleratorInfo = if ($AcceleratorInventory -and $AcceleratorInventory.Count -gt 0) {
@@ -1080,7 +1122,7 @@ function Get-AutoLaunchTuning {
             MemoryInfo          = $MemoryInfo
             FitTargetMiB        = if ($null -ne $SavedProfile.fit_target_mib) { [int]$SavedProfile.fit_target_mib } else { $null }
             CacheRamMiB         = if ($null -ne $SavedProfile.cache_ram_mib) { [int]$SavedProfile.cache_ram_mib } else { $null }
-            ParallelSlots       = $FixedLlamaServerParallelSlots
+            ParallelSlots       = $ParallelSlots
             Source              = "saved-profile"
             SourceLabel         = "saved auto-tune profile"
             AutoTuneEnabled     = [bool]$EnableAutoTune
@@ -1158,8 +1200,6 @@ function Get-AutoLaunchTuning {
             }
         }
     }
-
-    $ParallelSlots = $FixedLlamaServerParallelSlots
 
     return [pscustomobject]@{
         UseManagedGpuLayers = $UseManagedGpuLayers
@@ -3767,6 +3807,7 @@ function Convert-ForwardArgsToMenuConfig {
         ThinkLevel      = "Auto"
         MtpEnabled      = $null
         SpecDraftNMax   = "2"
+        Slots           = ""
         ExtraArgs       = ""
     }
 
@@ -3865,6 +3906,9 @@ function Convert-ForwardArgsToMenuConfig {
             '^--spec-draft-n-max(?:=(.+))?$' {
                 $Config.SpecDraftNMax = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
+            '^(?:--parallel|-np)(?:=(.+))?$' {
+                $Config.Slots = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
             default {
                 $Remaining.Add($Argument)
             }
@@ -3885,6 +3929,11 @@ function Convert-MenuConfigToForwardArgs {
     if ($Config.ContextSize) {
         $Arguments.Add("--ctx-size")
         $Arguments.Add([string]$Config.ContextSize)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.Slots)) {
+        $Arguments.Add("--parallel")
+        $Arguments.Add([string]$Config.Slots)
     }
 
     if (-not [string]::IsNullOrWhiteSpace([string]$Config.Temperature)) {
@@ -4127,6 +4176,7 @@ function Get-SavedLaunchProfilePersistedKeys {
         "ThinkLevel"
         "MtpEnabled"
         "SpecDraftNMax"
+        "Slots"
         "ExtraArgs"
     )
 }
@@ -4258,6 +4308,7 @@ function Format-SavedLaunchProfileSummary {
     $GpuText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.GpuLayers)) { "auto" } else { [string]$Profile.config.GpuLayers }
     $ReasoningText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ReasoningMode)) { "auto" } else { [string]$Profile.config.ReasoningMode }
     $MtpText = if ($null -eq $Profile.config.MtpEnabled) { "auto" } elseif ([bool]$Profile.config.MtpEnabled) { "on" } else { "off" }
+    $SlotsText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.Slots)) { [string]$FixedLlamaServerParallelSlots } else { [string]$Profile.config.Slots }
     $UpdatedAtText = ""
     if (-not [string]::IsNullOrWhiteSpace([string]$Profile.updated_at)) {
         try {
@@ -4269,8 +4320,8 @@ function Format-SavedLaunchProfileSummary {
     }
 
     return Format-BilingualText `
-        -ChineseText ("{0} | GPU {1} | 推理 {2} | MTP {3}{4}" -f $LaunchModeText, $GpuText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })) `
-        -EnglishText ("{0} | GPU {1} | reasoning {2} | MTP {3}{4}" -f $LaunchModeText, $GpuText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" }))
+        -ChineseText ("{0} | GPU {1} | Slots {2} | 推理 {3} | MTP {4}{5}" -f $LaunchModeText, $GpuText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })) `
+        -EnglishText ("{0} | GPU {1} | slots {2} | reasoning {3} | MTP {4}{5}" -f $LaunchModeText, $GpuText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" }))
 }
 
 function Show-QuickStartSavedProfileMenu {
@@ -4424,8 +4475,7 @@ function Apply-AutoTuneLearnedValuesToConfig {
         $UpdatedExtraArguments.Add([string]$Profile.cache_ram_mib)
     }
     if ($null -ne $Profile.parallel_slots) {
-        $UpdatedExtraArguments.Add("--parallel")
-        $UpdatedExtraArguments.Add([string]$Profile.parallel_slots)
+        $Config.Slots = [string]$Profile.parallel_slots
     }
 
     $Config.ExtraArgs = ConvertTo-ArgumentString -Arguments $UpdatedExtraArguments.ToArray()
@@ -5841,6 +5891,7 @@ function New-LaunchConfig {
         ThinkLevel        = [string]$ForwardConfig.ThinkLevel
         MtpEnabled        = $ForwardConfig.MtpEnabled
         SpecDraftNMax     = [string]$ForwardConfig.SpecDraftNMax
+        Slots             = [string]$ForwardConfig.Slots
         ExtraArgs         = [string]$ForwardConfig.ExtraArgs
     }
 
@@ -5870,6 +5921,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "MtpEnabled"; Label = "MTP"; Type = "bool" },
         [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數，Unsloth 預設為 2" -EnglishText "positive integer; Unsloth default is 2") },
         [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
+        [pscustomobject]@{ Key = "Slots"; Label = "Slots"; Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空使用 1；多請求才調高" -EnglishText "blank uses 1; raise only for concurrent requests") },
         [pscustomobject]@{ Key = "Temperature"; Label = "Temp"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.3" -EnglishText "blank uses the default; example: 0.3") },
         [pscustomobject]@{ Key = "TopK"; Label = "Top K"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 20" -EnglishText "blank uses the default; example: 20") },
         [pscustomobject]@{ Key = "TopP"; Label = "Top P"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.95" -EnglishText "blank uses the default; example: 0.95") },
@@ -5920,6 +5972,7 @@ function Get-LaunchConfigDefaultText {
         "MtpEnabled" { return $(if (Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for Qwen3.6 MTP GGUF" } else { "off" }) }
         "SpecDraftNMax" { return "2" }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
+        "Slots" { return ("{0} active request slot" -f $FixedLlamaServerParallelSlots) }
         "Temperature" { return "0.3" }
         "TopK" { return "20" }
         "TopP" { return "0.95" }
@@ -6017,6 +6070,13 @@ function Get-LaunchConfigValueText {
             }
 
             return [string]$Config.SpecDraftNMax
+        }
+        "Slots" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.Slots)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return ("{0} active request slots" -f [string]$Config.Slots)
         }
         "Temperature" {
             if ([string]::IsNullOrWhiteSpace([string]$Config.Temperature)) {
@@ -6199,6 +6259,12 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定總 context size。留空時會回退到 wrapper 管理的預設值。" -EnglishText "Sets total context size. Blank falls back to the wrapper managed default."
                 Recommendation = Format-BilingualText -ChineseText "除非你已經驗證過更大的 context，否則先用管理預設值。遇到 VRAM 壓力導致啟動失敗時，第一步先往下降。" -EnglishText "Start at the managed default unless you already validated a larger context. Lower it first when VRAM pressure causes startup failures."
+            }
+        }
+        "Slots" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定 llama-server 的 `--parallel`，也就是同時可服務的請求槽位數。" -EnglishText "Sets llama-server `--parallel`, the number of simultaneous request slots."
+                Recommendation = Format-BilingualText -ChineseText "一般單人本機使用請留空或用 `1`，這樣 context 不會被多個請求切分。只有你真的要同時處理多個 API 請求時，才調成 `2` 或更高，並同步確認 context 和 VRAM 是否足夠。" -EnglishText "For normal single-user local use, leave blank or use 1 so context is not split across requests. Raise this to 2 or higher only for real concurrent API traffic, and re-check context and VRAM headroom."
             }
         }
         "Temperature" {
@@ -6593,7 +6659,9 @@ function Get-LlamaServerArgsFromLaunchConfig {
     [void][int]::TryParse([string]$Config.ThreadsBatch, [ref]$RequestedThreadsBatch)
     $ResolvedThreads = Resolve-RequestedThreads -RequestedThreads $RequestedThreads -RequestedThreadsBatch $RequestedThreadsBatch
 
-    $ForwardArgs = @(Remove-LlamaParallelArgs -Arguments @(Convert-MenuConfigToForwardArgs -Config $Config))
+    $RawForwardArgs = @(Convert-MenuConfigToForwardArgs -Config $Config)
+    $RequestedParallelSlots = Get-LlamaParallelSlotsFromArgs -Arguments $RawForwardArgs
+    $ForwardArgs = @(Remove-LlamaParallelArgs -Arguments $RawForwardArgs)
     $LaunchModelEntry = Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $ResolvedModelPath
     $ModelGenerationArgs = @(Get-ModelGenerationArgs -ModelEntry $LaunchModelEntry -UserArguments $ForwardArgs)
     $AutoLaunchTuning = Get-AutoLaunchTuning `
@@ -6601,7 +6669,8 @@ function Get-LlamaServerArgsFromLaunchConfig {
         -RequestedGpuLayers ([string]$Config.GpuLayers) `
         -Arguments $ForwardArgs `
         -UseExtremeMode ([bool]$Config.ExtremeMode) `
-        -EnableAutoTune ([bool]$Config.AutoTune)
+        -EnableAutoTune ([bool]$Config.AutoTune) `
+        -RequestedParallelSlots $RequestedParallelSlots
 
     $VisionResolution = Resolve-LaunchConfigVisionMmprojPathForCommand -Config $Config -LaunchModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath
     $Arguments = New-Object System.Collections.Generic.List[string]
@@ -6975,7 +7044,9 @@ function Apply-LaunchSelection {
         $script:OpenPath = "/"
     }
 
-    $script:LlamaArgs = Convert-MenuConfigToForwardArgs -Config $Config
+    $RawForwardArgs = @(Convert-MenuConfigToForwardArgs -Config $Config)
+    $script:RequestedParallelSlots = Get-LlamaParallelSlotsFromArgs -Arguments $RawForwardArgs
+    $script:LlamaArgs = @($RawForwardArgs)
     $script:BaseUrl = "http://127.0.0.1:$script:Port"
 }
 
@@ -8964,9 +9035,9 @@ try {
         $ModelPath = Resolve-ModelPath -Path $ModelPath
     }
     Initialize-JsonWorkspaceFiles -IndexPath $ModelIndexPath
-    $LlamaArgs = @(Remove-LlamaParallelArgs -Arguments $LlamaArgs)
+    $script:RequestedParallelSlots = Get-LlamaParallelSlotsFromArgs -Arguments $LlamaArgs
     $script:LlamaArgs = $LlamaArgs
-    Test-LlamaArgConflict -Arguments $LlamaArgs
+    Test-LlamaArgConflict -Arguments @(Remove-LlamaParallelArgs -Arguments $LlamaArgs)
 
     if (-not (Test-Path -LiteralPath $ServerExe)) {
         throw (Format-BilingualText -ChineseText ("找不到 llama-server.exe：$ServerExe。請把 llama.cpp 執行檔放到 '$PreferredBinRoot'。") -EnglishText ("Cannot find llama-server.exe: $ServerExe. Put llama.cpp binaries in '$PreferredBinRoot'."))
@@ -9006,6 +9077,8 @@ try {
         throw "GpuLayers must be auto, all, or a non-negative integer."
     }
 
+    $script:RequestedParallelSlots = Get-LlamaParallelSlotsFromArgs -Arguments $LlamaArgs
+    [void](Resolve-RequestedParallelSlots -RequestedSlots $script:RequestedParallelSlots)
     $LlamaArgs = @(Remove-LlamaParallelArgs -Arguments $LlamaArgs)
     $script:LlamaArgs = $LlamaArgs
 
@@ -9038,7 +9111,7 @@ try {
         throw (Format-BilingualText -ChineseText ("連接埠 $Port 已被 PID $($Listener.OwningProcess) 佔用。" ) -EnglishText ("Port $Port is already in use by PID $($Listener.OwningProcess)."))
     }
 
-    $AutoLaunchTuning = Get-AutoLaunchTuning -ResolvedModelPath $ModelPath -RequestedGpuLayers $GpuLayers -Arguments $LlamaArgs -UseExtremeMode $ExtremeMode -EnableAutoTune $AutoTune
+    $AutoLaunchTuning = Get-AutoLaunchTuning -ResolvedModelPath $ModelPath -RequestedGpuLayers $GpuLayers -Arguments $LlamaArgs -UseExtremeMode $ExtremeMode -EnableAutoTune $AutoTune -RequestedParallelSlots $script:RequestedParallelSlots
 
     Write-Host (Format-BilingualText -ChineseText "正在啟動 llama.cpp 服務..." -EnglishText "Starting llama.cpp server...") -ForegroundColor Green
     Write-BilingualField -ChineseLabel "伺服器" -EnglishLabel "Server" -ChineseValue $ServerExe -EnglishValue $ServerExe
