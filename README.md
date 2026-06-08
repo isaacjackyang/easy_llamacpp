@@ -253,13 +253,23 @@ The first screen provides these main entry points:
   常用維護動作也保留在主選單。  
   Common maintenance actions remain available from the main menu.
 
+- `Maintenance`
+  刪除已儲存的啟動設定檔，或從選單新增、刪除、清空模型掃描路徑；調整掃描路徑後會立即刷新模型索引。  
+  Delete saved launch profiles, or add, remove, and clear model scan paths from the menu; changing scan paths refreshes the model index immediately.
+
+  `Maintenance` 也可以把已儲存設定檔輸出成 `exports\profiles\start_<設定檔名稱>.cmd`，之後可直接雙擊一鍵啟動。  
+  `Maintenance` can also export a saved profile to `exports\profiles\start_<profile-name>.cmd` for direct double-click launching.
+
 ## 模型索引檔 / Model Index File
 
 互動式選單會讀取 [`json/model-index.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-index.json)。  
 The interactive launcher reads [`json/model-index.json`](C:/Users/USER/llama%20win%20cuda%2013/json/model-index.json).
 
-現在 [`PS1/Start_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) 每次進入互動式選單前，都會先依腳本裡的 `$ConfiguredModelScanPath` 重掃 `*.gguf` 並刷新 `json/model-index.json`。如果那一行留空，腳本會退回到既有索引推測出的模型資料夾。  
-[`PS1/Start_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) now rescans `*.gguf` and refreshes `json/model-index.json` before each interactive launch, using the `$ConfiguredModelScanPath` line inside the script. If that line is left blank, it falls back to the model folder inferred from the existing index.
+現在 [`PS1/Start_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) 每次進入互動式選單前，都會先依腳本裡的 `$ConfiguredModelScanPaths` 重掃一個或多個 `*.gguf` 資料夾並刷新 `json/model-index.json`。舊的 `$ConfiguredModelScanPath` 單一路徑設定仍可使用；如果兩者都留空，腳本會退回到既有索引推測出的模型資料夾。  
+[`PS1/Start_LCPP.ps1`](C:/Users/USER/llama%20win%20cuda%2013/PS1/Start_LCPP.ps1) now rescans one or more `*.gguf` folders and refreshes `json/model-index.json` before each interactive launch, using the `$ConfiguredModelScanPaths` array inside the script. The legacy single-folder `$ConfiguredModelScanPath` setting is still supported; if both are left blank, it falls back to the model folder inferred from the existing index.
+
+也可以從第一層選單的 `Maintenance` -> `Model Scan Paths` 直接修改這些路徑，不必手動編輯 PS1。  
+You can also edit these paths directly from `Maintenance` -> `Model Scan Paths` on the first menu, without editing the PS1 by hand.
 
 每筆模型可以定義名稱、路徑與能力標記，例如是否支援推理或視覺：  
 Each model entry can define a display name, file path, and capability flags such as reasoning or vision:
