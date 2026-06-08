@@ -45,6 +45,9 @@ When omitted, the launcher uses the default_model_id entry from json\model-index
 Optional path to the vision mmproj GGUF file.
 Use this when you want a direct launch or bypass run to pin a specific projector.
 
+.PARAMETER DisableVision
+Disables automatic or manual vision projector selection for bypass/profile launches.
+
 .PARAMETER ModelIndexPath
 Path to the model index JSON file used by the interactive menu.
 Accepts either an absolute path or a path relative to the launcher root.
@@ -174,6 +177,7 @@ param(
     [int]$ThreadsBatch = -1,
     [string]$ModelPath = $null,
     [string]$VisionMmprojPath = $null,
+    [switch]$DisableVision,
     [string]$ModelIndexPath = ".\json\model-index.json",
     [string]$OpenPath = "/v1/models",
     [int]$ReadyTimeoutSec = 180,
@@ -192,6 +196,12 @@ param(
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$LlamaArgs
 )
+
+# Edit these lines to force model scanning from one or more GGUF folders on each interactive launch.
+# Example: $ConfiguredModelScanPaths = @("D:\LLM Model", "E:\LLM Model")
+$ConfiguredModelScanPaths = @()
+# Legacy single-folder setting is still supported and is scanned after $ConfiguredModelScanPaths.
+$ConfiguredModelScanPath = "C:\Users\USER\Documents\GitHub\easy_llamacpp\Model"
 
 $ErrorActionPreference = "Stop"
 
@@ -251,8 +261,6 @@ $SavedLaunchProfileFile = Join-Path $JsonRoot "launch-profiles.json"
 $ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
 $SupervisorScriptPath = Join-Path $Ps1Root "llama_supervisor.ps1"
 $WatchdogScriptPath = Join-Path $Ps1Root "llama_watchdog.ps1"
-# Edit this line to force model scanning from a specific GGUF folder on each interactive launch.
-$ConfiguredModelScanPath = "C:\Users\USER\Documents\GitHub\easy_llamacpp\Model"
 $BaseUrl = "http://127.0.0.1:$Port"
 $BrowserJob = $null
 $UsedInteractiveMenu = $false
@@ -276,6 +284,9 @@ $script:SelectedVisionModelEntry = $null
 $script:SelectedVisionModelPath = $null
 $script:SelectedVisionMmprojPath = $null
 $script:SelectedVisionDisabled = $false
+if ($DisableVision) {
+    $script:SelectedVisionDisabled = $true
+}
 if (-not [string]::IsNullOrWhiteSpace($VisionMmprojPath)) {
     $script:SelectedVisionMmprojPath = $VisionMmprojPath
 }
@@ -1342,6 +1353,98 @@ function Get-PreferredDefaultModelPath {
     return $null
 }
 
+function Get-ConfiguredModelScanPaths {
+    $Paths = New-Object System.Collections.Generic.List[string]
+    $SeenPaths = @{}
+    $AddPath = {
+        param(
+            [string]$Path
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return
+        }
+
+        $ResolvedPath = Resolve-ScriptRelativePath -Path $Path
+        if ([string]::IsNullOrWhiteSpace($ResolvedPath)) {
+            return
+        }
+
+        $PathKey = $ResolvedPath.ToLowerInvariant()
+        if ($SeenPaths.ContainsKey($PathKey)) {
+            return
+        }
+
+        $SeenPaths[$PathKey] = $true
+        [void]$Paths.Add($ResolvedPath)
+    }
+
+    if ($null -ne $ConfiguredModelScanPaths) {
+        foreach ($ConfiguredPath in @($ConfiguredModelScanPaths)) {
+            & $AddPath ([string]$ConfiguredPath)
+        }
+    }
+
+    & $AddPath $ConfiguredModelScanPath
+
+    return @($Paths)
+}
+
+function Test-ModelScanDirectoryHasModels {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $false
+    }
+
+    $ModelFile = Get-ChildItem -LiteralPath $Path -Filter "*.gguf" -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) } |
+        Select-Object -First 1
+
+    return ($null -ne $ModelFile)
+}
+
+function Get-ConfiguredModelScanDirectories {
+    $Directories = New-Object System.Collections.Generic.List[string]
+    foreach ($ConfiguredPath in @(Get-ConfiguredModelScanPaths)) {
+        if (Test-Path -LiteralPath $ConfiguredPath -PathType Container) {
+            [void]$Directories.Add($ConfiguredPath)
+        }
+    }
+
+    return @($Directories)
+}
+
+function Get-ModelFilesFromScanDirectories {
+    param(
+        [string[]]$ScanDirectories
+    )
+
+    $SeenModelFiles = @{}
+    return @(
+        foreach ($ScanDirectory in @($ScanDirectories)) {
+            if ([string]::IsNullOrWhiteSpace($ScanDirectory) -or -not (Test-Path -LiteralPath $ScanDirectory -PathType Container)) {
+                continue
+            }
+
+            Get-ChildItem -LiteralPath $ScanDirectory -Filter "*.gguf" -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) } |
+                Where-Object {
+                    $ModelFileKey = $_.FullName.ToLowerInvariant()
+                    if ($SeenModelFiles.ContainsKey($ModelFileKey)) {
+                        $false
+                    }
+                    else {
+                        $SeenModelFiles[$ModelFileKey] = $true
+                        $true
+                    }
+                }
+        }
+    ) | Sort-Object DirectoryName, Name
+}
+
 function Get-ModelScanDirectoryCandidates {
     param(
         [string]$IndexPath,
@@ -1372,14 +1475,43 @@ function Get-ModelScanDirectoryCandidates {
         $SeenCandidates[$CandidateKey] = $true
         [void]$Candidates.Add($ResolvedCandidate)
     }
+    $AddModelDirectoryCandidate = {
+        param(
+            [string]$ModelPath
+        )
 
-    if (-not [string]::IsNullOrWhiteSpace($ConfiguredModelScanPath)) {
-        & $AddCandidate $ConfiguredModelScanPath
+        if ([string]::IsNullOrWhiteSpace($ModelPath)) {
+            return
+        }
+
+        $ModelDirectory = [System.IO.Path]::GetDirectoryName($ModelPath)
+        if ([string]::IsNullOrWhiteSpace($ModelDirectory)) {
+            return
+        }
+
+        $DirectoryName = [System.IO.Path]::GetFileName($ModelDirectory)
+        $ParentDirectory = [System.IO.Directory]::GetParent($ModelDirectory)
+        if (
+            $ParentDirectory -and
+            -not [string]::IsNullOrWhiteSpace($DirectoryName) -and
+            -not [string]::IsNullOrWhiteSpace((Get-ModelSeriesLabelFromText -Text $DirectoryName))
+        ) {
+            if ($ParentDirectory.Parent) {
+                & $AddCandidate $ParentDirectory.Parent.FullName
+            }
+            & $AddCandidate $ParentDirectory.FullName
+        }
+
+        & $AddCandidate $ModelDirectory
+    }
+
+    foreach ($ConfiguredPath in @(Get-ConfiguredModelScanPaths)) {
+        & $AddCandidate $ConfiguredPath
     }
 
     $PreferredDefaultModelPath = Get-PreferredDefaultModelPath -IndexPath $IndexPath -PrimaryModelPath $PrimaryModelPath
     if (-not [string]::IsNullOrWhiteSpace($PreferredDefaultModelPath)) {
-        & $AddCandidate ([System.IO.Path]::GetDirectoryName($PreferredDefaultModelPath))
+        & $AddModelDirectoryCandidate $PreferredDefaultModelPath
     }
 
     $IndexPayload = Get-ExistingModelIndexPayload -Path $IndexPath
@@ -1387,7 +1519,7 @@ function Get-ModelScanDirectoryCandidates {
         foreach ($ModelEntry in @($IndexPayload.models)) {
             $ResolvedModelPath = Resolve-ModelPath -Path $ModelEntry.path
             if (-not [string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
-                & $AddCandidate ([System.IO.Path]::GetDirectoryName($ResolvedModelPath))
+                & $AddModelDirectoryCandidate $ResolvedModelPath
             }
         }
     }
@@ -1404,15 +1536,7 @@ function Get-DefaultModelScanDirectory {
 
     $Candidates = @(Get-ModelScanDirectoryCandidates -IndexPath $IndexPath -PrimaryModelPath $PrimaryModelPath)
     foreach ($Candidate in $Candidates) {
-        if (-not (Test-Path -LiteralPath $Candidate -PathType Container)) {
-            continue
-        }
-
-        $ModelFiles = @(
-            Get-ChildItem -LiteralPath $Candidate -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
-                Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) }
-        )
-        if ($ModelFiles.Count -gt 0) {
+        if (Test-ModelScanDirectoryHasModels -Path $Candidate) {
             return $Candidate
         }
     }
@@ -1433,8 +1557,17 @@ function Refresh-ModelIndexFromDefaultScanPath {
         [switch]$Quiet
     )
 
-    $ScanDirectory = Get-DefaultModelScanDirectory -IndexPath $Path -PrimaryModelPath $PrimaryModelPath
-    if ([string]::IsNullOrWhiteSpace($ScanDirectory)) {
+    $ScanDirectories = @(Get-ConfiguredModelScanDirectories)
+    $ModelFiles = @(Get-ModelFilesFromScanDirectories -ScanDirectories $ScanDirectories)
+    if ($ModelFiles.Count -eq 0) {
+        $DefaultScanDirectory = Get-DefaultModelScanDirectory -IndexPath $Path -PrimaryModelPath $PrimaryModelPath
+        if (-not [string]::IsNullOrWhiteSpace($DefaultScanDirectory)) {
+            $ScanDirectories = @($DefaultScanDirectory)
+            $ModelFiles = @(Get-ModelFilesFromScanDirectories -ScanDirectories $ScanDirectories)
+        }
+    }
+
+    if ($ScanDirectories.Count -eq 0) {
         if (-not $Quiet) {
             Write-Warning "Could not determine a model scan directory. model-index.json was not changed."
         }
@@ -1442,14 +1575,9 @@ function Refresh-ModelIndexFromDefaultScanPath {
         return $false
     }
 
-    $ModelFiles = @(
-        Get-ChildItem -LiteralPath $ScanDirectory -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
-            Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) } |
-            Sort-Object Name
-    )
     if ($ModelFiles.Count -eq 0) {
         if (-not $Quiet) {
-            Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f $ScanDirectory)
+            Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f ($ScanDirectories -join ", "))
         }
 
         return $false
@@ -1613,6 +1741,156 @@ function Skip-GgufValue {
     }
 }
 
+function Find-BytePatternIndex {
+    param(
+        [byte[]]$Bytes,
+        [byte[]]$Pattern
+    )
+
+    if (-not $Bytes -or -not $Pattern -or $Pattern.Length -eq 0 -or $Bytes.Length -lt $Pattern.Length) {
+        return -1
+    }
+
+    $LastStart = $Bytes.Length - $Pattern.Length
+    for ($Index = 0; $Index -le $LastStart; $Index++) {
+        $Matched = $true
+        for ($PatternIndex = 0; $PatternIndex -lt $Pattern.Length; $PatternIndex++) {
+            if ($Bytes[$Index + $PatternIndex] -ne $Pattern[$PatternIndex]) {
+                $Matched = $false
+                break
+            }
+        }
+
+        if ($Matched) {
+            return $Index
+        }
+    }
+
+    return -1
+}
+
+function Read-GgufNumericValueAtPosition {
+    param(
+        [System.IO.BinaryReader]$Reader,
+        [int64]$Position
+    )
+
+    if ($Position -lt 0 -or $Position -ge $Reader.BaseStream.Length) {
+        return $null
+    }
+
+    $Reader.BaseStream.Seek($Position, [System.IO.SeekOrigin]::Begin) | Out-Null
+    $Type = $Reader.ReadUInt32()
+    switch ($Type) {
+        0 { return [int64]$Reader.ReadByte() }
+        1 { return [int64]$Reader.ReadSByte() }
+        2 { return [int64]$Reader.ReadUInt16() }
+        3 { return [int64]$Reader.ReadInt16() }
+        4 { return [int64]$Reader.ReadUInt32() }
+        5 { return [int64]$Reader.ReadInt32() }
+        10 { return [int64]$Reader.ReadUInt64() }
+        11 { return [int64]$Reader.ReadInt64() }
+        default { return $null }
+    }
+}
+
+function Find-GgufLayerCountByKeyScan {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+
+    $Patterns = @(
+        [System.Text.Encoding]::UTF8.GetBytes("block_count"),
+        [System.Text.Encoding]::UTF8.GetBytes("layer_count")
+    )
+    $ChunkSize = 4MB
+    $MaxBytesToScan = 256MB
+    $OverlapSize = 256
+    $ScannedBytes = [int64]0
+
+    try {
+        $Stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $Reader = New-Object System.IO.BinaryReader($Stream)
+            $Magic = [System.Text.Encoding]::ASCII.GetString($Reader.ReadBytes(4))
+            if ($Magic -ne "GGUF") {
+                return $null
+            }
+
+            $Reader.BaseStream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $PreviousBytes = [byte[]]@()
+            while ($ScannedBytes -lt $MaxBytesToScan -and $Reader.BaseStream.Position -lt $Reader.BaseStream.Length) {
+                $BytesToRead = [Math]::Min($ChunkSize, $MaxBytesToScan - $ScannedBytes)
+                $Chunk = $Reader.ReadBytes([int]$BytesToRead)
+                if ($Chunk.Length -eq 0) {
+                    break
+                }
+
+                $SearchBytes = New-Object byte[] ($PreviousBytes.Length + $Chunk.Length)
+                if ($PreviousBytes.Length -gt 0) {
+                    [Array]::Copy($PreviousBytes, 0, $SearchBytes, 0, $PreviousBytes.Length)
+                }
+                [Array]::Copy($Chunk, 0, $SearchBytes, $PreviousBytes.Length, $Chunk.Length)
+                $SearchBaseOffset = $ScannedBytes - $PreviousBytes.Length
+
+                foreach ($Pattern in $Patterns) {
+                    $PatternIndex = Find-BytePatternIndex -Bytes $SearchBytes -Pattern $Pattern
+                    if ($PatternIndex -lt 0) {
+                        continue
+                    }
+
+                    $PatternOffset = $SearchBaseOffset + $PatternIndex
+                    for ($PrefixLength = 0; $PrefixLength -le 64; $PrefixLength++) {
+                        $KeyStart = $PatternOffset - $PrefixLength
+                        if ($KeyStart -lt 8) {
+                            continue
+                        }
+
+                        $LengthBytes = New-Object byte[] 8
+                        $Reader.BaseStream.Seek(($KeyStart - 8), [System.IO.SeekOrigin]::Begin) | Out-Null
+                        if ($Reader.Read($LengthBytes, 0, 8) -ne 8) {
+                            continue
+                        }
+
+                        $KeyLength = [BitConverter]::ToUInt64($LengthBytes, 0)
+                        if ($KeyLength -lt [uint64]$Pattern.Length -or $KeyLength -gt 128) {
+                            continue
+                        }
+                        if ($KeyStart + [int64]$KeyLength -ne $PatternOffset + $Pattern.Length) {
+                            continue
+                        }
+
+                        $Value = Read-GgufNumericValueAtPosition -Reader $Reader -Position ($KeyStart + [int64]$KeyLength)
+                        if ($null -ne $Value -and [int64]$Value -gt 0 -and [int64]$Value -lt 100000) {
+                            return [int]$Value
+                        }
+                    }
+                }
+
+                $ScannedBytes += $Chunk.Length
+                $KeepCount = [Math]::Min($OverlapSize, $SearchBytes.Length)
+                $PreviousBytes = New-Object byte[] $KeepCount
+                [Array]::Copy($SearchBytes, $SearchBytes.Length - $KeepCount, $PreviousBytes, 0, $KeepCount)
+            }
+        }
+        finally {
+            if ($Reader) {
+                $Reader.Close()
+            }
+            $Stream.Close()
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
 function Get-ModelRepeatingLayerCount {
     param(
         [string]$Path
@@ -1630,6 +1908,12 @@ function Get-ModelRepeatingLayerCount {
     $LayerCount = $null
 
     try {
+        $LayerCount = Find-GgufLayerCountByKeyScan -Path $ResolvedPath
+        if ($null -ne $LayerCount) {
+            $script:ModelRepeatingLayerCountCache[$ResolvedPath] = $LayerCount
+            return $LayerCount
+        }
+
         $Stream = [System.IO.File]::Open($ResolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
             $Reader = New-Object System.IO.BinaryReader($Stream)
@@ -1658,10 +1942,6 @@ function Get-ModelRepeatingLayerCount {
                     }
                 }
                 else {
-                    if ($Key -like 'tokenizer.*') {
-                        break
-                    }
-
                     Skip-GgufValue -Reader $Reader -Type $Type
                 }
             }
@@ -1744,6 +2024,179 @@ function Sync-LaunchConfigGpuFields {
     $Config.RepeatingLayers = Convert-GpuLayersToRepeatingLayers -GpuLayers ([string]$Config.GpuLayers) -RepeatingLayerCount $RepeatingLayerCount
 }
 
+function Get-ModelLayerDistribution {
+    param(
+        [AllowNull()][string]$ModelPath,
+        [AllowNull()][string]$RequestedGpuLayers,
+        [AllowNull()]$GpuOffloadInfo
+    )
+
+    $TotalLayers = $null
+    $GpuLayers = $null
+    $CpuLayers = $null
+    $Source = "metadata"
+    $IsRuntimeEstimate = $false
+
+    if ($GpuOffloadInfo -and $null -ne $GpuOffloadInfo.OffloadedLayers -and $null -ne $GpuOffloadInfo.TotalLayers) {
+        $TotalLayers = [int]$GpuOffloadInfo.TotalLayers
+        $GpuLayers = [int]$GpuOffloadInfo.OffloadedLayers
+        $CpuLayers = [Math]::Max(0, $TotalLayers - $GpuLayers)
+        $Source = "runtime"
+    }
+    else {
+        $RepeatingLayerCount = Get-ModelRepeatingLayerCount -Path $ModelPath
+        if ($null -ne $RepeatingLayerCount) {
+            $TotalLayers = [int]$RepeatingLayerCount + 1
+        }
+
+        $GpuLayerText = if ([string]::IsNullOrWhiteSpace($RequestedGpuLayers)) { "auto" } else { [string]$RequestedGpuLayers }
+        if ($null -ne $TotalLayers) {
+            if ($GpuLayerText.Trim().ToLowerInvariant() -eq "all") {
+                $GpuLayers = $TotalLayers
+                $CpuLayers = 0
+            }
+            elseif ($GpuLayerText -match '^\d+$') {
+                $GpuLayers = [Math]::Min([int]$GpuLayerText, $TotalLayers)
+                $CpuLayers = [Math]::Max(0, $TotalLayers - $GpuLayers)
+            }
+            elseif (
+                $GpuOffloadInfo -and
+                $GpuLayerText.Trim().ToLowerInvariant() -eq "auto" -and
+                (
+                    ($null -ne $GpuOffloadInfo.GpuProcessDedicatedMiB -and [double]$GpuOffloadInfo.GpuProcessDedicatedMiB -gt 0) -or
+                    ($null -ne $GpuOffloadInfo.GpuProcessLocalMiB -and [double]$GpuOffloadInfo.GpuProcessLocalMiB -gt 0)
+                )
+            ) {
+                $GpuLayers = $TotalLayers
+                $CpuLayers = 0
+                $Source = "system-gpu-memory"
+                $IsRuntimeEstimate = $true
+            }
+        }
+    }
+
+    $GpuAdapterLayerParts = @()
+    if (
+        $null -ne $GpuLayers -and
+        $GpuOffloadInfo -and
+        $GpuOffloadInfo.GpuProcessAdapters -and
+        @($GpuOffloadInfo.GpuProcessAdapters).Count -gt 1
+    ) {
+        $AdapterWeights = @(
+            foreach ($Adapter in @($GpuOffloadInfo.GpuProcessAdapters)) {
+                $Weight = $null
+                if ($null -ne $Adapter.DedicatedMiB -and [double]$Adapter.DedicatedMiB -gt 0) {
+                    $Weight = [double]$Adapter.DedicatedMiB
+                }
+                elseif ($null -ne $Adapter.LocalMiB -and [double]$Adapter.LocalMiB -gt 0) {
+                    $Weight = [double]$Adapter.LocalMiB
+                }
+
+                if ($null -ne $Weight -and $Weight -gt 0) {
+                    [pscustomobject]@{
+                        Label     = [string]$Adapter.Label
+                        Weight    = $Weight
+                        Base      = 0
+                        Remainder = 0.0
+                        Layers    = 0
+                    }
+                }
+            }
+        )
+
+        $WeightTotal = ($AdapterWeights | Measure-Object -Property Weight -Sum).Sum
+        if ($WeightTotal -gt 0) {
+            $AssignedLayers = 0
+            foreach ($AdapterWeight in $AdapterWeights) {
+                $Exact = ([double]$GpuLayers * [double]$AdapterWeight.Weight) / [double]$WeightTotal
+                $Base = [Math]::Floor($Exact)
+                $AdapterWeight.Base = [int]$Base
+                $AdapterWeight.Layers = [int]$Base
+                $AdapterWeight.Remainder = [double]($Exact - $Base)
+                $AssignedLayers += [int]$Base
+            }
+
+            $RemainingLayers = [Math]::Max(0, [int]$GpuLayers - [int]$AssignedLayers)
+            foreach ($AdapterWeight in @($AdapterWeights | Sort-Object -Property Remainder -Descending)) {
+                if ($RemainingLayers -le 0) {
+                    break
+                }
+
+                $AdapterWeight.Layers++
+                $RemainingLayers--
+            }
+
+            $GpuAdapterLayerParts = @(
+                foreach ($AdapterWeight in $AdapterWeights) {
+                    "{0} {1}" -f $AdapterWeight.Label, $AdapterWeight.Layers
+                }
+            )
+        }
+    }
+
+    return [pscustomobject]@{
+        TotalLayers        = $TotalLayers
+        GpuLayers          = $GpuLayers
+        CpuLayers          = $CpuLayers
+        GpuAdapterLayers   = $GpuAdapterLayerParts
+        RequestedGpuLayers = if ([string]::IsNullOrWhiteSpace($RequestedGpuLayers)) { "auto" } else { [string]$RequestedGpuLayers }
+        Source             = $Source
+        IsRuntimeEstimate  = $IsRuntimeEstimate
+    }
+}
+
+function Format-ModelLayerDistributionValue {
+    param(
+        [AllowNull()][string]$ModelPath,
+        [AllowNull()][string]$RequestedGpuLayers,
+        [AllowNull()]$GpuOffloadInfo,
+        [ValidateSet("Chinese", "English")]
+        [string]$Language = "English"
+    )
+
+    $Distribution = Get-ModelLayerDistribution -ModelPath $ModelPath -RequestedGpuLayers $RequestedGpuLayers -GpuOffloadInfo $GpuOffloadInfo
+    $RequestedText = if ([string]::IsNullOrWhiteSpace([string]$Distribution.RequestedGpuLayers)) { "auto" } else { [string]$Distribution.RequestedGpuLayers }
+
+    if ($null -eq $Distribution.TotalLayers) {
+        if ($Language -eq "Chinese") {
+            return "總層數未知 | GPU $RequestedText | CPU 未知"
+        }
+
+        return "total unknown | GPU $RequestedText | CPU unknown"
+    }
+
+    $GpuText = if ($null -ne $Distribution.GpuLayers) { [string]$Distribution.GpuLayers } else { $RequestedText }
+    if ($Distribution.GpuAdapterLayers -and @($Distribution.GpuAdapterLayers).Count -gt 1) {
+        if ($Language -eq "Chinese") {
+            $GpuText = "{0}（約 {1}）" -f $GpuText, (@($Distribution.GpuAdapterLayers) -join " / ")
+        }
+        else {
+            $GpuText = "{0} (approx {1})" -f $GpuText, (@($Distribution.GpuAdapterLayers) -join " / ")
+        }
+    }
+    $CpuText = if ($null -ne $Distribution.CpuLayers) { [string]$Distribution.CpuLayers } else { "auto" }
+    $SourceText = switch ([string]$Distribution.Source) {
+        "runtime" {
+            if ($Language -eq "Chinese") { "實際" } else { "runtime" }
+        }
+        "runtime-estimated" {
+            if ($Language -eq "Chinese") { "推定" } else { "inferred" }
+        }
+        "system-gpu-memory" {
+            if ($Language -eq "Chinese") { "系統確認" } else { "system-confirmed" }
+        }
+        default {
+            if ($Language -eq "Chinese") { "預估" } else { "estimated" }
+        }
+    }
+
+    if ($Language -eq "Chinese") {
+        return "總 {0} | GPU {1} | CPU {2}（{3}）" -f $Distribution.TotalLayers, $GpuText, $CpuText, $SourceText
+    }
+
+    return "total {0} | GPU {1} | CPU {2} ({3})" -f $Distribution.TotalLayers, $GpuText, $CpuText, $SourceText
+}
+
 function Sync-LaunchConfigMtpFields {
     param(
         [System.Collections.IDictionary]$Config
@@ -1812,6 +2265,83 @@ function Sync-LaunchConfigReasoningFields {
     }
 }
 
+function Get-GpuProcessMemoryInfo {
+    param(
+        [System.Diagnostics.Process]$Process
+    )
+
+    if (-not $Process) {
+        return [pscustomobject]@{
+            DedicatedMiB = $null
+            LocalMiB     = $null
+            Instances    = @()
+            Adapters     = @()
+        }
+    }
+
+    try {
+        $Samples = Get-Counter '\GPU Process Memory(*)\Dedicated Usage','\GPU Process Memory(*)\Local Usage' -ErrorAction Stop
+        $MatchingSamples = @(
+            $Samples.CounterSamples |
+                Where-Object { $_.InstanceName -match ("^pid_{0}_" -f [regex]::Escape([string]$Process.Id)) }
+        )
+
+        $DedicatedBytes = 0.0
+        $LocalBytes = 0.0
+        $AdapterBuckets = @{}
+        $AdapterOrder = New-Object System.Collections.Generic.List[string]
+        foreach ($Sample in $MatchingSamples) {
+            $AdapterInstance = [regex]::Replace([string]$Sample.InstanceName, ("^pid_{0}_" -f [regex]::Escape([string]$Process.Id)), "")
+            if (-not $AdapterBuckets.ContainsKey($AdapterInstance)) {
+                $AdapterBuckets[$AdapterInstance] = [pscustomobject]@{
+                    Instance       = $AdapterInstance
+                    DedicatedBytes = 0.0
+                    LocalBytes     = 0.0
+                }
+                $AdapterOrder.Add($AdapterInstance)
+            }
+
+            if ($Sample.Path -match '\\dedicated usage$') {
+                $DedicatedBytes += [double]$Sample.CookedValue
+                $AdapterBuckets[$AdapterInstance].DedicatedBytes += [double]$Sample.CookedValue
+            }
+            elseif ($Sample.Path -match '\\local usage$') {
+                $LocalBytes += [double]$Sample.CookedValue
+                $AdapterBuckets[$AdapterInstance].LocalBytes += [double]$Sample.CookedValue
+            }
+        }
+
+        $AdapterIndex = 0
+        $Adapters = @(
+            foreach ($AdapterInstance in $AdapterOrder) {
+                $Bucket = $AdapterBuckets[$AdapterInstance]
+                [pscustomobject]@{
+                    Label        = "GPU$AdapterIndex"
+                    Instance     = $Bucket.Instance
+                    DedicatedMiB = if ($Bucket.DedicatedBytes -gt 0) { [Math]::Round(($Bucket.DedicatedBytes / 1MB), 2) } else { $null }
+                    LocalMiB     = if ($Bucket.LocalBytes -gt 0) { [Math]::Round(($Bucket.LocalBytes / 1MB), 2) } else { $null }
+                }
+                $AdapterIndex++
+            }
+        )
+
+        return [pscustomobject]@{
+            DedicatedMiB = if ($DedicatedBytes -gt 0) { [Math]::Round(($DedicatedBytes / 1MB), 2) } else { $null }
+            LocalMiB     = if ($LocalBytes -gt 0) { [Math]::Round(($LocalBytes / 1MB), 2) } else { $null }
+            Instances    = @($MatchingSamples | Select-Object -ExpandProperty InstanceName -Unique)
+            Adapters     = $Adapters
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            DedicatedMiB = $null
+            LocalMiB     = $null
+            Instances    = @()
+            Adapters     = @()
+        }
+    }
+}
+
 function Get-GpuOffloadInfo {
     param(
         [System.Diagnostics.Process]$Process = $null
@@ -1822,6 +2352,7 @@ function Get-GpuOffloadInfo {
     $TrackedLogPaths = Get-TrackedLogPaths
     $TrackedStdErrLog = $TrackedLogPaths.StdErrLog
     $RequestedGpuLayers = $null
+    $GpuProcessMemoryInfo = Get-GpuProcessMemoryInfo -Process $TrackedProcess
 
     if ($TrackedProcess) {
         try {
@@ -1848,6 +2379,9 @@ function Get-GpuOffloadInfo {
             GpuModelBufferMiB   = $null
             GpuModelBufferTotalMiB = $null
             CpuMappedModelBufferMiB = $null
+            GpuProcessDedicatedMiB = $GpuProcessMemoryInfo.DedicatedMiB
+            GpuProcessLocalMiB     = $GpuProcessMemoryInfo.LocalMiB
+            GpuProcessAdapters      = @($GpuProcessMemoryInfo.Adapters)
             LogPath             = $TrackedStdErrLog
         }
     }
@@ -1881,6 +2415,9 @@ function Get-GpuOffloadInfo {
         GpuModelBufferMiB      = $GpuModelBufferMiB
         GpuModelBufferTotalMiB = $GpuModelBufferTotalMiB
         CpuMappedModelBufferMiB = $CpuMappedModelBufferMiB
+        GpuProcessDedicatedMiB = $GpuProcessMemoryInfo.DedicatedMiB
+        GpuProcessLocalMiB     = $GpuProcessMemoryInfo.LocalMiB
+        GpuProcessAdapters     = @($GpuProcessMemoryInfo.Adapters)
         LogPath                = $TrackedStdErrLog
     }
 }
@@ -4267,8 +4804,69 @@ function Get-SavedLaunchProfilesForModel {
             Where-Object {
                 [string]::Equals((Resolve-ModelPath -Path ([string]$_.model_path)), $ResolvedModelPath, [System.StringComparison]::OrdinalIgnoreCase)
             } |
-            Sort-Object @{ Expression = { [datetime]::Parse(([string]$_.updated_at)) }; Descending = $true }, @{ Expression = { [string]$_.name }; Descending = $false }
+            Sort-Object @{ Expression = {
+                    try { [datetime]::Parse(([string]$_.updated_at)) }
+                    catch { [datetime]::MinValue }
+                }; Descending = $true }, @{ Expression = { [string]$_.name }; Descending = $false }
     )
+}
+
+function Get-SavedLaunchProfiles {
+    $Data = Get-SavedLaunchProfileData -Path $SavedLaunchProfileFile
+    return @(
+        $Data.profiles |
+            Sort-Object @{ Expression = {
+                    try { [datetime]::Parse(([string]$_.updated_at)) }
+                    catch { [datetime]::MinValue }
+                }; Descending = $true }, @{ Expression = { [string]$_.name }; Descending = $false }
+    )
+}
+
+function Get-ModelEntryForSavedLaunchProfile {
+    param(
+        $Profile,
+        [string]$IndexPath
+    )
+
+    if (-not $Profile) {
+        return $null
+    }
+
+    $ProfileModelPath = if (-not [string]::IsNullOrWhiteSpace([string]$Profile.model_path)) {
+        [string]$Profile.model_path
+    }
+    elseif ($Profile.config -and $Profile.config.PSObject.Properties["ModelPath"]) {
+        [string]$Profile.config.ModelPath
+    }
+    else {
+        ""
+    }
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $ProfileModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        return $null
+    }
+
+    $ModelEntry = Get-ModelIndexEntryByPath -IndexPath $IndexPath -ResolvedModelPath $ResolvedModelPath
+    if ($ModelEntry) {
+        return $ModelEntry
+    }
+
+    if (-not (Test-Path -LiteralPath $ResolvedModelPath -PathType Leaf)) {
+        return $null
+    }
+
+    $FallbackName = if (-not [string]::IsNullOrWhiteSpace([string]$Profile.model_name)) {
+        [string]$Profile.model_name
+    }
+    else {
+        [System.IO.Path]::GetFileNameWithoutExtension($ResolvedModelPath)
+    }
+
+    return [pscustomobject]@{
+        name = $FallbackName
+        path = $ResolvedModelPath
+    }
 }
 
 function Apply-SavedLaunchProfileToConfig {
@@ -4295,9 +4893,35 @@ function Apply-SavedLaunchProfileToConfig {
     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $IndexPath
 }
 
-function Format-SavedLaunchProfileSummary {
+function Get-SavedLaunchProfileContextText {
     param(
         $Profile
+    )
+
+    if (-not $Profile -or -not $Profile.config) {
+        return [string]$script:ManagedDefaultContextSize
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Profile.config.ContextSize)) {
+        return [string]$Profile.config.ContextSize
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Profile.config.ExtraArgs)) {
+        $ExtraArgs = @(Split-ArgumentLine -Line ([string]$Profile.config.ExtraArgs))
+        $ContextFromExtraArgs = Get-LlamaArgumentValue -Arguments $ExtraArgs -Patterns @('^--ctx-size(?:=(.+))?$')
+        if (-not [string]::IsNullOrWhiteSpace($ContextFromExtraArgs)) {
+            return [string]$ContextFromExtraArgs
+        }
+    }
+
+    return [string]$script:ManagedDefaultContextSize
+}
+
+function Format-SavedLaunchProfileSummary {
+    param(
+        $Profile,
+        [ValidateSet("Bilingual", "Chinese", "English")]
+        [string]$Language = "Bilingual"
     )
 
     if (-not $Profile -or -not $Profile.config) {
@@ -4306,6 +4930,7 @@ function Format-SavedLaunchProfileSummary {
 
     $LaunchModeText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.LaunchMode)) { "Background Service" } else { [string]$Profile.config.LaunchMode }
     $GpuText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.GpuLayers)) { "auto" } else { [string]$Profile.config.GpuLayers }
+    $ContextText = Get-SavedLaunchProfileContextText -Profile $Profile
     $ReasoningText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ReasoningMode)) { "auto" } else { [string]$Profile.config.ReasoningMode }
     $MtpText = if ($null -eq $Profile.config.MtpEnabled) { "auto" } elseif ([bool]$Profile.config.MtpEnabled) { "on" } else { "off" }
     $SlotsText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.Slots)) { [string]$FixedLlamaServerParallelSlots } else { [string]$Profile.config.Slots }
@@ -4319,9 +4944,19 @@ function Format-SavedLaunchProfileSummary {
         }
     }
 
+    $ChineseText = "{0} | GPU {1} | CTX {2} | Slots {3} | 推理 {4} | MTP {5}{6}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })
+    $EnglishText = "{0} | GPU {1} | CTX {2} | slots {3} | reasoning {4} | MTP {5}{6}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" })
+
+    if ($Language -eq "Chinese") {
+        return $ChineseText
+    }
+    if ($Language -eq "English") {
+        return $EnglishText
+    }
+
     return Format-BilingualText `
-        -ChineseText ("{0} | GPU {1} | Slots {2} | 推理 {3} | MTP {4}{5}" -f $LaunchModeText, $GpuText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })) `
-        -EnglishText ("{0} | GPU {1} | slots {2} | reasoning {3} | MTP {4}{5}" -f $LaunchModeText, $GpuText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" }))
+        -ChineseText $ChineseText `
+        -EnglishText $EnglishText
 }
 
 function Show-QuickStartSavedProfileMenu {
@@ -4361,6 +4996,73 @@ function Show-QuickStartSavedProfileMenu {
     $Selection = Show-ListMenu `
         -Title (Format-BilingualText -ChineseText "快速啟動設定檔" -EnglishText "Quick Start Profiles") `
         -Subtitle (Format-BilingualText -ChineseText ("為 {0} 選擇預設快速啟動或已儲存設定檔。" -f $ModelEntry.name) -EnglishText ("Choose default Quick Start or a saved profile for {0}." -f $ModelEntry.name)) `
+        -Items $Items.ToArray()
+
+    if (-not $Selection) {
+        return [pscustomobject]@{
+            Action  = "Back"
+            Profile = $null
+        }
+    }
+
+    return $Selection
+}
+
+function Show-QuickStartEntryMenu {
+    param(
+        [string]$IndexPath
+    )
+
+    $Profiles = @(Get-SavedLaunchProfiles)
+    if ($Profiles.Count -eq 0) {
+        return [pscustomobject]@{
+            Action  = "SelectModel"
+            Profile = $null
+        }
+    }
+
+    $Items = New-Object System.Collections.Generic.List[object]
+    foreach ($Profile in $Profiles) {
+        $ModelName = if (-not [string]::IsNullOrWhiteSpace([string]$Profile.model_name)) {
+            [string]$Profile.model_name
+        }
+        else {
+            $ModelEntry = Get-ModelEntryForSavedLaunchProfile -Profile $Profile -IndexPath $IndexPath
+            if ($ModelEntry) { [string]$ModelEntry.name } else { Format-BilingualText -ChineseText "未知模型" -EnglishText "Unknown model" }
+        }
+
+        $Items.Add([pscustomobject]@{
+                Name        = Format-BilingualText -ChineseText ("設定檔：{0}" -f [string]$Profile.name) -EnglishText ("Profile: {0}" -f [string]$Profile.name)
+                Description = Format-BilingualText `
+                    -ChineseText ("{0} | {1}" -f $ModelName, (Format-SavedLaunchProfileSummary -Profile $Profile -Language "Chinese")) `
+                    -EnglishText ("{0} | {1}" -f $ModelName, (Format-SavedLaunchProfileSummary -Profile $Profile -Language "English"))
+                Value       = [pscustomobject]@{
+                    Action  = "UseProfile"
+                    Profile = $Profile
+                }
+            })
+    }
+
+    $Items.Add([pscustomobject]@{
+            Name        = Format-BilingualText -ChineseText "選擇模型" -EnglishText "Choose Model"
+            Description = Format-BilingualText -ChineseText "不使用已儲存設定檔，進入一般快速啟動模型選單。" -EnglishText "Do not use a saved profile. Open the normal Quick Start model picker."
+            Value       = [pscustomobject]@{
+                Action  = "SelectModel"
+                Profile = $null
+            }
+        })
+    $Items.Add([pscustomobject]@{
+            Name        = Format-BilingualText -ChineseText "返回" -EnglishText "Back"
+            Description = Format-BilingualText -ChineseText "回到主選單。" -EnglishText "Return to the main menu."
+            Value       = [pscustomobject]@{
+                Action  = "Back"
+                Profile = $null
+            }
+        })
+
+    $Selection = Show-ListMenu `
+        -Title (Format-BilingualText -ChineseText "快速啟動" -EnglishText "Quick Start") `
+        -Subtitle (Format-BilingualText -ChineseText "已儲存設定檔會優先列在這裡；也可以改走一般模型選擇。" -EnglishText "Saved profiles are listed first here; you can still use the normal model picker.") `
         -Items $Items.ToArray()
 
     if (-not $Selection) {
@@ -5082,13 +5784,41 @@ function Get-ModelSeriesLabel {
     }
 
     $Candidates = @()
+    $FolderCandidates = @()
     if ($ModelEntry.PSObject.Properties["name"] -and -not [string]::IsNullOrWhiteSpace([string]$ModelEntry.name)) {
         $Candidates += [string]$ModelEntry.name
     }
 
     if ($ModelEntry.PSObject.Properties["path"] -and -not [string]::IsNullOrWhiteSpace([string]$ModelEntry.path)) {
         try {
-            $Candidates += [System.IO.Path]::GetFileNameWithoutExtension([string]$ModelEntry.path)
+            $ResolvedModelPath = Resolve-ModelPath -Path ([string]$ModelEntry.path)
+            $Candidates += [System.IO.Path]::GetFileNameWithoutExtension($ResolvedModelPath)
+
+            $ParentDirectory = [System.IO.Directory]::GetParent($ResolvedModelPath)
+            if ($ParentDirectory) {
+                $ImmediateParentLabel = Get-ModelSeriesLabelFromText -Text $ParentDirectory.Name
+                if (-not [string]::IsNullOrWhiteSpace($ImmediateParentLabel)) {
+                    return $ImmediateParentLabel
+                }
+            }
+
+            while ($ParentDirectory) {
+                $ParentName = $ParentDirectory.Name
+                $ParentOfParent = $ParentDirectory.Parent
+                if (
+                    -not [string]::IsNullOrWhiteSpace($ParentName) -and
+                    -not [string]::Equals($ParentDirectory.FullName, $ScriptRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+                    ($null -ne $ParentOfParent)
+                ) {
+                    $FolderCandidates += $ParentName
+                }
+
+                if ([string]::Equals($ParentDirectory.FullName, $ScriptRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    break
+                }
+
+                $ParentDirectory = $ParentDirectory.Parent
+            }
         }
         catch {
             $Candidates += [string]$ModelEntry.path
@@ -5106,6 +5836,13 @@ function Get-ModelSeriesLabel {
         $FallbackLabel = Get-FallbackModelSeriesLabel -Text $Candidate
         if (-not [string]::IsNullOrWhiteSpace($FallbackLabel)) {
             return $FallbackLabel
+        }
+    }
+
+    foreach ($Candidate in $FolderCandidates) {
+        $Label = Get-ModelSeriesLabelFromText -Text $Candidate
+        if (-not [string]::IsNullOrWhiteSpace($Label)) {
+            return $Label
         }
     }
 
@@ -5481,8 +6218,10 @@ function Get-VisionSelectableModels {
             $SearchRoots.Add($PrimaryDirectory)
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace($ConfiguredModelScanPath) -and (Test-Path -LiteralPath $ConfiguredModelScanPath -PathType Container)) {
-        $SearchRoots.Add((Resolve-Path -LiteralPath $ConfiguredModelScanPath).Path)
+    foreach ($ConfiguredPath in @(Get-ConfiguredModelScanPaths)) {
+        if (-not [string]::IsNullOrWhiteSpace($ConfiguredPath) -and (Test-Path -LiteralPath $ConfiguredPath -PathType Container)) {
+            $SearchRoots.Add((Resolve-Path -LiteralPath $ConfiguredPath).Path)
+        }
     }
 
     $IndexData = Get-ModelIndexData -Path $IndexPath
@@ -5837,12 +6576,508 @@ function Show-MainLauncherMenu {
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "快速啟動" -EnglishText "Quick Start"; Description = Format-BilingualText -ChineseText "先選模型，再選背景服務或 Web UI。" -EnglishText "Pick a model, then choose background service or Web UI."; Value = "QuickStart" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch"; Description = Format-BilingualText -ChineseText "先選模型，再編輯參數矩陣後啟動。" -EnglishText "Pick a model, edit a parameter matrix, then start."; Value = "TuneLaunch" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "服務狀態" -EnglishText "Server Status"; Description = Format-BilingualText -ChineseText "顯示追蹤中的服務狀態、執行參數與 GPU 卸載摘要。" -EnglishText "Show tracked server status, runtime settings, and GPU offload summary."; Value = "Status" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "維護" -EnglishText "Maintenance"; Description = Format-BilingualText -ChineseText "刪除已儲存設定檔，或修改模型掃描路徑。" -EnglishText "Delete saved profiles or edit model scan paths."; Value = "Maintenance" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "停止目前服務" -EnglishText "Stop Running Server"; Description = Format-BilingualText -ChineseText "停止目前被追蹤的 llama.cpp 服務。" -EnglishText "Stop the currently tracked llama.cpp server."; Value = "Stop" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "llama-server 說明" -EnglishText "llama-server Help"; Description = Format-BilingualText -ChineseText "顯示目前已安裝 llama-server.exe 的完整 --help 輸出。" -EnglishText "Show the exact --help output from the installed llama-server.exe."; Value = "Help" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "離開" -EnglishText "Exit"; Description = Format-BilingualText -ChineseText "不做變更直接離開啟動器。" -EnglishText "Leave the launcher without changing anything."; Value = "Exit" }
     )
 
     return Show-ListMenu -Title (Format-BilingualText -ChineseText "llama.cpp 啟動器" -EnglishText "llama.cpp Launcher") -Subtitle (Format-BilingualText -ChineseText "先選擇快速啟動或調校後啟動，工具型功能也保留在這裡。" -EnglishText "Choose Quick Start or Tune And Launch first. Utility actions stay here too.") -Items $Options
+}
+
+function Show-MaintenanceMenu {
+    $Options = @(
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "已儲存設定檔" -EnglishText "Saved Profiles"; Description = Format-BilingualText -ChineseText "檢視並刪除 Quick Start / Tune And Launch 儲存的設定檔。" -EnglishText "Review and delete profiles saved from Quick Start or Tune And Launch."; Value = "Profiles" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "輸出設定檔" -EnglishText "Export Profile"; Description = Format-BilingualText -ChineseText "把已儲存設定檔輸出成可雙擊的一鍵啟動 .cmd。" -EnglishText "Export a saved profile as a double-click one-shot .cmd launcher."; Value = "ExportProfile" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "模型掃描路徑" -EnglishText "Model Scan Paths"; Description = Format-BilingualText -ChineseText "新增、刪除或重設模型掃描資料夾，完成後會刷新模型索引。" -EnglishText "Add, remove, or reset model scan folders, then refresh the model index."; Value = "ScanPaths" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"; Description = Format-BilingualText -ChineseText "回到主選單。" -EnglishText "Return to the main menu."; Value = "Back" }
+    )
+
+    return Show-ListMenu -Title (Format-BilingualText -ChineseText "維護" -EnglishText "Maintenance") -Subtitle (Format-BilingualText -ChineseText "管理啟動器的持久設定。" -EnglishText "Manage launcher settings that persist across runs.") -Items $Options
+}
+
+function Remove-SavedLaunchProfileById {
+    param(
+        [string]$ProfileId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProfileId)) {
+        return $false
+    }
+
+    $Data = Get-SavedLaunchProfileData -Path $SavedLaunchProfileFile
+    $RemainingProfiles = @($Data.profiles | Where-Object { [string]$_.id -ne [string]$ProfileId })
+    if ($RemainingProfiles.Count -eq @($Data.profiles).Count) {
+        return $false
+    }
+
+    Save-SavedLaunchProfileData -Path $SavedLaunchProfileFile -Profiles $RemainingProfiles
+    return $true
+}
+
+function Show-SavedLaunchProfileMaintenance {
+    param(
+        [string]$IndexPath
+    )
+
+    while ($true) {
+        $Profiles = @(Get-SavedLaunchProfiles)
+        if ($Profiles.Count -eq 0) {
+            Show-MenuHeader -Title (Format-BilingualText -ChineseText "已儲存設定檔" -EnglishText "Saved Profiles") -Subtitle (Format-BilingualText -ChineseText "目前沒有已儲存設定檔。" -EnglishText "There are no saved profiles yet.")
+            Wait-MenuContinue
+            return
+        }
+
+        $Items = @(
+            foreach ($Profile in $Profiles) {
+                $ModelEntry = Get-ModelEntryForSavedLaunchProfile -Profile $Profile -IndexPath $IndexPath
+                $ModelName = if ($ModelEntry) { [string]$ModelEntry.name } elseif ($Profile.model_name) { [string]$Profile.model_name } else { [System.IO.Path]::GetFileNameWithoutExtension([string]$Profile.model_path) }
+                [pscustomobject]@{
+                    Name        = Format-BilingualText -ChineseText ("刪除：{0}" -f [string]$Profile.name) -EnglishText ("Delete: {0}" -f [string]$Profile.name)
+                    Description = Format-BilingualText -ChineseText ("{0} | {1}" -f $ModelName, (Format-SavedLaunchProfileSummary -Profile $Profile -Language "Chinese")) -EnglishText ("{0} | {1}" -f $ModelName, (Format-SavedLaunchProfileSummary -Profile $Profile -Language "English"))
+                    Value       = [pscustomobject]@{ Action = "Delete"; Profile = $Profile }
+                }
+            }
+        )
+        $Items += [pscustomobject]@{ Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"; Description = Format-BilingualText -ChineseText "回到維護選單。" -EnglishText "Return to Maintenance."; Value = [pscustomobject]@{ Action = "Back" } }
+
+        $Selection = Show-ListMenu -Title (Format-BilingualText -ChineseText "已儲存設定檔" -EnglishText "Saved Profiles") -Subtitle (Format-BilingualText -ChineseText "選擇要刪除的設定檔；刪除前會再次確認。" -EnglishText "Choose a profile to delete; you will be asked to confirm.") -Items $Items
+        if (-not $Selection -or $Selection.Action -eq "Back") {
+            return
+        }
+
+        $ProfileName = [string]$Selection.Profile.name
+        $Confirm = Read-Host (Format-BilingualText -ChineseText ("確定刪除「{0}」？輸入 YES 確認" -f $ProfileName) -EnglishText ("Delete '{0}'? Type YES to confirm" -f $ProfileName))
+        if ($Confirm -ne "YES") {
+            Write-Host (Format-BilingualText -ChineseText "已取消刪除。" -EnglishText "Delete canceled.") -ForegroundColor Yellow
+            Start-Sleep -Seconds 1
+            continue
+        }
+
+        if (Remove-SavedLaunchProfileById -ProfileId ([string]$Selection.Profile.id)) {
+            Write-Host (Format-BilingualText -ChineseText ("已刪除設定檔：{0}" -f $ProfileName) -EnglishText ("Deleted profile: {0}" -f $ProfileName)) -ForegroundColor Green
+        }
+        else {
+            Write-Host (Format-BilingualText -ChineseText "找不到要刪除的設定檔。" -EnglishText "The selected profile could not be found.") -ForegroundColor Red
+        }
+        Start-Sleep -Seconds 1
+    }
+}
+
+function ConvertTo-PowerShellSingleQuotedString {
+    param(
+        [AllowNull()][string]$Value
+    )
+
+    $SafeValue = if ($null -eq $Value) { "" } else { [string]$Value }
+    return "'{0}'" -f ($SafeValue -replace "'", "''")
+}
+
+function ConvertTo-CmdArgument {
+    param(
+        [AllowNull()][string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+
+    $Text = [string]$Value
+    if ($Text -match '^[A-Za-z0-9_\-\.\/:=]+$') {
+        return $Text
+    }
+
+    $Escaped = $Text -replace '%', '%%'
+    $Escaped = $Escaped -replace '"', '\"'
+    return '"{0}"' -f $Escaped
+}
+
+function ConvertTo-SafeCommandFileName {
+    param(
+        [AllowNull()][string]$Value
+    )
+
+    $Text = if ([string]::IsNullOrWhiteSpace($Value)) { "profile" } else { [string]$Value }
+    foreach ($InvalidChar in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $Text = $Text.Replace([string]$InvalidChar, "_")
+    }
+
+    $Text = [regex]::Replace($Text, '\s+', '_').Trim("_", ".", " ")
+    $Text = [regex]::Replace($Text, '[^A-Za-z0-9._\-\u4e00-\u9fff]+', "_").Trim("_", ".", " ")
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return "profile"
+    }
+
+    return $Text
+}
+
+function Get-LaunchConfigWrapperArguments {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $Arguments = New-Object System.Collections.Generic.List[string]
+    $Arguments.Add("-BypassMenu")
+    $Arguments.Add("-Background")
+    $Arguments.Add("-NoPause")
+
+    if ([string]$Config.LaunchMode -eq "Background Service") {
+        $Arguments.Add("-NoBrowser")
+    }
+
+    $Arguments.Add("-ModelPath")
+    $Arguments.Add((Resolve-ModelPath -Path ([string]$Config.ModelPath)))
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.Port)) {
+        $Arguments.Add("-Port")
+        $Arguments.Add([string]$Config.Port)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.GpuLayers)) {
+        $Arguments.Add("-GpuLayers")
+        $Arguments.Add([string]$Config.GpuLayers)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.Threads)) {
+        $Arguments.Add("-Threads")
+        $Arguments.Add([string]$Config.Threads)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ThreadsBatch)) {
+        $Arguments.Add("-ThreadsBatch")
+        $Arguments.Add([string]$Config.ThreadsBatch)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ReadyTimeoutSec)) {
+        $Arguments.Add("-ReadyTimeoutSec")
+        $Arguments.Add([string]$Config.ReadyTimeoutSec)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.OpenPath)) {
+        $Arguments.Add("-OpenPath")
+        $Arguments.Add([string]$Config.OpenPath)
+    }
+    if ([bool]$Config.ExtremeMode) {
+        $Arguments.Add("-ExtremeMode")
+    }
+    if ([bool]$Config.AutoTune) {
+        $Arguments.Add("-AutoTune")
+    }
+    if ([string]$Config.VisionSelectionMode -eq "disabled") {
+        $Arguments.Add("-DisableVision")
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$Config.VisionMmprojPath)) {
+        $ResolvedMmprojPath = Resolve-ModelPath -Path ([string]$Config.VisionMmprojPath)
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedMmprojPath)) {
+            $Arguments.Add("-VisionMmprojPath")
+            $Arguments.Add($ResolvedMmprojPath)
+        }
+    }
+
+    foreach ($ForwardArgument in @(Convert-MenuConfigToForwardArgs -Config $Config)) {
+        $Arguments.Add([string]$ForwardArgument)
+    }
+
+    return @($Arguments)
+}
+
+function New-ProfileCommandFileContent {
+    param(
+        [System.Collections.IDictionary]$Config,
+        [string]$ProfileName
+    )
+
+    $LauncherPath = Join-Path $Ps1Root "Start_LCPP.ps1"
+    $ArgumentLines = @(
+        foreach ($Argument in @(Get-LaunchConfigWrapperArguments -Config $Config)) {
+            "    {0} ^" -f (ConvertTo-CmdArgument -Value $Argument)
+        }
+    )
+    $ArgumentLines += "    %*"
+
+    $Lines = New-Object System.Collections.Generic.List[string]
+    $Lines.Add("@echo off")
+    $Lines.Add("setlocal EnableExtensions")
+    $Lines.Add("")
+    $Lines.Add("chcp 65001 >nul 2>nul")
+    $Lines.Add("")
+    $Lines.Add("rem Exported launcher profile")
+    $Lines.Add(("set ""LAUNCHER_PS1={0}""" -f $LauncherPath))
+    $Lines.Add("set ""POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe""")
+    $Lines.Add("")
+    $Lines.Add("if not exist ""%LAUNCHER_PS1%"" (")
+    $Lines.Add("    echo Cannot find launcher script: ""%LAUNCHER_PS1%""")
+    $Lines.Add("    exit /b 1")
+    $Lines.Add(")")
+    $Lines.Add("")
+    $Lines.Add("if not exist ""%POWERSHELL_EXE%"" (")
+    $Lines.Add("    set ""POWERSHELL_EXE=powershell.exe""")
+    $Lines.Add(")")
+    $Lines.Add("")
+    $Lines.Add("set ""LCPP_LAUNCH_SOURCE=%~f0""")
+    $Lines.Add("""%POWERSHELL_EXE%"" -NoLogo -NoProfile -ExecutionPolicy Bypass -File ""%LAUNCHER_PS1%"" ^")
+    $Lines.Add("    -ReturnNonZeroOnError ^")
+    $Lines.Add("    -WrapperControlsPause ^")
+    foreach ($ArgumentLine in $ArgumentLines) {
+        $Lines.Add($ArgumentLine)
+    }
+    $Lines.Add("set ""EXIT_CODE=%ERRORLEVEL%""")
+    $Lines.Add("")
+    $Lines.Add("if not ""%EXIT_CODE%""==""0"" (")
+    $Lines.Add("    echo.")
+    $Lines.Add("    echo Start failed with exit code %EXIT_CODE%.")
+    $Lines.Add("    echo.")
+    $Lines.Add("    if /I not ""%LCPP_NO_PAUSE_ON_ERROR%""==""1"" pause")
+    $Lines.Add(")")
+    $Lines.Add("")
+    $Lines.Add("exit /b %EXIT_CODE%")
+
+    return ($Lines -join "`r`n") + "`r`n"
+}
+
+function Export-SavedLaunchProfileCommandFile {
+    param(
+        $Profile,
+        [string]$IndexPath
+    )
+
+    $ModelEntry = Get-ModelEntryForSavedLaunchProfile -Profile $Profile -IndexPath $IndexPath
+    if (-not $ModelEntry) {
+        throw (Format-BilingualText -ChineseText "這個設定檔找不到有效模型路徑，無法輸出一鍵啟動檔。" -EnglishText "This profile does not point to a valid model path, so it cannot be exported.")
+    }
+
+    $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments @()
+    $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
+    Apply-SavedLaunchProfileToConfig -Config $Config -Profile $Profile -IndexPath $IndexPath
+
+    $ExportRoot = Join-Path $ScriptRoot "exports\profiles"
+    if (-not (Test-Path -LiteralPath $ExportRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $ExportRoot -Force | Out-Null
+    }
+
+    $SafeName = ConvertTo-SafeCommandFileName -Value ([string]$Profile.name)
+    $OutputPath = Join-Path $ExportRoot ("start_{0}.cmd" -f $SafeName)
+    $Content = New-ProfileCommandFileContent -Config $Config -ProfileName ([string]$Profile.name)
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($OutputPath, $Content, $Utf8NoBom)
+
+    return [pscustomobject]@{
+        Path       = $OutputPath
+        Config     = $Config
+        ModelEntry = $ModelEntry
+    }
+}
+
+function Show-SavedLaunchProfileCommandExport {
+    param(
+        [string]$IndexPath
+    )
+
+    while ($true) {
+        $Profiles = @(Get-SavedLaunchProfiles)
+        if ($Profiles.Count -eq 0) {
+            Show-MenuHeader -Title (Format-BilingualText -ChineseText "輸出設定檔" -EnglishText "Export Profile") -Subtitle (Format-BilingualText -ChineseText "目前沒有已儲存設定檔可輸出。" -EnglishText "There are no saved profiles to export.")
+            Wait-MenuContinue
+            return
+        }
+
+        $Items = @(
+            foreach ($Profile in $Profiles) {
+                $ModelEntry = Get-ModelEntryForSavedLaunchProfile -Profile $Profile -IndexPath $IndexPath
+                $ModelName = if ($ModelEntry) { [string]$ModelEntry.name } elseif ($Profile.model_name) { [string]$Profile.model_name } else { [System.IO.Path]::GetFileNameWithoutExtension([string]$Profile.model_path) }
+                [pscustomobject]@{
+                    Name        = Format-BilingualText -ChineseText ("輸出：{0}" -f [string]$Profile.name) -EnglishText ("Export: {0}" -f [string]$Profile.name)
+                    Description = Format-BilingualText -ChineseText ("{0} | {1}" -f $ModelName, (Format-SavedLaunchProfileSummary -Profile $Profile -Language "Chinese")) -EnglishText ("{0} | {1}" -f $ModelName, (Format-SavedLaunchProfileSummary -Profile $Profile -Language "English"))
+                    Value       = [pscustomobject]@{ Action = "Export"; Profile = $Profile }
+                }
+            }
+        )
+        $Items += [pscustomobject]@{ Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"; Description = Format-BilingualText -ChineseText "回到維護選單。" -EnglishText "Return to Maintenance."; Value = [pscustomobject]@{ Action = "Back" } }
+
+        $Selection = Show-ListMenu -Title (Format-BilingualText -ChineseText "輸出設定檔" -EnglishText "Export Profile") -Subtitle (Format-BilingualText -ChineseText "選擇一個已儲存設定檔，輸出成可雙擊的一鍵啟動 .cmd。" -EnglishText "Choose a saved profile to export as a double-click one-shot .cmd launcher.") -Items $Items
+        if (-not $Selection -or $Selection.Action -eq "Back") {
+            return
+        }
+
+        try {
+            $Export = Export-SavedLaunchProfileCommandFile -Profile $Selection.Profile -IndexPath $IndexPath
+            Show-MenuHeader -Title (Format-BilingualText -ChineseText "輸出設定檔" -EnglishText "Export Profile") -Subtitle (Format-BilingualText -ChineseText "已產生一鍵啟動檔。" -EnglishText "One-shot launcher file created.")
+            Write-BilingualField -ChineseLabel "輸出檔案" -EnglishLabel "Output" -ChineseValue ([string]$Export.Path) -EnglishValue ([string]$Export.Path) -ForegroundColor Green
+            Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue ([string]$Export.Config.ModelPath) -EnglishValue ([string]$Export.Config.ModelPath)
+            Write-BilingualField -ChineseLabel "啟動模式" -EnglishLabel "Launch" -ChineseValue ([string]$Export.Config.LaunchMode) -EnglishValue ([string]$Export.Config.LaunchMode)
+            Wait-MenuContinue
+        }
+        catch {
+            Show-MenuHeader -Title (Format-BilingualText -ChineseText "輸出設定檔" -EnglishText "Export Profile") -Subtitle (Format-BilingualText -ChineseText "輸出失敗。" -EnglishText "Export failed.")
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Wait-MenuContinue
+        }
+    }
+}
+
+function Save-ConfiguredModelScanPathsToScript {
+    param(
+        [string[]]$Paths
+    )
+
+    $NormalizedPaths = New-Object System.Collections.Generic.List[string]
+    $SeenPaths = @{}
+    foreach ($Path in @($Paths)) {
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            continue
+        }
+
+        $TrimmedPath = ([string]$Path).Trim()
+        $PathKey = $TrimmedPath.ToLowerInvariant()
+        if ($SeenPaths.ContainsKey($PathKey)) {
+            continue
+        }
+
+        $SeenPaths[$PathKey] = $true
+        [void]$NormalizedPaths.Add($TrimmedPath)
+    }
+
+    $QuotedPaths = @($NormalizedPaths | ForEach-Object { ConvertTo-PowerShellSingleQuotedString -Value $_ })
+    $ScanPathsLine = if ($QuotedPaths.Count -gt 0) {
+        '$ConfiguredModelScanPaths = @({0})' -f ($QuotedPaths -join ", ")
+    }
+    else {
+        '$ConfiguredModelScanPaths = @()'
+    }
+    $LegacyLine = '$ConfiguredModelScanPath = ""'
+
+    $ScriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
+        $ScriptPath = Join-Path $ScriptRoot "PS1\Start_LCPP.ps1"
+    }
+
+    $Content = Get-Content -LiteralPath $ScriptPath -Raw
+    $Options = [System.Text.RegularExpressions.RegexOptions]::Multiline
+    $Content = [System.Text.RegularExpressions.Regex]::Replace($Content, '^\$ConfiguredModelScanPaths\s*=.*$', [System.Text.RegularExpressions.MatchEvaluator]{ param($Match) $ScanPathsLine }, $Options)
+    $Content = [System.Text.RegularExpressions.Regex]::Replace($Content, '^\$ConfiguredModelScanPath\s*=.*$', [System.Text.RegularExpressions.MatchEvaluator]{ param($Match) $LegacyLine }, $Options)
+    Set-Content -LiteralPath $ScriptPath -Value $Content -Encoding UTF8
+
+    $script:ConfiguredModelScanPaths = @($NormalizedPaths)
+    $script:ConfiguredModelScanPath = ""
+
+    return @($NormalizedPaths)
+}
+
+function Format-ModelScanPathDescription {
+    param(
+        [string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $ModelCount = @(
+            Get-ChildItem -LiteralPath $Path -Filter "*.gguf" -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) }
+        ).Count
+        return Format-BilingualText -ChineseText ("存在，找到 {0} 個模型檔。" -f $ModelCount) -EnglishText ("Exists, {0} model file(s) found." -f $ModelCount)
+    }
+
+    return Format-BilingualText -ChineseText "路徑不存在；會保留設定，但刷新索引時會略過。" -EnglishText "Path does not exist; it is saved but skipped while refreshing the index."
+}
+
+function Show-ModelScanPathMaintenance {
+    param(
+        [string]$IndexPath
+    )
+
+    while ($true) {
+        $CurrentPaths = @(Get-ConfiguredModelScanPaths)
+        $Summary = Format-BilingualText -ChineseText ("目前共有 {0} 個自訂掃描路徑。" -f $CurrentPaths.Count) -EnglishText ("{0} custom scan path(s) configured." -f $CurrentPaths.Count)
+
+        $Options = @(
+            [pscustomobject]@{ Name = Format-BilingualText -ChineseText "新增路徑" -EnglishText "Add Path"; Description = Format-BilingualText -ChineseText "新增一個模型根資料夾，會遞迴掃描其中的 GGUF。" -EnglishText "Add a model root folder; GGUF files below it are scanned recursively."; Value = "Add" },
+            [pscustomobject]@{ Name = Format-BilingualText -ChineseText "刪除路徑" -EnglishText "Remove Path"; Description = Format-BilingualText -ChineseText "從掃描清單移除一個資料夾，不會刪除磁碟上的模型。" -EnglishText "Remove a folder from the scan list without deleting files on disk."; Value = "Remove" },
+            [pscustomobject]@{ Name = Format-BilingualText -ChineseText "刷新模型索引" -EnglishText "Refresh Model Index"; Description = Format-BilingualText -ChineseText "使用目前掃描路徑立即重建模型清單。" -EnglishText "Rebuild the model list from the current scan paths now."; Value = "Refresh" },
+            [pscustomobject]@{ Name = Format-BilingualText -ChineseText "清空路徑" -EnglishText "Clear Paths"; Description = Format-BilingualText -ChineseText "清空自訂掃描路徑，之後只使用啟動器推斷的預設路徑。" -EnglishText "Clear custom scan paths and fall back to launcher-inferred defaults."; Value = "Clear" },
+            [pscustomobject]@{ Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"; Description = Format-BilingualText -ChineseText "回到維護選單。" -EnglishText "Return to Maintenance."; Value = "Back" }
+        )
+
+        $Action = Show-ListMenu -Title (Format-BilingualText -ChineseText "模型掃描路徑" -EnglishText "Model Scan Paths") -Subtitle $Summary -Items $Options
+
+        switch ($Action) {
+            "Add" {
+                $NewPath = Read-Host (Format-BilingualText -ChineseText "輸入要新增的模型掃描資料夾" -EnglishText "Path to add")
+                if ([string]::IsNullOrWhiteSpace($NewPath)) {
+                    continue
+                }
+
+                $UpdatedPaths = @($CurrentPaths + ([string]$NewPath).Trim())
+                [void](Save-ConfiguredModelScanPathsToScript -Paths $UpdatedPaths)
+                [void](Refresh-ModelIndexFromDefaultScanPath -Path $IndexPath -PrimaryModelPath $ModelPath -Quiet)
+                Write-Host (Format-BilingualText -ChineseText "已新增並刷新模型索引。" -EnglishText "Path added and model index refreshed.") -ForegroundColor Green
+                Start-Sleep -Seconds 1
+            }
+            "Remove" {
+                if ($CurrentPaths.Count -eq 0) {
+                    Write-Host (Format-BilingualText -ChineseText "目前沒有可刪除的掃描路徑。" -EnglishText "There are no scan paths to remove.") -ForegroundColor Yellow
+                    Start-Sleep -Seconds 1
+                    continue
+                }
+
+                $RemoveItems = @(
+                    foreach ($Path in $CurrentPaths) {
+                        [pscustomobject]@{
+                            Name        = [string]$Path
+                            Description = Format-ModelScanPathDescription -Path $Path
+                            Value       = [pscustomobject]@{ Action = "Remove"; Path = [string]$Path }
+                        }
+                    }
+                )
+                $RemoveItems += [pscustomobject]@{ Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"; Description = Format-BilingualText -ChineseText "不刪除路徑。" -EnglishText "Do not remove a path."; Value = [pscustomobject]@{ Action = "Back" } }
+                $Selection = Show-ListMenu -Title (Format-BilingualText -ChineseText "刪除掃描路徑" -EnglishText "Remove Scan Path") -Subtitle (Format-BilingualText -ChineseText "只會移除設定，不會刪除模型檔案。" -EnglishText "Only the setting is removed; model files are not deleted.") -Items $RemoveItems
+                if (-not $Selection -or $Selection.Action -eq "Back") {
+                    continue
+                }
+
+                $UpdatedPaths = @($CurrentPaths | Where-Object { -not [string]::Equals([string]$_, [string]$Selection.Path, [System.StringComparison]::OrdinalIgnoreCase) })
+                [void](Save-ConfiguredModelScanPathsToScript -Paths $UpdatedPaths)
+                [void](Refresh-ModelIndexFromDefaultScanPath -Path $IndexPath -PrimaryModelPath $ModelPath -Quiet)
+                Write-Host (Format-BilingualText -ChineseText "已刪除路徑並刷新模型索引。" -EnglishText "Path removed and model index refreshed.") -ForegroundColor Green
+                Start-Sleep -Seconds 1
+            }
+            "Refresh" {
+                $Refreshed = Refresh-ModelIndexFromDefaultScanPath -Path $IndexPath -PrimaryModelPath $ModelPath -Quiet
+                if ($Refreshed) {
+                    Write-Host (Format-BilingualText -ChineseText "模型索引已刷新。" -EnglishText "Model index refreshed.") -ForegroundColor Green
+                }
+                else {
+                    Write-Host (Format-BilingualText -ChineseText "找不到可用的模型掃描資料夾，索引未更新。" -EnglishText "No usable model scan folder was found, so the index was not changed.") -ForegroundColor Yellow
+                }
+                Start-Sleep -Seconds 1
+            }
+            "Clear" {
+                $Confirm = Read-Host (Format-BilingualText -ChineseText "確定清空所有自訂掃描路徑？輸入 YES 確認" -EnglishText "Clear all custom scan paths? Type YES to confirm")
+                if ($Confirm -ne "YES") {
+                    Write-Host (Format-BilingualText -ChineseText "已取消清空。" -EnglishText "Clear canceled.") -ForegroundColor Yellow
+                    Start-Sleep -Seconds 1
+                    continue
+                }
+
+                [void](Save-ConfiguredModelScanPathsToScript -Paths @())
+                [void](Refresh-ModelIndexFromDefaultScanPath -Path $IndexPath -PrimaryModelPath $ModelPath -Quiet)
+                Write-Host (Format-BilingualText -ChineseText "已清空自訂掃描路徑。" -EnglishText "Custom scan paths cleared.") -ForegroundColor Green
+                Start-Sleep -Seconds 1
+            }
+            default {
+                return
+            }
+        }
+    }
+}
+
+function Show-MaintenanceFlow {
+    param(
+        [string]$IndexPath
+    )
+
+    while ($true) {
+        $Action = Show-MaintenanceMenu
+        switch ($Action) {
+            "Profiles" { Show-SavedLaunchProfileMaintenance -IndexPath $IndexPath }
+            "ExportProfile" { Show-SavedLaunchProfileCommandExport -IndexPath $IndexPath }
+            "ScanPaths" { Show-ModelScanPathMaintenance -IndexPath $IndexPath }
+            default { return }
+        }
+    }
 }
 
 function New-LaunchConfig {
@@ -5911,6 +7146,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "OpenPath"; Label = (Format-BilingualText -ChineseText "開啟路徑" -EnglishText "Open Path"); Type = "text"; Hint = (Format-BilingualText -ChineseText "Web UI 通常使用 /" -EnglishText "For Web UI use /") },
         [pscustomobject]@{ Key = "GpuLayers"; Label = "GPU Layers"; Type = "text"; Hint = (Format-BilingualText -ChineseText "輸入 auto、all 或數字" -EnglishText "auto, all, or number") },
         [pscustomobject]@{ Key = "RepeatingLayers"; Label = (Format-BilingualText -ChineseText "重複層數" -EnglishText "Repeating Layers"); Type = "text"; Hint = (Format-BilingualText -ChineseText "輸入 auto、all 或重複層數" -EnglishText "auto, all, or number of repeating layers") },
+        [pscustomobject]@{ Key = "LayerDistribution"; Label = (Format-BilingualText -ChineseText "模型層數" -EnglishText "Layers"); Type = "info" },
         [pscustomobject]@{ Key = "ExtremeMode"; Label = (Format-BilingualText -ChineseText "極限顯存" -EnglishText "Extreme VRAM"); Type = "bool" },
         [pscustomobject]@{ Key = "AutoTune"; Label = (Format-BilingualText -ChineseText "自動調校" -EnglishText "Auto Tune"); Type = "bool" },
         [pscustomobject]@{ Key = "Threads"; Label = "Threads"; Type = "number"; Hint = (Format-BilingualText -ChineseText "輸入 -1 或正整數" -EnglishText "-1 or positive integer") },
@@ -6049,6 +7285,9 @@ function Get-LaunchConfigValueText {
             }
 
             return [string]$Config.RepeatingLayers
+        }
+        "LayerDistribution" {
+            return Format-ModelLayerDistributionValue -ModelPath ([string]$Config.ModelPath) -RequestedGpuLayers ([string]$Config.GpuLayers) -GpuOffloadInfo $null -Language "Chinese"
         }
         "Threads" {
             if ([string]$Config.Threads -eq "-1") {
@@ -6199,6 +7438,12 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "用另一種方式思考 GPU 卸載深度；wrapper 會自動把 repeating layers 換算成 llama.cpp 的 GPU layer 數。" -EnglishText "Alternative way to think about offload depth. The wrapper converts repeating layers into llama.cpp GPU layer count automatically."
                 Recommendation = Format-BilingualText -ChineseText "不確定時先用 `auto`。要微調 VRAM 使用量時，建議逐步增加，不要一開始就直接跳到 `all`。" -EnglishText "Use auto if you are unsure. When fine-tuning VRAM usage, raise this gradually instead of jumping straight to all."
+            }
+        }
+        "LayerDistribution" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "顯示目前模型的總層數，以及依照 GPU Layers 設定預估會放在 GPU 與 CPU 的層數。" -EnglishText "Shows total model layers and the estimated GPU/CPU layer split from the current GPU Layers value."
+                Recommendation = Format-BilingualText -ChineseText "`auto` 啟動前只能顯示自動分配；服務真正載入後，狀態頁會改用 llama.cpp log 顯示實際 GPU/CPU 層數。" -EnglishText "Before launch, auto can only be shown as automatic allocation. After the server loads, the status page uses llama.cpp logs for the real GPU/CPU split."
             }
         }
         "ExtremeMode" {
@@ -6415,6 +7660,9 @@ function Edit-LaunchConfigItem {
     )
 
     switch ($Item.Type) {
+        "info" {
+            return $null
+        }
         "model" {
             $SelectedModel = Select-ModelEntry -IndexPath $IndexPath -CurrentModelPath $Config.ModelPath
             if ($SelectedModel) {
@@ -7135,12 +8383,33 @@ function Invoke-InteractiveLauncher {
 
         switch ($MainAction) {
             "QuickStart" {
+                $QuickStartEntry = Show-QuickStartEntryMenu -IndexPath $IndexPath
+                if (-not $QuickStartEntry -or $QuickStartEntry.Action -eq "Back") {
+                    continue
+                }
+
+                $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $LlamaArgs
+
+                if ($QuickStartEntry.Action -eq "UseProfile" -and $QuickStartEntry.Profile) {
+                    $ModelEntry = Get-ModelEntryForSavedLaunchProfile -Profile $QuickStartEntry.Profile -IndexPath $IndexPath
+                    if (-not $ModelEntry) {
+                        Write-Host ""
+                        Write-Host (Format-BilingualText -ChineseText "這個設定檔找不到有效模型路徑，無法啟動。" -EnglishText "This profile does not point to a valid model path, so it cannot be launched.") -ForegroundColor Red
+                        Start-Sleep -Seconds 2
+                        continue
+                    }
+
+                    $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
+                    Apply-SavedLaunchProfileToConfig -Config $Config -Profile $QuickStartEntry.Profile -IndexPath $IndexPath
+                    Apply-LaunchSelection -Config $Config
+                    return $true
+                }
+
                 $ModelEntry = Select-ModelEntry -IndexPath $IndexPath -CurrentModelPath $ModelPath
                 if (-not $ModelEntry) {
                     continue
                 }
 
-                $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $LlamaArgs
                 $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
                 $SavedProfileSelection = Show-QuickStartSavedProfileMenu -ModelEntry $ModelEntry
                 if ($SavedProfileSelection.Action -eq "Back") {
@@ -7189,6 +8458,9 @@ function Invoke-InteractiveLauncher {
             }
             "Status" {
                 Show-LiveServerStatusView
+            }
+            "Maintenance" {
+                Show-MaintenanceFlow -IndexPath $IndexPath
             }
             "Stop" {
                 Show-MenuHeader -Title (Format-BilingualText -ChineseText "停止目前服務" -EnglishText "Stop Running Server") -Subtitle (Format-BilingualText -ChineseText "如果目前有被追蹤的 llama.cpp 服務，現在會將它停止。" -EnglishText "Stopping the tracked llama.cpp server if one exists.")
@@ -7879,6 +9151,29 @@ function Format-TrackedServerBufferValue {
 
     if ($null -ne $GpuOffloadInfo.CpuMappedModelBufferMiB) {
         $Parts.Add(("CPU-mapped {0:N2} MiB" -f [double]$GpuOffloadInfo.CpuMappedModelBufferMiB))
+    }
+
+    if ($GpuOffloadInfo.GpuProcessAdapters -and @($GpuOffloadInfo.GpuProcessAdapters).Count -gt 0) {
+        $AdapterParts = @(
+            foreach ($Adapter in @($GpuOffloadInfo.GpuProcessAdapters)) {
+                if ($null -ne $Adapter.DedicatedMiB -and [double]$Adapter.DedicatedMiB -gt 0) {
+                    "{0} {1:N2} MiB" -f [string]$Adapter.Label, [double]$Adapter.DedicatedMiB
+                }
+                elseif ($null -ne $Adapter.LocalMiB -and [double]$Adapter.LocalMiB -gt 0) {
+                    "{0} {1:N2} MiB local" -f [string]$Adapter.Label, [double]$Adapter.LocalMiB
+                }
+            }
+        )
+
+        if ($AdapterParts.Count -gt 0) {
+            $Parts.Add(("GPU process VRAM {0}" -f ($AdapterParts -join " | ")))
+        }
+    }
+    elseif ($null -ne $GpuOffloadInfo.GpuProcessDedicatedMiB) {
+        $Parts.Add(("GPU process VRAM {0:N2} MiB" -f [double]$GpuOffloadInfo.GpuProcessDedicatedMiB))
+    }
+    elseif ($null -ne $GpuOffloadInfo.GpuProcessLocalMiB) {
+        $Parts.Add(("GPU process local memory {0:N2} MiB" -f [double]$GpuOffloadInfo.GpuProcessLocalMiB))
     }
 
     if ($Parts.Count -eq 0) {
@@ -8883,6 +10178,9 @@ function Show-ServerStatus {
             }
             $GpuValue = Format-TrackedServerGpuValue -TrackedSettings $TrackedSettings -GpuOffloadInfo $TrackedGpuOffloadInfo
             Write-BilingualField -ChineseLabel "GPU" -EnglishLabel "GPU" -ChineseValue $GpuValue -EnglishValue $GpuValue
+            $LayerDistributionZh = Format-ModelLayerDistributionValue -ModelPath $TrackedModelPath -RequestedGpuLayers $TrackedSettings.GpuLayers -GpuOffloadInfo $TrackedGpuOffloadInfo -Language "Chinese"
+            $LayerDistributionEn = Format-ModelLayerDistributionValue -ModelPath $TrackedModelPath -RequestedGpuLayers $TrackedSettings.GpuLayers -GpuOffloadInfo $TrackedGpuOffloadInfo -Language "English"
+            Write-BilingualField -ChineseLabel "模型層數" -EnglishLabel "Layers" -ChineseValue $LayerDistributionZh -EnglishValue $LayerDistributionEn
             if ($TrackedGpuOffloadInfo) {
                 $BufferSummary = Format-TrackedServerBufferValue -GpuOffloadInfo $TrackedGpuOffloadInfo
                 if (-not [string]::IsNullOrWhiteSpace($BufferSummary)) {
@@ -8996,6 +10294,13 @@ function Show-ServerStatus {
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ExtraArgs)) {
                 Write-BilingualField -ChineseLabel "額外參數" -EnglishLabel "Extra" -ChineseValue $TrackedSettings.ExtraArgs -EnglishValue $TrackedSettings.ExtraArgs
             }
+        }
+        else {
+            $GpuValue = Format-TrackedServerGpuValue -TrackedSettings $null -GpuOffloadInfo $TrackedGpuOffloadInfo
+            Write-BilingualField -ChineseLabel "GPU" -EnglishLabel "GPU" -ChineseValue $GpuValue -EnglishValue $GpuValue
+            $LayerDistributionZh = Format-ModelLayerDistributionValue -ModelPath $TrackedModelPath -RequestedGpuLayers $TrackedGpuOffloadInfo.RequestedGpuLayers -GpuOffloadInfo $TrackedGpuOffloadInfo -Language "Chinese"
+            $LayerDistributionEn = Format-ModelLayerDistributionValue -ModelPath $TrackedModelPath -RequestedGpuLayers $TrackedGpuOffloadInfo.RequestedGpuLayers -GpuOffloadInfo $TrackedGpuOffloadInfo -Language "English"
+            Write-BilingualField -ChineseLabel "模型層數" -EnglishLabel "Layers" -ChineseValue $LayerDistributionZh -EnglishValue $LayerDistributionEn
         }
         if ($TrackedRuntimeProperties) {
             Write-BilingualField -ChineseLabel "Web UI" -EnglishLabel "Web UI" -ChineseValue $(if ($TrackedRuntimeProperties.webui) { "開啟（內建瀏覽器介面）" } else { "關閉（內建瀏覽器介面）" }) -EnglishValue $(if ($TrackedRuntimeProperties.webui) { "on (built-in browser UI)" } else { "off (built-in browser UI)" })
@@ -9135,6 +10440,12 @@ try {
     else {
         Write-BilingualField -ChineseLabel "GPU" -EnglishLabel "GPU" -ChineseValue ([string]$AutoLaunchTuning.EffectiveGpuLayers) -EnglishValue ([string]$AutoLaunchTuning.EffectiveGpuLayers)
     }
+    $LaunchLayerRequestedGpuLayers = if ($AutoLaunchTuning.UseManagedGpuLayers) { [string]$GpuLayers } else { [string]$AutoLaunchTuning.EffectiveGpuLayers }
+    Write-BilingualField `
+        -ChineseLabel "模型層數" `
+        -EnglishLabel "Layers" `
+        -ChineseValue (Format-ModelLayerDistributionValue -ModelPath $ModelPath -RequestedGpuLayers $LaunchLayerRequestedGpuLayers -GpuOffloadInfo $null -Language "Chinese") `
+        -EnglishValue (Format-ModelLayerDistributionValue -ModelPath $ModelPath -RequestedGpuLayers $LaunchLayerRequestedGpuLayers -GpuOffloadInfo $null -Language "English")
     Write-BilingualField -ChineseLabel "執行緒" -EnglishLabel "Threads" -ChineseValue ([string]$Threads) -EnglishValue ([string]$Threads)
     Write-BilingualField -ChineseLabel "批次執行緒" -EnglishLabel "Batch" -ChineseValue ([string]$ThreadsBatch) -EnglishValue ([string]$ThreadsBatch)
     if ($AutoLaunchTuning.AcceleratorInfo) {

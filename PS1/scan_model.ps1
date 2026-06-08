@@ -3,14 +3,17 @@
 Scans local GGUF files and rebuilds model-index.json.
 
 .DESCRIPTION
-Looks for *.gguf files in the launcher root folder and writes a
-json\model-index.json file compatible with Start_LCPP.ps1. Model paths are
-written as absolute paths so the generated JSON can be copied elsewhere.
-The first model in alphabetical order becomes the default model.
+Looks for *.gguf files in one or more scan folders and writes a
+json\model-index.json file compatible with Start_LCPP.ps1. When -ScanPath is
+omitted, the launcher root folder is scanned. Model paths are written as
+absolute paths so the generated JSON can be copied elsewhere. The first model
+in alphabetical order becomes the default model.
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [string[]]$ScanPath = @()
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -369,6 +372,51 @@ if (-not (Test-Path -LiteralPath $JsonRoot -PathType Container)) {
     [void](New-Item -ItemType Directory -Path $JsonRoot -Force)
 }
 
+$ScanRoots = New-Object System.Collections.Generic.List[string]
+$SeenScanRoots = @{}
+$AddScanRoot = {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    $ResolvedPath = if ([System.IO.Path]::IsPathRooted($Path)) {
+        [System.IO.Path]::GetFullPath($Path)
+    }
+    else {
+        [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $Path))
+    }
+
+    if (-not (Test-Path -LiteralPath $ResolvedPath -PathType Container)) {
+        return
+    }
+
+    $RootKey = $ResolvedPath.ToLowerInvariant()
+    if ($SeenScanRoots.ContainsKey($RootKey)) {
+        return
+    }
+
+    $SeenScanRoots[$RootKey] = $true
+    [void]$ScanRoots.Add($ResolvedPath)
+}
+
+if ($ScanPath.Count -gt 0) {
+    foreach ($RootPath in @($ScanPath)) {
+        & $AddScanRoot $RootPath
+    }
+}
+else {
+    & $AddScanRoot $ProjectRoot
+}
+
+if ($ScanRoots.Count -eq 0) {
+    Write-Warning "No valid scan folders were found. model-index.json was not changed."
+    exit 1
+}
+
 $IndexPath = Join-Path -Path $JsonRoot -ChildPath "model-index.json"
 $ExistingByPath = @{}
 if (Test-Path -LiteralPath $IndexPath -PathType Leaf) {
@@ -384,14 +432,26 @@ if (Test-Path -LiteralPath $IndexPath -PathType Leaf) {
     }
 }
 
+$SeenModelFiles = @{}
 $ModelFiles = @(
-    Get-ChildItem -LiteralPath $ProjectRoot -Filter "*.gguf" -File |
-        Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) } |
-        Sort-Object Name
-)
+    foreach ($RootPath in $ScanRoots) {
+        Get-ChildItem -LiteralPath $RootPath -Filter "*.gguf" -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { -not (Test-MmprojFilePath -Path $_.FullName) } |
+            Where-Object {
+                $ModelFileKey = $_.FullName.ToLowerInvariant()
+                if ($SeenModelFiles.ContainsKey($ModelFileKey)) {
+                    $false
+                }
+                else {
+                    $SeenModelFiles[$ModelFileKey] = $true
+                    $true
+                }
+            }
+    }
+) | Sort-Object DirectoryName, Name
 
 if ($ModelFiles.Count -eq 0) {
-    Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f $ProjectRoot)
+    Write-Warning ("No GGUF files were found in {0}. model-index.json was not changed." -f ($ScanRoots -join ", "))
     exit 1
 }
 
