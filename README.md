@@ -1203,23 +1203,27 @@ This preset currently pins:
 同樣的 `Q6_K_P` 在這台雙 `RTX 5070 Ti 16 GB` 上，`131072` 和 `163840` 都會在 GPU1 OOM，所以目前穩定值先停在 `98304`。  
 On this dual `RTX 5070 Ti 16 GB` machine, the same `Q6_K_P` build runs out of memory on GPU1 at both `131072` and `163840`, so the stable value is currently kept at `98304`.
 
-#### Qwen3.6 MTP 啟動 / Qwen3.6 MTP Startup
+#### MTP 啟動 / MTP Startup
 
-現在 `Start_LCPP.ps1` 會自動辨識檔名、`id` 或 `path` 含有 `Qwen3.6` 與 `MTP` 的模型，並套用一組對齊 Unsloth `Qwen3.6 llama.cpp MTP` 教學的預設參數。  
-`Start_LCPP.ps1` now auto-detects models whose filename, `id`, or `path` contains both `Qwen3.6` and `MTP`, then applies a default parameter set aligned with the Unsloth `Qwen3.6 llama.cpp MTP` guide.
+現在 `Start_LCPP.ps1` 會自動辨識支援 MTP 的 GGUF。除了原本檔名、`id` 或 `path` 含有 `Qwen3.6` 與 `MTP` 的模型，也支援新版 `llama.cpp` 的 Gemma 4 QAT/MTP 形式：主模型是 `qat.gguf`、旁邊另有 `mtp.gguf` drafter，或直接選到完整單檔 `mtp.gguf`。  
+`Start_LCPP.ps1` now auto-detects MTP-capable GGUFs. In addition to the existing `Qwen3.6` + `MTP` filename, `id`, or `path` detection, it supports the newer `llama.cpp` Gemma 4 QAT/MTP layout: a `qat.gguf` target with a neighboring `mtp.gguf` drafter, or a complete single-file `mtp.gguf`.
 
-如果你是走 `Tune And Launch`，現在也可以直接在矩陣裡切換 `MTP` 開或關，並設定 `SPEC_DRAFT_N_MAX`。預設值是 `2`。  
-If you launch through `Tune And Launch`, you can now toggle `MTP` directly inside the matrix and set `SPEC_DRAFT_N_MAX` there as well. The default value is `2`.
+如果你是走 `Tune And Launch`，可以直接在矩陣裡切換 `MTP` 開或關，並設定 `SPEC_DRAFT_N_MAX`。Gemma 4 MTP 會依 Unsloth 範例預設為 `4`，其他 MTP 模型預設為 `2`。  
+If you launch through `Tune And Launch`, you can toggle `MTP` directly inside the matrix and set `SPEC_DRAFT_N_MAX` there as well. Gemma 4 MTP defaults to `4` following the Unsloth example, while other MTP models default to `2`.
 
 同一個矩陣現在也加入了 `Reasoning` 與 `Think Level`。`Reasoning` 會對應 `llama.cpp` 的 `--reasoning auto|on|off`；`Think Level` 會對應 `--reasoning-budget`，目前內建的級別是 `Low (1024)`、`Medium (4096)`、`High (8192)`、`Max (-1)`。  
 The same matrix now also includes `Reasoning` and `Think Level`. `Reasoning` maps to `llama.cpp` `--reasoning auto|on|off`; `Think Level` maps to `--reasoning-budget`, with built-in levels `Low (1024)`, `Medium (4096)`, `High (8192)`, and `Max (-1)`.
 
-自動補上的重點是：  
-The launcher now auto-adds:
+所有支援 MTP 的模型都會自動補上：  
+For every supported MTP model, the launcher auto-adds:
 
 - `--spec-type draft-mtp`
-- `--spec-draft-n-max 2`
+- `--spec-draft-n-max 4` for Gemma 4 MTP, otherwise `2`
 - `--flash-attn on`
+
+Qwen3.6 MTP 另外保留原本的專屬預設：  
+Qwen3.6 MTP also keeps its previous model-specific defaults:
+
 - `--cache-type-k q8_0`
 - `--cache-type-v q8_0`
 - `--jinja`
@@ -1230,8 +1234,8 @@ The launcher now auto-adds:
 - `--presence-penalty 0`
 - `--repeat-penalty 1`
 
-這些預設只會套用在真正的 `MTP` GGUF 上；一般 `Qwen3.6` GGUF 不會被強行加上 `MTP` 參數，避免啟動失敗。你也仍然可以在命令列後面自己覆寫這些值。  
-These defaults only apply to real `MTP` GGUFs. Regular `Qwen3.6` GGUFs are left alone so the launcher does not force incompatible `MTP` flags. You can still override any of these values through trailing command-line arguments.
+這些預設只會套用在偵測為支援 MTP 的 GGUF 上；一般非 MTP GGUF 不會被強行加上 `MTP` 參數，避免啟動失敗。你也仍然可以在命令列後面自己覆寫這些值。  
+These defaults only apply to GGUFs detected as MTP-capable. Regular non-MTP GGUFs are left alone so the launcher does not force incompatible `MTP` flags. You can still override any of these values through trailing command-line arguments.
 
 這台機器另外補了兩個可直接雙擊的雙 GPU MTP preset：  
 This machine now also includes two double-click dual-GPU MTP presets:

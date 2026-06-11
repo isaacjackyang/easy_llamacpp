@@ -801,13 +801,16 @@ function Get-ServerArgs {
         $CombinedArgs += $Argument
     }
 
-    if (Test-Qwen36MtpDefaultsEnabled -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath -Arguments $CombinedArgs) {
+    if (Test-MtpDefaultsEnabled -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath -Arguments $CombinedArgs) {
+        $MtpDefaultSpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value "2"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value $MtpDefaultSpecDraftNMax
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-fa|--flash-attn)(?:=|$)') -Flag "--flash-attn" -Value "on"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctv|--cache-type-v)(?:=|$)') -Flag "--cache-type-v" -Value "q8_0"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
+        if (Test-IsQwen36MtpModel -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath) {
+            Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
+            Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctv|--cache-type-v)(?:=|$)') -Flag "--cache-type-v" -Value "q8_0"
+            Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
+        }
     }
 
     if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
@@ -2202,13 +2205,13 @@ function Sync-LaunchConfigMtpFields {
         [System.Collections.IDictionary]$Config
     )
 
-    $IsQwen36MtpModel = Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    $IsMtpCapableModel = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     if ($null -eq $Config.MtpEnabled) {
-        $Config.MtpEnabled = $IsQwen36MtpModel
+        $Config.MtpEnabled = $IsMtpCapableModel
     }
 
     if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) {
-        $Config.SpecDraftNMax = "2"
+        $Config.SpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     }
 }
 
@@ -4084,14 +4087,88 @@ function Test-IsQwen36MtpModel {
     return ($CombinedText -match '(?i)qwen3(?:[._]|)6' -and $CombinedText -match '(?i)(?:^|[^a-z0-9])mtp(?:[^a-z0-9]|$)')
 }
 
-function Test-Qwen36MtpDefaultsEnabled {
+function Get-ModelIdentityText {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    $CandidateParts = New-Object System.Collections.Generic.List[string]
+
+    if ($ModelEntry) {
+        foreach ($PropertyName in @("id", "name", "path", "notes")) {
+            if ($ModelEntry.PSObject.Properties[$PropertyName] -and -not [string]::IsNullOrWhiteSpace([string]$ModelEntry.$PropertyName)) {
+                $CandidateParts.Add([string]$ModelEntry.$PropertyName)
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        $CandidateParts.Add($ResolvedModelPath)
+    }
+
+    if ($CandidateParts.Count -eq 0) {
+        return ""
+    }
+
+    return ($CandidateParts.ToArray() -join "`n")
+}
+
+function Test-IsGemma4QatMtpModel {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    $CombinedText = Get-ModelIdentityText -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+    if ([string]::IsNullOrWhiteSpace($CombinedText)) {
+        return $false
+    }
+
+    $IsGemma4 = $CombinedText -match '(?i)gemma[-_. ]?4'
+    $HasMtpOrQatSignal = $CombinedText -match '(?i)(?:^|[^a-z0-9])(?:mtp|qat)(?:[^a-z0-9]|$)'
+    return ($IsGemma4 -and $HasMtpOrQatSignal)
+}
+
+function Test-IsMtpCapableModel {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    if (Test-IsQwen36MtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath) {
+        return $true
+    }
+
+    if (Test-IsGemma4QatMtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath) {
+        return $true
+    }
+
+    $CombinedText = Get-ModelIdentityText -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+    return ($CombinedText -match '(?i)(?:^|[^a-z0-9])mtp(?:[^a-z0-9]|$)')
+}
+
+function Get-MtpDefaultSpecDraftNMax {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    if (Test-IsGemma4QatMtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath) {
+        return "4"
+    }
+
+    return "2"
+}
+
+function Test-MtpDefaultsEnabled {
     param(
         $ModelEntry,
         [string]$ResolvedModelPath,
         [AllowNull()][string[]]$Arguments
     )
 
-    if (-not (Test-IsQwen36MtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)) {
+    if (-not (Test-IsMtpCapableModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)) {
         return $false
     }
 
@@ -4111,6 +4188,20 @@ function Test-Qwen36MtpDefaultsEnabled {
     }
 
     return ($SpecTypes -contains "draft-mtp")
+}
+
+function Test-Qwen36MtpDefaultsEnabled {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath,
+        [AllowNull()][string[]]$Arguments
+    )
+
+    if (-not (Test-IsQwen36MtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)) {
+        return $false
+    }
+
+    return (Test-MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $Arguments)
 }
 
 function ConvertTo-LlamaScalarArgumentValue {
@@ -4343,7 +4434,7 @@ function Convert-ForwardArgsToMenuConfig {
         ReasoningMode   = "auto"
         ThinkLevel      = "Auto"
         MtpEnabled      = $null
-        SpecDraftNMax   = "2"
+        SpecDraftNMax   = ""
         Slots           = ""
         ExtraArgs       = ""
     }
@@ -4544,14 +4635,14 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add($ReasoningBudget)
     }
 
-    $ModelUsesQwen36MtpDefaults = Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    $ModelUsesMtpDefaults = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     if ([bool]$Config.MtpEnabled) {
         $Arguments.Add("--spec-type")
         $Arguments.Add("draft-mtp")
         $Arguments.Add("--spec-draft-n-max")
-        $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { "2" } else { [string]$Config.SpecDraftNMax }))
+        $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) } else { [string]$Config.SpecDraftNMax }))
     }
-    elseif ($ModelUsesQwen36MtpDefaults) {
+    elseif ($ModelUsesMtpDefaults) {
         $Arguments.Add("--spec-type")
         $Arguments.Add("none")
     }
@@ -7155,7 +7246,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "ReasoningMode"; Label = (Format-BilingualText -ChineseText "推理模式" -EnglishText "Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "ThinkLevel"; Label = (Format-BilingualText -ChineseText "思考等級" -EnglishText "Think Level"); Type = "choice"; Choices = (Get-ThinkLevelChoices) },
         [pscustomobject]@{ Key = "MtpEnabled"; Label = "MTP"; Type = "bool" },
-        [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數，Unsloth 預設為 2" -EnglishText "positive integer; Unsloth default is 2") },
+        [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數；Gemma 4 MTP 預設 4，其他 MTP 預設 2" -EnglishText "positive integer; Gemma 4 MTP defaults to 4, other MTP defaults to 2") },
         [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
         [pscustomobject]@{ Key = "Slots"; Label = "Slots"; Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空使用 1；多請求才調高" -EnglishText "blank uses 1; raise only for concurrent requests") },
         [pscustomobject]@{ Key = "Temperature"; Label = "Temp"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.3" -EnglishText "blank uses the default; example: 0.3") },
@@ -7205,8 +7296,8 @@ function Get-LaunchConfigDefaultText {
         "ThreadsBatch" { return "auto -> $LogicalThreads" }
         "ReasoningMode" { return "auto" }
         "ThinkLevel" { return "Auto (no explicit budget)" }
-        "MtpEnabled" { return $(if (Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for Qwen3.6 MTP GGUF" } else { "off" }) }
-        "SpecDraftNMax" { return "2" }
+        "MtpEnabled" { return $(if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for supported MTP GGUF" } else { "off" }) }
+        "SpecDraftNMax" { return Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
         "Slots" { return ("{0} active request slot" -f $FixedLlamaServerParallelSlots) }
         "Temperature" { return "0.3" }
@@ -7219,8 +7310,8 @@ function Get-LaunchConfigDefaultText {
         "TensorSplit" { return "auto" }
         "Fit" { return "llama.cpp default" }
         "FlashAttention2" {
-            if (Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) {
-                return "auto -> on for Qwen3.6 MTP GGUF"
+            if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) {
+                return "auto -> on for supported MTP GGUF"
             }
 
             return "auto"
@@ -7395,7 +7486,8 @@ function Get-LaunchConfigItemHelp {
         $Item
     )
 
-    $IsQwen36MtpModel = Test-IsQwen36MtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    $IsMtpCapableModel = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    $IsGemma4QatMtpModel = Test-IsGemma4QatMtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
 
     switch ([string]$Item.Key) {
         "Model" {
@@ -7491,13 +7583,13 @@ function Get-LaunchConfigItemHelp {
         "MtpEnabled" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "切換 speculative MTP 啟動。開啟後，launcher 會送出 `--spec-type draft-mtp` 與相關預設。" -EnglishText "Toggles speculative MTP startup. When enabled, the launcher emits --spec-type draft-mtp and related defaults."
-                Recommendation = if ($IsQwen36MtpModel) { (Format-BilingualText -ChineseText "如果是 Qwen3.6 MTP GGUF，建議保持開啟。只有在你要比較非 MTP 行為或做疑難排解時才關掉。" -EnglishText "For Qwen3.6 MTP GGUFs, leave this On. Turn it Off only if you want to force a plain non-MTP run for comparison or troubleshooting.") } else { (Format-BilingualText -ChineseText "除非你明確要使用 draft-mtp，且知道目前模型支援，否則保持關閉。" -EnglishText "Leave this Off unless you intentionally want draft-mtp and know the selected model supports it.") }
+                Recommendation = if ($IsMtpCapableModel) { (Format-BilingualText -ChineseText "如果這是 MTP GGUF，或 Gemma 4 QAT 主模型旁邊有 llama.cpp 可自動發現的 MTP drafter，建議保持開啟。只有在比較非 MTP 行為或疑難排解時才關掉。" -EnglishText "For an MTP GGUF, or a Gemma 4 QAT target with an auto-discoverable MTP drafter beside it, leave this On. Turn it Off only for non-MTP comparison or troubleshooting.") } else { (Format-BilingualText -ChineseText "除非你明確要使用 draft-mtp，且知道目前模型支援，否則保持關閉。" -EnglishText "Leave this Off unless you intentionally want draft-mtp and know the selected model supports it.") }
             }
         }
         "SpecDraftNMax" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定 llama.cpp 的 `--spec-draft-n-max`，也就是每一步 speculative drafting 最多要草擬多少 token。" -EnglishText "Sets llama.cpp --spec-draft-n-max, the maximum number of speculative draft tokens per step."
-                Recommendation = Format-BilingualText -ChineseText "先從 `2` 開始。只有在你已經實測目前 MTP 模型穩定，而且更深 drafting 確實有收益時，才往上加。" -EnglishText "Start with 2. Increase only after measuring that your chosen MTP model stays stable and actually benefits from deeper drafting."
+                Recommendation = if ($IsGemma4QatMtpModel) { (Format-BilingualText -ChineseText "Gemma 4 MTP 依 Unsloth 範例先用 `4`。如果遇到穩定性或延遲問題，再降到 `2` 比較。" -EnglishText "For Gemma 4 MTP, start with 4 as shown in the Unsloth example. Drop to 2 only when comparing stability or latency.") } else { (Format-BilingualText -ChineseText "先從 `2` 開始。只有在你已經實測目前 MTP 模型穩定，而且更深 drafting 確實有收益時，才往上加。" -EnglishText "Start with 2. Increase only after measuring that your chosen MTP model stays stable and actually benefits from deeper drafting.") }
             }
         }
         "ContextSize" {
@@ -7670,7 +7762,7 @@ function Edit-LaunchConfigItem {
                 $Config.ModelPath = Resolve-ModelPath -Path $SelectedModel.path
                 $Config.ModelCapabilities = Format-ModelCapabilities -ModelEntry $SelectedModel
                 Sync-LaunchConfigGpuFields -Config $Config
-                $Config.MtpEnabled = Test-IsQwen36MtpModel -ModelEntry $SelectedModel -ResolvedModelPath $Config.ModelPath
+                $Config.MtpEnabled = Test-IsMtpCapableModel -ModelEntry $SelectedModel -ResolvedModelPath $Config.ModelPath
                 Sync-LaunchConfigMtpFields -Config $Config
                 if ([string]$Config.VisionSelectionMode -eq "auto") {
                     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $IndexPath
@@ -7951,13 +8043,16 @@ function Get-LlamaServerArgsFromLaunchConfig {
         $CombinedArgs += [string]$Argument
     }
 
-    if (Test-Qwen36MtpDefaultsEnabled -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $CombinedArgs) {
+    if (Test-MtpDefaultsEnabled -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $CombinedArgs) {
+        $MtpDefaultSpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value "2"
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value $MtpDefaultSpecDraftNMax
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-fa|--flash-attn)(?:=|$)') -Flag "--flash-attn" -Value "on"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctv|--cache-type-v)(?:=|$)') -Flag "--cache-type-v" -Value "q8_0"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
+        if (Test-IsQwen36MtpModel -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath) {
+            Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
+            Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctv|--cache-type-v)(?:=|$)') -Flag "--cache-type-v" -Value "q8_0"
+            Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
+        }
     }
 
     if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
