@@ -236,10 +236,22 @@ else {
     $PreferredBinRoot
 }
 $ServerExe = Join-Path $LlamaBinRoot "llama-server.exe"
+$BenchExe = Join-Path $LlamaBinRoot "llama-bench.exe"
+$BatchedBenchExe = Join-Path $LlamaBinRoot "llama-batched-bench.exe"
 $LegacyServerExe = Join-Path $LegacyBinRoot "llama-server.exe"
+$LegacyBenchExe = Join-Path $LegacyBinRoot "llama-bench.exe"
+$LegacyBatchedBenchExe = Join-Path $LegacyBinRoot "llama-batched-bench.exe"
 $ServerExeCandidates = @(
     $ServerExe
     $LegacyServerExe
+) | Select-Object -Unique
+$BenchExeCandidates = @(
+    $BenchExe
+    $LegacyBenchExe
+) | Select-Object -Unique
+$BatchedBenchExeCandidates = @(
+    $BatchedBenchExe
+    $LegacyBatchedBenchExe
 ) | Select-Object -Unique
 $LegacyPidFile = Join-Path $ScriptRoot "llama-server.pid"
 $LegacyStdOutLog = Join-Path $ScriptRoot "llama-server.stdout.log"
@@ -258,10 +270,11 @@ $WatchdogPidFile = Join-Path $LogRoot "llama-watchdog.pid"
 $WatchdogLog = Join-Path $LogRoot "llama-watchdog.log"
 $TuningProfileFile = Join-Path $JsonRoot "model-tuning.json"
 $SavedLaunchProfileFile = Join-Path $JsonRoot "launch-profiles.json"
+$BenchmarkModelCardsFile = Join-Path $JsonRoot "model-cards.json"
 $ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
 $SupervisorScriptPath = Join-Path $Ps1Root "llama_supervisor.ps1"
 $WatchdogScriptPath = Join-Path $Ps1Root "llama_watchdog.ps1"
-$BaseUrl = "http://127.0.0.1:$Port"
+$BaseUrl = "http://localhost:$Port"
 $BrowserJob = $null
 $UsedInteractiveMenu = $false
 $EncounteredFatalError = $false
@@ -805,6 +818,7 @@ function Get-ServerArgs {
         $MtpDefaultSpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value $MtpDefaultSpecDraftNMax
+        Add-Gemma4MtpDraftModelDefault -TargetArguments $Arguments -UserArguments $CombinedArgs -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-fa|--flash-attn)(?:=|$)') -Flag "--flash-attn" -Value "on"
         if (Test-IsQwen36MtpModel -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath) {
             Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
@@ -4161,6 +4175,80 @@ function Get-MtpDefaultSpecDraftNMax {
     return "2"
 }
 
+function Resolve-Gemma4MtpDraftModelPath {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    if (-not (Test-IsGemma4QatMtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)) {
+        return ""
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        return ""
+    }
+
+    try {
+        $ModelFile = Get-Item -LiteralPath $ResolvedModelPath -ErrorAction Stop
+    }
+    catch {
+        return ""
+    }
+
+    $ModelDirectory = $ModelFile.DirectoryName
+    if ([string]::IsNullOrWhiteSpace($ModelDirectory) -or -not (Test-Path -LiteralPath $ModelDirectory -PathType Container)) {
+        return ""
+    }
+
+    $ModelBaseName = [System.IO.Path]::GetFileNameWithoutExtension($ModelFile.Name)
+    $CandidateFiles = Get-ChildItem -LiteralPath $ModelDirectory -File -Filter "*.gguf" -ErrorAction SilentlyContinue
+    $Candidates = @(
+        $CandidateFiles |
+            Where-Object {
+                $_.FullName -ne $ModelFile.FullName -and
+                $_.Name -match '(?i)mtp' -and
+                $_.Name -notmatch '(?i)mmproj'
+            }
+    )
+
+    $Candidates = @(
+        $Candidates |
+            Sort-Object `
+                @{ Expression = { if ($_.BaseName -match '(?i)^mtp') { 0 } else { 1 } } }, `
+                @{ Expression = { [Math]::Abs($_.BaseName.Length - $ModelBaseName.Length) } }, `
+                @{ Expression = { $_.Name } }
+    )
+
+    if ($Candidates.Count -eq 0) {
+        return ""
+    }
+
+    return [string]$Candidates[0].FullName
+}
+
+function Add-Gemma4MtpDraftModelDefault {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]]$TargetArguments,
+        [AllowNull()][string[]]$UserArguments,
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    $DraftModelPath = Resolve-Gemma4MtpDraftModelPath -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+    if ([string]::IsNullOrWhiteSpace($DraftModelPath)) {
+        return
+    }
+
+    Add-DefaultLlamaArgument `
+        -TargetArguments $TargetArguments `
+        -UserArguments $UserArguments `
+        -Patterns @('^(?:-md|--model-draft|--spec-draft-model)(?:=|$)') `
+        -Flag "--spec-draft-model" `
+        -Value $DraftModelPath
+}
+
 function Test-MtpDefaultsEnabled {
     param(
         $ModelEntry,
@@ -4231,7 +4319,11 @@ function Get-ModelGenerationArgs {
 
     $ResolvedModelPath = if ($ModelEntry -and $ModelEntry.PSObject.Properties["path"]) { [string]$ModelEntry.path } else { $null }
     $UseQwen36MtpDefaults = Test-Qwen36MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $UserArguments
-    $DefaultTemperature = "0.3"
+    $DefaultTemperature = "1.0"
+    $DefaultTopP = "0.95"
+    $DefaultTopK = "20"
+    $DefaultMinP = "0.00"
+    $DefaultPresencePenalty = "1.5"
     $Generation = $null
     if ($ModelEntry -and $ModelEntry.PSObject.Properties["generation"] -and $null -ne $ModelEntry.generation) {
         $Generation = $ModelEntry.generation
@@ -4252,17 +4344,73 @@ function Get-ModelGenerationArgs {
         }
     }
 
-    $PresencePenaltyValue = $null
+    if (-not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--top-p(?:=|$)'))) {
+        $Value = $DefaultTopP
+        if ($Generation -and $Generation.PSObject.Properties["top_p"]) {
+            $ConfiguredValue = ConvertTo-LlamaScalarArgumentValue -Value $Generation.top_p
+            if ($null -ne $ConfiguredValue) {
+                $Value = $ConfiguredValue
+            }
+        }
+        elseif ($Generation -and $Generation.PSObject.Properties["topP"]) {
+            $ConfiguredValue = ConvertTo-LlamaScalarArgumentValue -Value $Generation.topP
+            if ($null -ne $ConfiguredValue) {
+                $Value = $ConfiguredValue
+            }
+        }
+        if ($null -ne $Value) {
+            $Arguments.Add("--top-p")
+            $Arguments.Add($Value)
+        }
+    }
+
+    if (-not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--top-k(?:=|$)'))) {
+        $Value = $DefaultTopK
+        if ($Generation -and $Generation.PSObject.Properties["top_k"]) {
+            $ConfiguredValue = ConvertTo-LlamaScalarArgumentValue -Value $Generation.top_k
+            if ($null -ne $ConfiguredValue) {
+                $Value = $ConfiguredValue
+            }
+        }
+        elseif ($Generation -and $Generation.PSObject.Properties["topK"]) {
+            $ConfiguredValue = ConvertTo-LlamaScalarArgumentValue -Value $Generation.topK
+            if ($null -ne $ConfiguredValue) {
+                $Value = $ConfiguredValue
+            }
+        }
+        if ($null -ne $Value) {
+            $Arguments.Add("--top-k")
+            $Arguments.Add($Value)
+        }
+    }
+
+    if (-not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--min-p(?:=|$)'))) {
+        $Value = $DefaultMinP
+        if ($Generation -and $Generation.PSObject.Properties["min_p"]) {
+            $ConfiguredValue = ConvertTo-LlamaScalarArgumentValue -Value $Generation.min_p
+            if ($null -ne $ConfiguredValue) {
+                $Value = $ConfiguredValue
+            }
+        }
+        elseif ($Generation -and $Generation.PSObject.Properties["minP"]) {
+            $ConfiguredValue = ConvertTo-LlamaScalarArgumentValue -Value $Generation.minP
+            if ($null -ne $ConfiguredValue) {
+                $Value = $ConfiguredValue
+            }
+        }
+        if ($null -ne $Value) {
+            $Arguments.Add("--min-p")
+            $Arguments.Add($Value)
+        }
+    }
+
+    $PresencePenaltyValue = $DefaultPresencePenalty
     if ($Generation -and $Generation.PSObject.Properties["presence_penalty"]) {
         $PresencePenaltyValue = $Generation.presence_penalty
     }
     elseif ($Generation -and $Generation.PSObject.Properties["presencePenalty"]) {
         $PresencePenaltyValue = $Generation.presencePenalty
     }
-    elseif ($UseQwen36MtpDefaults) {
-        $PresencePenaltyValue = 0
-    }
-
     if ($null -ne $PresencePenaltyValue -and -not (Test-LlamaArgumentProvided -Arguments $UserArguments -Patterns @('^--presence-penalty(?:=|$)'))) {
         $Value = ConvertTo-LlamaScalarArgumentValue -Value $PresencePenaltyValue
         if ($null -ne $Value) {
@@ -4272,9 +4420,6 @@ function Get-ModelGenerationArgs {
     }
 
     if ($UseQwen36MtpDefaults) {
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--top-p(?:=|$)') -Flag "--top-p" -Value "0.95"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--top-k(?:=|$)') -Flag "--top-k" -Value "20"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--min-p(?:=|$)') -Flag "--min-p" -Value "0.0"
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $UserArguments -Patterns @('^--repeat-penalty(?:=|$)') -Flag "--repeat-penalty" -Value "1"
     }
 
@@ -4423,6 +4568,7 @@ function Convert-ForwardArgsToMenuConfig {
         TopK            = ""
         TopP            = ""
         MinP            = ""
+        PresencePenalty = ""
         Host            = "127.0.0.1"
         Metrics         = $false
         ApiKey          = ""
@@ -4463,6 +4609,9 @@ function Convert-ForwardArgsToMenuConfig {
             }
             '^--min-p(?:=(.+))?$' {
                 $Config.MinP = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^--presence-penalty(?:=(.+))?$' {
+                $Config.PresencePenalty = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
             '^--host(?:=(.+))?$' {
                 $Config.Host = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
@@ -4584,6 +4733,11 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add([string]$Config.MinP)
     }
 
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.PresencePenalty)) {
+        $Arguments.Add("--presence-penalty")
+        $Arguments.Add([string]$Config.PresencePenalty)
+    }
+
     if ($Config.Host) {
         $Arguments.Add("--host")
         $Arguments.Add([string]$Config.Host)
@@ -4635,19 +4789,21 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add($ReasoningBudget)
     }
 
+    $ExtraArguments = @(Split-ArgumentLine -Line $Config.ExtraArgs)
     $ModelUsesMtpDefaults = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     if ([bool]$Config.MtpEnabled) {
         $Arguments.Add("--spec-type")
         $Arguments.Add("draft-mtp")
         $Arguments.Add("--spec-draft-n-max")
         $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) } else { [string]$Config.SpecDraftNMax }))
+        Add-Gemma4MtpDraftModelDefault -TargetArguments $Arguments -UserArguments $ExtraArguments -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     }
     elseif ($ModelUsesMtpDefaults) {
         $Arguments.Add("--spec-type")
         $Arguments.Add("none")
     }
 
-    foreach ($ExtraArgument in (Split-ArgumentLine -Line $Config.ExtraArgs)) {
+    foreach ($ExtraArgument in $ExtraArguments) {
         $Arguments.Add($ExtraArgument)
     }
 
@@ -4678,6 +4834,7 @@ function Ensure-TuningProfileFile {
     $Bootstrap = [ordered]@{
         version  = 1
         profiles = @()
+        defaults = @()
     }
 
     $Bootstrap | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
@@ -4754,6 +4911,9 @@ function Get-SavedLaunchProfileData {
     if (-not $Data.profiles) {
         $Data | Add-Member -NotePropertyName profiles -NotePropertyValue @() -Force
     }
+    if (-not $Data.PSObject.Properties["defaults"] -or -not $Data.defaults) {
+        $Data | Add-Member -NotePropertyName defaults -NotePropertyValue @() -Force
+    }
 
     return $Data
 }
@@ -4761,12 +4921,33 @@ function Get-SavedLaunchProfileData {
 function Save-SavedLaunchProfileData {
     param(
         [string]$Path,
-        [object[]]$Profiles
+        [object[]]$Profiles,
+        [object[]]$Defaults = $null
     )
+
+    if ($null -eq $Defaults) {
+        $ExistingDefaults = @()
+        if (Test-Path -LiteralPath $Path) {
+            try {
+                $ExistingJson = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+                if (-not [string]::IsNullOrWhiteSpace($ExistingJson)) {
+                    $ExistingData = $ExistingJson | ConvertFrom-Json
+                    if ($ExistingData.PSObject.Properties["defaults"]) {
+                        $ExistingDefaults = @($ExistingData.defaults)
+                    }
+                }
+            }
+            catch {
+                $ExistingDefaults = @()
+            }
+        }
+        $Defaults = $ExistingDefaults
+    }
 
     $Payload = [ordered]@{
         version  = 1
         profiles = @($Profiles)
+        defaults = @($Defaults)
     }
 
     $Payload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Path -Encoding UTF8
@@ -4792,6 +4973,7 @@ function Get-SavedLaunchProfilePersistedKeys {
         "TopK"
         "TopP"
         "MinP"
+        "PresencePenalty"
         "Host"
         "Metrics"
         "ApiKey"
@@ -4877,6 +5059,76 @@ function Save-SavedLaunchProfile {
         Name        = $TrimmedName
         Path        = $SavedLaunchProfileFile
     }
+}
+
+function Save-SavedLaunchDefault {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path ([string]$Config.ModelPath)
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        throw (Format-BilingualText -ChineseText "目前設定缺少有效的模型路徑，無法儲存微調預設值。" -EnglishText "The current config has no valid model path, so the tuning defaults cannot be saved.")
+    }
+
+    $Data = Get-SavedLaunchProfileData -Path $SavedLaunchProfileFile
+    $ExistingDefault = @(
+        $Data.defaults |
+            Where-Object {
+                [string]::Equals((Resolve-ModelPath -Path ([string]$_.model_path)), $ResolvedModelPath, [System.StringComparison]::OrdinalIgnoreCase)
+            } |
+            Select-Object -First 1
+    )
+
+    $Now = (Get-Date).ToString("o")
+    $Snapshot = Get-SavedLaunchProfileConfigSnapshot -Config $Config
+    $Entry = [ordered]@{
+        id         = if ($ExistingDefault) { [string]$ExistingDefault[0].id } else { [guid]::NewGuid().ToString() }
+        name       = "__tune_default__"
+        model_name = [string]$Config.ModelName
+        model_path = $ResolvedModelPath
+        created_at = if ($ExistingDefault) { [string]$ExistingDefault[0].created_at } else { $Now }
+        updated_at = $Now
+        config     = $Snapshot
+    }
+
+    $UpdatedDefaults = @(
+        $Data.defaults |
+            Where-Object { [string]$_.id -ne [string]$Entry.id }
+    )
+    $UpdatedDefaults += [pscustomobject]$Entry
+    Save-SavedLaunchProfileData -Path $SavedLaunchProfileFile -Profiles @($Data.profiles) -Defaults $UpdatedDefaults
+
+    return [pscustomobject]@{
+        Saved       = $true
+        Overwritten = [bool]$ExistingDefault
+        ModelName   = [string]$Config.ModelName
+        Path        = $SavedLaunchProfileFile
+    }
+}
+
+function Get-SavedLaunchDefaultForModel {
+    param(
+        [string]$ModelPath
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $ModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) {
+        return $null
+    }
+
+    $Data = Get-SavedLaunchProfileData -Path $SavedLaunchProfileFile
+    return @(
+        $Data.defaults |
+            Where-Object {
+                [string]::Equals((Resolve-ModelPath -Path ([string]$_.model_path)), $ResolvedModelPath, [System.StringComparison]::OrdinalIgnoreCase)
+            } |
+            Sort-Object @{ Expression = {
+                    try { [datetime]::Parse(([string]$_.updated_at)) }
+                    catch { [datetime]::MinValue }
+                }; Descending = $true } |
+            Select-Object -First 1
+    )[0]
 }
 
 function Get-SavedLaunchProfilesForModel {
@@ -6662,10 +6914,721 @@ function Show-LaunchModeMenu {
     return Show-ListMenu -Title (Format-BilingualText -ChineseText "啟動模式" -EnglishText "Launch Mode") -Subtitle (Format-BilingualText -ChineseText "選擇你要如何啟動服務。" -EnglishText "Choose how you want to start the server.") -Items $Options
 }
 
+function Resolve-FirstExistingPath {
+    param([string[]]$Candidates)
+
+    foreach ($Candidate in @($Candidates)) {
+        if (-not [string]::IsNullOrWhiteSpace($Candidate) -and (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
+            return $Candidate
+        }
+    }
+
+    return $null
+}
+
+function Get-BenchmarkModeMenu {
+    $Options = @(
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "快速測速" -EnglishText "Quick Speed Test"; Description = Format-BilingualText -ChineseText "約略測 pp512 與 tg128，適合確認這個模型大概跑多快。" -EnglishText "Measures pp512 and tg128. Good for a quick feel of model speed."; Value = "Quick" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "長上下文測試" -EnglishText "Long Context Test"; Description = Format-BilingualText -ChineseText "測 512/2048/8192/16384 prompt，適合看貼長文或 RAG 的 prefill 速度。" -EnglishText "Tests 512/2048/8192/16384 prompt sizes for long-prompt or RAG prefill speed."; Value = "LongContext" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "批次/顯存甜點測試" -EnglishText "Batch Sweet Spot"; Description = Format-BilingualText -ChineseText "掃 batch 與 ubatch 組合，適合找吞吐與 VRAM 的平衡點。" -EnglishText "Sweeps batch and ubatch combinations to find a throughput/VRAM sweet spot."; Value = "BatchSweep" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "CPU/GPU 對照快測" -EnglishText "CPU/GPU Quick Compare"; Description = Format-BilingualText -ChineseText "同一模型用 CPU 與 GPU 各跑短測；大模型 CPU 可能很慢。" -EnglishText "Runs a short CPU vs GPU comparison. Large models can be slow on CPU."; Value = "CpuGpu" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"; Description = Format-BilingualText -ChineseText "回到主選單。" -EnglishText "Return to the main menu."; Value = "Back" }
+    )
+
+    return Show-ListMenu -Title (Format-BilingualText -ChineseText "效能測試" -EnglishText "Benchmark") -Subtitle (Format-BilingualText -ChineseText "選一個懶人模式；結果會自動存到 logs。" -EnglishText "Pick an easy preset; results are saved to logs automatically.") -Items $Options
+}
+
+function Get-BenchmarkModelCardEstimate {
+    param(
+        $ModelEntry,
+        [string]$ModelPath
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $ModelPath
+    $IdentityText = Get-ModelIdentityText -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+    $FileSizeBytes = Get-ModelFileSizeBytes -Path $ResolvedModelPath
+    $FileSizeMiB = if ($FileSizeBytes -gt 0) { [double]$FileSizeBytes / 1MB } else { $null }
+    $ParameterB = $null
+    if ($IdentityText -match '(?i)(\d+(?:\.\d+)?)\s*b(?:[^a-z0-9]|$)') {
+        $ParameterB = [double]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    $Quantization = "unknown"
+    if ($IdentityText -match '(?i)(?:^|[^a-z0-9])((?:i)?q\d(?:_[a-z0-9]+)+|q\d_\d|mxfp\d+)(?:[^a-z0-9]|$)') {
+        $Quantization = $Matches[1].ToUpperInvariant()
+    }
+
+    $CardOverride = Get-BenchmarkModelCardOverride -ModelEntry $ModelEntry -ModelPath $ResolvedModelPath
+    $SupportedContext = $script:ManagedDefaultContextSize
+    $ContextMatches = [regex]::Matches($IdentityText, '(?i)(\d{2,6})\s*k(?:[^a-z0-9]|$)|(?:ctx|context|n_ctx)[-_. =]*(\d{4,6})')
+    foreach ($Match in $ContextMatches) {
+        $ValueText = if ($Match.Groups[1].Success) { $Match.Groups[1].Value } else { $Match.Groups[2].Value }
+        [int]$ParsedContext = 0
+        if ([int]::TryParse($ValueText, [ref]$ParsedContext)) {
+            if ($Match.Groups[1].Success -and $ParsedContext -lt 1000) {
+                $ParsedContext *= 1024
+            }
+            if ($ParsedContext -gt $SupportedContext) {
+                $SupportedContext = $ParsedContext
+            }
+        }
+    }
+
+    if (Test-IsGemma4QatMtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath) {
+        $SupportedContext = [Math]::Max($SupportedContext, 262144)
+    }
+
+    if ($CardOverride -and $CardOverride.PSObject.Properties["supported_context"]) {
+        [int]$OverrideContext = 0
+        if ([int]::TryParse([string]$CardOverride.supported_context, [ref]$OverrideContext) -and $OverrideContext -ge 1024) {
+            $SupportedContext = $OverrideContext
+        }
+    }
+    elseif ($CardOverride -and $CardOverride.PSObject.Properties["n_ctx_train"]) {
+        [int]$OverrideContext = 0
+        if ([int]::TryParse([string]$CardOverride.n_ctx_train, [ref]$OverrideContext) -and $OverrideContext -ge 1024) {
+            $SupportedContext = $OverrideContext
+        }
+    }
+
+    if ($CardOverride -and $CardOverride.PSObject.Properties["parameters_b"]) {
+        [double]$OverrideParameters = 0
+        if ([double]::TryParse([string]$CardOverride.parameters_b, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$OverrideParameters) -and $OverrideParameters -gt 0) {
+            $ParameterB = $OverrideParameters
+        }
+    }
+
+    if ($CardOverride -and $CardOverride.PSObject.Properties["quantization"] -and -not [string]::IsNullOrWhiteSpace([string]$CardOverride.quantization)) {
+        $Quantization = ([string]$CardOverride.quantization).Trim().ToUpperInvariant()
+    }
+
+    $MtpEnabled = Test-IsMtpCapableModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+    $DraftModelPath = Resolve-Gemma4MtpDraftModelPath -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+    $DraftSizeMiB = $null
+    if (-not [string]::IsNullOrWhiteSpace($DraftModelPath)) {
+        $DraftSizeBytes = Get-ModelFileSizeBytes -Path $DraftModelPath
+        if ($DraftSizeBytes -gt 0) {
+            $DraftSizeMiB = [double]$DraftSizeBytes / 1MB
+        }
+    }
+
+    $Inventory = @(Get-AcceleratorInventory)
+    $TotalFreeMiB = if ($Inventory.Count -gt 0) { [double](($Inventory | Measure-Object -Property FreeMiB -Sum).Sum) } else { $null }
+    $TotalMiB = if ($Inventory.Count -gt 0) { [double](($Inventory | Measure-Object -Property TotalMiB -Sum).Sum) } else { $null }
+
+    $EstimatedMaxContext = $SupportedContext
+    $LimitReason = "model supported context"
+    if ($null -ne $TotalFreeMiB -and $null -ne $FileSizeMiB -and $TotalFreeMiB -gt 0) {
+        $ReserveMiB = [Math]::Max(2048.0, $TotalFreeMiB * 0.10)
+        $StaticMiB = $FileSizeMiB + $(if ($null -ne $DraftSizeMiB) { $DraftSizeMiB } else { 0.0 })
+        $DynamicBudgetMiB = $TotalFreeMiB - $StaticMiB - $ReserveMiB
+        $ParamScale = if ($null -ne $ParameterB -and $ParameterB -gt 0) { [double]$ParameterB } else { [Math]::Max(7.0, $FileSizeMiB / 768.0) }
+        $QuantScale = switch -Regex ($Quantization) {
+            '^Q8' { 1.25; break }
+            '^Q6' { 1.12; break }
+            '^Q5' { 1.05; break }
+            '^Q4' { 1.0; break }
+            '^IQ' { 0.95; break }
+            default { 1.05 }
+        }
+        $MtpScale = if ($MtpEnabled) { 1.18 } else { 1.0 }
+        $EstimatedMiBPer1024 = [Math]::Max(96.0, 28.0 * $ParamScale * $QuantScale * $MtpScale)
+        if ($DynamicBudgetMiB -gt $EstimatedMiBPer1024) {
+            $VramLimitedContext = [int]([Math]::Floor(($DynamicBudgetMiB / $EstimatedMiBPer1024)) * 1024)
+            $VramLimitedContext = [Math]::Max(1024, $VramLimitedContext)
+            if ($VramLimitedContext -lt $EstimatedMaxContext) {
+                $EstimatedMaxContext = $VramLimitedContext
+                $LimitReason = "estimated available VRAM"
+            }
+        }
+        elseif ($DynamicBudgetMiB -gt 0) {
+            $EstimatedMaxContext = [Math]::Min($EstimatedMaxContext, 1024)
+            $LimitReason = "tight estimated VRAM"
+        }
+    }
+
+    $EstimatedMaxContext = [Math]::Max(1024, [int]([Math]::Floor($EstimatedMaxContext / 1024.0) * 1024))
+    $StartContext = [Math]::Max(1024, [int]([Math]::Floor(($SupportedContext / 2.0) / 1024.0) * 1024))
+    if ($StartContext -gt $EstimatedMaxContext) {
+        $StartContext = $EstimatedMaxContext
+    }
+
+    return [pscustomobject]@{
+        ParameterB          = $ParameterB
+        Quantization        = $Quantization
+        MtpEnabled          = $MtpEnabled
+        DraftModelPath      = $DraftModelPath
+        MainSizeMiB         = $FileSizeMiB
+        DraftSizeMiB        = $DraftSizeMiB
+        SupportedContext    = [int]$SupportedContext
+        StartContext        = [int]$StartContext
+        EstimatedMaxContext = [int]$EstimatedMaxContext
+        LimitReason         = $LimitReason
+        TotalGpuFreeMiB     = $TotalFreeMiB
+        TotalGpuMiB         = $TotalMiB
+        OverrideSource      = if ($CardOverride) { $BenchmarkModelCardsFile } else { "" }
+    }
+}
+
+function Get-BenchmarkModelCardOverride {
+    param(
+        $ModelEntry,
+        [string]$ModelPath
+    )
+
+    if (-not (Test-Path -LiteralPath $BenchmarkModelCardsFile -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $Data = Get-Content -LiteralPath $BenchmarkModelCardsFile -Raw -ErrorAction Stop | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+
+    $Cards = @()
+    if ($Data.PSObject.Properties["models"]) {
+        $Cards = @($Data.models)
+    }
+    elseif ($Data -is [System.Array]) {
+        $Cards = @($Data)
+    }
+
+    if ($Cards.Count -eq 0) {
+        return $null
+    }
+
+    $ResolvedPath = Resolve-ModelPath -Path $ModelPath
+    foreach ($Card in $Cards) {
+        if (-not $Card) {
+            continue
+        }
+
+        if ($ModelEntry -and $Card.PSObject.Properties["id"] -and [string]::Equals([string]$Card.id, [string]$ModelEntry.id, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $Card
+        }
+
+        if ($Card.PSObject.Properties["path"]) {
+            $CardPath = Resolve-ModelPath -Path ([string]$Card.path)
+            if (-not [string]::IsNullOrWhiteSpace($CardPath) -and [string]::Equals($CardPath, $ResolvedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $Card
+            }
+        }
+
+        if ($Card.PSObject.Properties["name"] -and $ModelEntry -and [string]::Equals([string]$Card.name, [string]$ModelEntry.name, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $Card
+        }
+    }
+
+    return $null
+}
+
+function Format-BenchmarkModelCardSummary {
+    param($Card)
+
+    if (-not $Card) {
+        return ""
+    }
+
+    $ParamText = if ($null -ne $Card.ParameterB) { "{0:0.##}B" -f [double]$Card.ParameterB } else { "unknown params" }
+    $MtpText = if ($Card.MtpEnabled) { "MTP on" } else { "MTP off" }
+    $VramText = if ($null -ne $Card.TotalGpuFreeMiB -and $null -ne $Card.TotalGpuMiB) { "GPU free {0:N0}/{1:N0} MiB" -f [double]$Card.TotalGpuFreeMiB, [double]$Card.TotalGpuMiB } else { "GPU unknown" }
+    $OverrideText = if (-not [string]::IsNullOrWhiteSpace([string]$Card.OverrideSource)) { ", card override" } else { "" }
+    return ("{0}, {1}, {2}, ctx support ~{3:N0}, start {4:N0}, max {5:N0} ({6}), {7}{8}" -f $ParamText, [string]$Card.Quantization, $MtpText, [int]$Card.SupportedContext, [int]$Card.StartContext, [int]$Card.EstimatedMaxContext, [string]$Card.LimitReason, $VramText, $OverrideText)
+}
+
+function Get-BenchmarkModeDefinition {
+    param(
+        [string]$Mode,
+        [string]$ModelPath,
+        $ModelEntry = $null
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path $ModelPath
+    $CommonArgs = @("-m", $ResolvedModelPath, "-t", ([string][Math]::Max(1, $LogicalThreads - 2)), "-fa", "auto", "-o", "md", "--progress")
+    $BenchPath = Resolve-FirstExistingPath -Candidates $BenchExeCandidates
+    $BenchmarkCard = Get-BenchmarkModelCardEstimate -ModelEntry $ModelEntry -ModelPath $ResolvedModelPath
+
+    switch ($Mode) {
+        "Quick" {
+            return [pscustomobject]@{ Title = Format-BilingualText -ChineseText "快速測速" -EnglishText "Quick Speed Test"; Description = Format-BilingualText -ChineseText "看最常用的 prompt processing 與 token generation 速度。" -EnglishText "Shows the most common prompt-processing and token-generation speeds."; Executable = $BenchPath; Arguments = @($CommonArgs + @("-ngl", "99", "-p", "512", "-n", "128", "-r", "3", "-b", "2048", "-ub", "512")) }
+        }
+        "LongContext" {
+            return [pscustomobject]@{ Title = Format-BilingualText -ChineseText "長上下文測試" -EnglishText "Long Context Test"; Description = Format-BilingualText -ChineseText "重點看長 prompt prefill 是否夠快，以及上下文加長後是否溢出顯存。" -EnglishText "Focuses on long-prompt prefill speed and whether longer contexts fit in VRAM."; Executable = $BenchPath; Arguments = @($CommonArgs + @("-ngl", "99", "-p", "512,2048,8192,16384", "-n", "128", "-r", "3", "-b", "2048", "-ub", "512")) }
+        }
+        "BatchSweep" {
+            return [pscustomobject]@{
+                Title                 = Format-BilingualText -ChineseText "批次/顯存甜點測試" -EnglishText "Batch Sweet Spot"
+                Description           = Format-BilingualText -ChineseText "先估算模型卡與 CTX/VRAM 上限，從支援 CTX 的一半開始；若太高就往下，穩定後用 1024 階梯往上探。" -EnglishText "Estimates a local model card and CTX/VRAM limit, starts at half supported CTX, downshifts if too high, then probes upward in 1024-token steps."
+                Executable            = $BenchPath
+                Arguments             = @($CommonArgs + @("-ngl", "99", "-p", "2048", "-n", "128", "-r", "2", "-b", ("{0}-{1}+1024" -f [string]$BenchmarkCard.StartContext, [string]$BenchmarkCard.EstimatedMaxContext), "-ub", "256,512,1024"))
+                BaseArguments         = @($CommonArgs + @("-ngl", "99", "-p", "2048", "-n", "128", "-r", "2"))
+                ProgressiveBatchSweep = $true
+                ModelCard             = $BenchmarkCard
+                StartBatch            = [int]$BenchmarkCard.StartContext
+                MaxBatch              = [int]$BenchmarkCard.EstimatedMaxContext
+                StepBatch             = 1024
+                AllowDownshift        = $true
+                DropThreshold         = 0.08
+            }
+        }
+        "CpuGpu" {
+            return [pscustomobject]@{ Title = Format-BilingualText -ChineseText "CPU/GPU 對照快測" -EnglishText "CPU/GPU Quick Compare"; Description = Format-BilingualText -ChineseText "同一模型短測 CPU 與 GPU；如果模型很大，CPU 那輪會慢。" -EnglishText "Short CPU/GPU comparison for the same model; the CPU run can be slow for large models."; Executable = $BenchPath; Arguments = @($CommonArgs + @("-ngl", "0,99", "-p", "512", "-n", "64", "-r", "2", "-b", "1024", "-ub", "256")) }
+        }
+        default {
+            return $null
+        }
+    }
+}
+
+function Invoke-CapturedProcess {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        throw (Format-BilingualText -ChineseText ("找不到可執行檔：{0}" -f $FilePath) -EnglishText ("Executable not found: {0}" -f $FilePath))
+    }
+
+    $StartInfo.FileName = $FilePath
+    $StartInfo.Arguments = ConvertTo-ArgumentString -Arguments @($Arguments)
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.WorkingDirectory = $ScriptRoot
+
+    $Process = New-Object System.Diagnostics.Process
+    $Process.StartInfo = $StartInfo
+    [void]$Process.Start()
+    $StdOut = $Process.StandardOutput.ReadToEnd()
+    $StdErr = $Process.StandardError.ReadToEnd()
+    $Process.WaitForExit()
+
+    return [pscustomobject]@{ ExitCode = [int]$Process.ExitCode; StdOut = [string]$StdOut; StdErr = [string]$StdErr }
+}
+
+function Get-BestPromptProcessingSpeed {
+    param(
+        [string]$MarkdownOutput
+    )
+
+    $Rows = @(Get-LlamaBenchChartRows -MarkdownOutput $MarkdownOutput)
+    $PromptRows = @($Rows | Where-Object { [string]$_.Label -match '(?i)(^|\|)\s*test\s+pp' })
+    if ($PromptRows.Count -eq 0) {
+        return $null
+    }
+
+    return [double](@($PromptRows | Measure-Object -Property Speed -Maximum).Maximum)
+}
+
+function Invoke-ProgressiveBatchBenchmark {
+    param(
+        $Definition
+    )
+
+    $MaxBatch = if ($Definition.PSObject.Properties["MaxBatch"] -and [int]$Definition.MaxBatch -gt 0) { [int]$Definition.MaxBatch } else { [int]$script:ManagedDefaultContextSize }
+    $StartBatch = if ($Definition.PSObject.Properties["StartBatch"] -and [int]$Definition.StartBatch -gt 0) { [int]$Definition.StartBatch } else { 1024 }
+    $StepBatch = if ($Definition.PSObject.Properties["StepBatch"] -and [int]$Definition.StepBatch -gt 0) { [int]$Definition.StepBatch } else { 1024 }
+    $AllowDownshift = ($Definition.PSObject.Properties["AllowDownshift"] -and [bool]$Definition.AllowDownshift)
+    $DropThreshold = if ($Definition.PSObject.Properties["DropThreshold"] -and [double]$Definition.DropThreshold -gt 0) { [double]$Definition.DropThreshold } else { 0.08 }
+    $MaxBatch = [Math]::Max(1024, [int]([Math]::Floor($MaxBatch / 1024.0) * 1024))
+    $StartBatch = [Math]::Max(1024, [int]([Math]::Floor($StartBatch / 1024.0) * 1024))
+    if ($StartBatch -gt $MaxBatch) {
+        $StartBatch = $MaxBatch
+    }
+    $Batch = $StartBatch
+    $Direction = "down"
+    $FoundStableStartingPoint = $false
+    $BestPromptSpeed = 0.0
+    $ExitCode = 0
+    $StdOutParts = New-Object System.Collections.Generic.List[string]
+    $StdErrParts = New-Object System.Collections.Generic.List[string]
+    $StopReason = ""
+
+    if ($Definition.PSObject.Properties["ModelCard"] -and $Definition.ModelCard) {
+        $StdOutParts.Add("## Estimated Model Card")
+        $StdOutParts.Add("")
+        $StdOutParts.Add(("- Summary: {0}" -f (Format-BenchmarkModelCardSummary -Card $Definition.ModelCard)))
+        if (-not [string]::IsNullOrWhiteSpace([string]$Definition.ModelCard.DraftModelPath)) {
+            $StdOutParts.Add(("- MTP draft: {0}" -f [string]$Definition.ModelCard.DraftModelPath))
+        }
+        $StdOutParts.Add("")
+    }
+
+    while ($Batch -le $MaxBatch) {
+        $UbatchValues = @(256, 512, 1024 | Where-Object { $_ -le $Batch })
+        if ($UbatchValues.Count -eq 0) {
+            $UbatchValues = @($Batch)
+        }
+
+        $DirectionText = if ($FoundStableStartingPoint) { "up" } elseif ($Direction -eq "down") { "downshift" } else { "up" }
+        Write-Host (Format-BilingualText -ChineseText ("正在測 batch {0} / 起點 {1} / 最大 {2}..." -f $Batch, $StartBatch, $MaxBatch) -EnglishText ("Testing batch {0} / start {1} / max {2}..." -f $Batch, $StartBatch, $MaxBatch)) -ForegroundColor Cyan
+        $Arguments = @($Definition.BaseArguments + @("-b", ([string]$Batch), "-ub", (($UbatchValues | ForEach-Object { [string]$_ }) -join ",")))
+        $RunResult = Invoke-CapturedProcess -FilePath ([string]$Definition.Executable) -Arguments $Arguments
+        $ExitCode = [Math]::Max($ExitCode, [int]$RunResult.ExitCode)
+
+        $StdOutParts.Add(("## Batch {0} ({1})" -f $Batch, $DirectionText))
+        $StdOutParts.Add("")
+        if (-not [string]::IsNullOrWhiteSpace([string]$RunResult.StdOut)) {
+            $StdOutParts.Add(([string]$RunResult.StdOut).TrimEnd())
+        }
+        $StdOutParts.Add("")
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$RunResult.StdErr)) {
+            $StdErrParts.Add(("## Batch {0}" -f $Batch))
+            $StdErrParts.Add(([string]$RunResult.StdErr).TrimEnd())
+            $StdErrParts.Add("")
+        }
+
+        $CurrentBestPromptSpeed = Get-BestPromptProcessingSpeed -MarkdownOutput ([string]$RunResult.StdOut)
+        if ($null -ne $CurrentBestPromptSpeed) {
+            Write-Host (Format-BilingualText -ChineseText ("batch {0} 最佳 pp：{1:N2} t/s" -f $Batch, [double]$CurrentBestPromptSpeed) -EnglishText ("batch {0} best pp: {1:N2} t/s" -f $Batch, [double]$CurrentBestPromptSpeed)) -ForegroundColor Gray
+            if (-not $FoundStableStartingPoint) {
+                $FoundStableStartingPoint = $true
+                $Direction = "up"
+                $ExitCode = 0
+            }
+
+            if ($BestPromptSpeed -gt 0 -and [double]$CurrentBestPromptSpeed -lt ($BestPromptSpeed * (1.0 - $DropThreshold))) {
+                $StopReason = Format-BilingualText -ChineseText ("停止：batch {0} 的最佳 pp 已比歷史最佳下降超過 {1:P0}。" -f $Batch, $DropThreshold) -EnglishText ("Stopped: best pp at batch {0} dropped by more than {1:P0} from the best seen." -f $Batch, $DropThreshold)
+                break
+            }
+
+            if ([double]$CurrentBestPromptSpeed -gt $BestPromptSpeed) {
+                $BestPromptSpeed = [double]$CurrentBestPromptSpeed
+            }
+        }
+
+        if ($RunResult.ExitCode -ne 0) {
+            if (-not $FoundStableStartingPoint -and $AllowDownshift -and ($Batch -gt 1024)) {
+                $NextBatch = [Math]::Max(1024, $Batch - $StepBatch)
+                Write-Host (Format-BilingualText -ChineseText ("batch {0} 失敗，往下改測 {1}。" -f $Batch, $NextBatch) -EnglishText ("batch {0} failed, downshifting to {1}." -f $Batch, $NextBatch)) -ForegroundColor Yellow
+                $Batch = $NextBatch
+                continue
+            }
+
+            $StopReason = Format-BilingualText -ChineseText ("停止：batch {0} 執行失敗，可能已碰到顯存或配置上限。" -f $Batch) -EnglishText ("Stopped: batch {0} failed, likely hitting a VRAM or configuration limit." -f $Batch)
+            break
+        }
+
+        if (-not $FoundStableStartingPoint) {
+            $FoundStableStartingPoint = $true
+            $Direction = "up"
+        }
+
+        if ($Batch -eq $MaxBatch) {
+            $StopReason = Format-BilingualText -ChineseText ("停止：已測到最大 context / batch {0}。" -f $MaxBatch) -EnglishText ("Stopped: reached max context / batch {0}." -f $MaxBatch)
+            break
+        }
+
+        $NextBatch = [Math]::Min($MaxBatch, $Batch + $StepBatch)
+        if ($NextBatch -le $Batch) {
+            break
+        }
+        $Batch = $NextBatch
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($StopReason)) {
+        $StdOutParts.Add("")
+        $StdOutParts.Add(("**{0}**" -f $StopReason))
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $ExitCode
+        StdOut   = ($StdOutParts -join "`r`n")
+        StdErr   = ($StdErrParts -join "`r`n")
+    }
+}
+
+function ConvertTo-SvgEscapedText {
+    param(
+        [AllowNull()][string]$Text
+    )
+
+    if ($null -eq $Text) {
+        return ""
+    }
+
+    $Escaped = [string]$Text
+    $Escaped = $Escaped.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+    return $Escaped.Replace([string][char]34, "&quot;")
+}
+
+function ConvertFrom-MarkdownTableCellText {
+    param(
+        [AllowNull()][string]$Text
+    )
+
+    if ($null -eq $Text) {
+        return ""
+    }
+
+    return ([string]$Text).Trim().Trim([char]0x60)
+}
+
+function Get-LlamaBenchChartRows {
+    param(
+        [string]$MarkdownOutput
+    )
+
+    if ([string]::IsNullOrWhiteSpace($MarkdownOutput)) {
+        return @()
+    }
+
+    $Lines = @($MarkdownOutput -split "\r?\n")
+    $Header = $null
+    $Rows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($Line) -or $Line.TrimStart() -notlike "|*") {
+            continue
+        }
+
+        $Cells = @(
+            $Line.Trim().Trim("|") -split "\|" |
+                ForEach-Object { ConvertFrom-MarkdownTableCellText -Text $_ }
+        )
+        if ($Cells.Count -lt 2) {
+            continue
+        }
+
+        $IsSeparator = $true
+        foreach ($Cell in $Cells) {
+            if ($Cell -notmatch '^\s*:?-{3,}:?\s*$') {
+                $IsSeparator = $false
+                break
+            }
+        }
+        if ($IsSeparator) {
+            continue
+        }
+
+        if (-not $Header) {
+            $LowerCells = @($Cells | ForEach-Object { ([string]$_).ToLowerInvariant() })
+            if (($LowerCells -contains "test") -and (($LowerCells -contains "t/s") -or ($LowerCells -contains "tok/s"))) {
+                $Header = @($Cells)
+            }
+            continue
+        }
+
+        $Map = @{}
+        for ($Index = 0; $Index -lt [Math]::Min($Header.Count, $Cells.Count); $Index++) {
+            $Map[([string]$Header[$Index]).ToLowerInvariant()] = [string]$Cells[$Index]
+        }
+
+        $SpeedText = if ($Map.ContainsKey("t/s")) { [string]$Map["t/s"] } elseif ($Map.ContainsKey("tok/s")) { [string]$Map["tok/s"] } else { "" }
+        if ($SpeedText -notmatch '[-+]?\d+(?:\.\d+)?') {
+            continue
+        }
+
+        $Speed = [double]::Parse($Matches[0], [System.Globalization.CultureInfo]::InvariantCulture)
+        $LabelParts = New-Object System.Collections.Generic.List[string]
+        foreach ($Name in @("test", "ngl", "n_gpu_layers", "batch", "n_batch", "ubatch", "n_ubatch", "fa")) {
+            if ($Map.ContainsKey($Name) -and -not [string]::IsNullOrWhiteSpace([string]$Map[$Name])) {
+                $DisplayName = switch ($Name) {
+                    "n_gpu_layers" { "ngl" }
+                    "n_batch" { "batch" }
+                    "n_ubatch" { "ubatch" }
+                    default { $Name }
+                }
+                $LabelParts.Add(("{0} {1}" -f $DisplayName, [string]$Map[$Name]))
+            }
+        }
+
+        if ($LabelParts.Count -eq 0) {
+            $LabelParts.Add("benchmark")
+        }
+
+        $Rows.Add([pscustomobject]@{
+            Label = ($LabelParts -join " | ")
+            Speed = $Speed
+        })
+    }
+
+    return @($Rows.ToArray())
+}
+
+function Export-BenchmarkBarChartSvg {
+    param(
+        [object[]]$Rows,
+        [string]$Title,
+        [string]$OutputPath
+    )
+
+    $ChartRows = @($Rows | Where-Object { $null -ne $_ -and $null -ne $_.Speed } | Sort-Object Speed -Descending)
+    if ($ChartRows.Count -eq 0) {
+        return $null
+    }
+
+    $MaxRows = [Math]::Min(24, $ChartRows.Count)
+    $ChartRows = @($ChartRows | Select-Object -First $MaxRows)
+    $MaxSpeed = [double](@($ChartRows | Measure-Object -Property Speed -Maximum).Maximum)
+    if ($MaxSpeed -le 0) {
+        return $null
+    }
+
+    $Width = 1180
+    $Left = 310
+    $Right = 120
+    $Top = 92
+    $RowHeight = 34
+    $BarHeight = 20
+    $Bottom = 70
+    $Height = $Top + ($ChartRows.Count * $RowHeight) + $Bottom
+    $BarMaxWidth = $Width - $Left - $Right
+    $EscapedTitle = ConvertTo-SvgEscapedText -Text $Title
+
+    $Svg = New-Object System.Collections.Generic.List[string]
+    $Svg.Add(('<?xml version="1.0" encoding="UTF-8"?>'))
+    $Svg.Add(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $Width, $Height))
+    $Svg.Add('<rect width="100%" height="100%" fill="#111827"/>')
+    $Svg.Add(('<text x="32" y="42" fill="#f9fafb" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">{0}</text>' -f $EscapedTitle))
+    $Svg.Add('<text x="32" y="68" fill="#9ca3af" font-family="Segoe UI, Arial, sans-serif" font-size="14">llama-bench throughput, tokens per second. Higher is better.</text>')
+    $Svg.Add(('<line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#374151" stroke-width="1"/>' -f ($Left - 12), ($Top - 18), ($Height - $Bottom + 8)))
+
+    for ($Index = 0; $Index -lt $ChartRows.Count; $Index++) {
+        $Row = $ChartRows[$Index]
+        $Y = $Top + ($Index * $RowHeight)
+        $BarWidth = [Math]::Max(2, [Math]::Round(([double]$Row.Speed / $MaxSpeed) * $BarMaxWidth))
+        $Label = ConvertTo-SvgEscapedText -Text (Get-FitText -Text ([string]$Row.Label) -Width 48)
+        $SpeedLabel = ConvertTo-SvgEscapedText -Text (("{0:N2} t/s" -f [double]$Row.Speed))
+        $Fill = if ($Index -eq 0) { "#22c55e" } elseif ($Index -lt 3) { "#38bdf8" } else { "#60a5fa" }
+        $Svg.Add(('<text x="32" y="{0}" fill="#d1d5db" font-family="Segoe UI, Arial, sans-serif" font-size="13">{1}</text>' -f ($Y + 15), $Label))
+        $Svg.Add(('<rect x="{0}" y="{1}" width="{2}" height="{3}" rx="4" fill="{4}"/>' -f $Left, $Y, $BarWidth, $BarHeight, $Fill))
+        $Svg.Add(('<text x="{0}" y="{1}" fill="#f9fafb" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">{2}</text>' -f ($Left + $BarWidth + 10), ($Y + 15), $SpeedLabel))
+    }
+
+    $Svg.Add(('<text x="32" y="{0}" fill="#6b7280" font-family="Segoe UI, Arial, sans-serif" font-size="12">Generated by easy_llamacpp Benchmark UI.</text>' -f ($Height - 24)))
+    $Svg.Add('</svg>')
+    $Svg | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+    return $OutputPath
+}
+
+function Show-BenchmarkFlow {
+    param([string]$IndexPath)
+
+    $BenchPath = Resolve-FirstExistingPath -Candidates $BenchExeCandidates
+    if ([string]::IsNullOrWhiteSpace($BenchPath)) {
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "效能測試" -EnglishText "Benchmark") -Subtitle (Format-BilingualText -ChineseText "找不到 llama-bench.exe。" -EnglishText "llama-bench.exe was not found.")
+        Write-BilingualField -ChineseLabel "期待路徑" -EnglishLabel "Expected" -ChineseValue $BenchExe -EnglishValue $BenchExe -ForegroundColor Yellow
+        Wait-MenuContinue
+        return
+    }
+
+    $ModelEntry = Select-ModelEntry -IndexPath $IndexPath -CurrentModelPath $ModelPath
+    if (-not $ModelEntry) {
+        return
+    }
+
+    $Mode = Get-BenchmarkModeMenu
+    if (-not $Mode -or $Mode -eq "Back") {
+        return
+    }
+
+    $Definition = Get-BenchmarkModeDefinition -Mode $Mode -ModelPath ([string]$ModelEntry.path) -ModelEntry $ModelEntry
+    if (-not $Definition -or [string]::IsNullOrWhiteSpace([string]$Definition.Executable)) {
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "效能測試" -EnglishText "Benchmark") -Subtitle (Format-BilingualText -ChineseText "這個測試模式目前無法執行。" -EnglishText "This benchmark preset cannot run right now.")
+        Wait-MenuContinue
+        return
+    }
+
+    Show-MenuHeader -Title $Definition.Title -Subtitle $Definition.Description
+    Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue ([string]$ModelEntry.name) -EnglishValue ([string]$ModelEntry.name)
+    Write-BilingualField -ChineseLabel "工具" -EnglishLabel "Tool" -ChineseValue ([string]$Definition.Executable) -EnglishValue ([string]$Definition.Executable)
+    if ($Definition.PSObject.Properties["ModelCard"] -and $Definition.ModelCard) {
+        Write-BilingualField -ChineseLabel "估算" -EnglishLabel "Estimate" -ChineseValue (Format-BenchmarkModelCardSummary -Card $Definition.ModelCard) -EnglishValue (Format-BenchmarkModelCardSummary -Card $Definition.ModelCard) -ForegroundColor Cyan
+    }
+    $CommandLine = "& {0} {1}" -f (ConvertTo-PowerShellCommandToken -Value ([string]$Definition.Executable)), ((@($Definition.Arguments) | ForEach-Object { ConvertTo-PowerShellCommandToken -Value ([string]$_) }) -join " ")
+    Write-WrappedInfoLine -Prefix "CMD : " -Text $CommandLine -PrefixColor Cyan -TextColor Green
+    Write-Host ""
+    Write-Host (Format-BilingualText -ChineseText "按 Enter 開始；Esc 取消。" -EnglishText "Press Enter to start; Esc cancels.") -ForegroundColor Yellow
+    $Key = Read-ConsoleKey
+    if ($Key.VirtualKeyCode -eq 27) {
+        return
+    }
+
+    Show-MenuHeader -Title $Definition.Title -Subtitle (Format-BilingualText -ChineseText "正在執行 benchmark，這可能需要一點時間。" -EnglishText "Benchmark is running; this may take a while.")
+    $StartedAt = Get-Date
+    $Result = if ($Definition.PSObject.Properties["ProgressiveBatchSweep"] -and [bool]$Definition.ProgressiveBatchSweep) {
+        Invoke-ProgressiveBatchBenchmark -Definition $Definition
+    }
+    else {
+        Invoke-CapturedProcess -FilePath ([string]$Definition.Executable) -Arguments @($Definition.Arguments)
+    }
+    $FinishedAt = Get-Date
+
+    if (-not (Test-Path -LiteralPath $LogRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
+    }
+    $LogPath = Join-Path $LogRoot ("bench-{0}-{1}.md" -f ([string]$Mode).ToLowerInvariant(), ($StartedAt.ToString("yyyyMMdd-HHmmss")))
+    $ChartPath = Join-Path $LogRoot ("bench-{0}-{1}.svg" -f ([string]$Mode).ToLowerInvariant(), ($StartedAt.ToString("yyyyMMdd-HHmmss")))
+    $ChartRows = Get-LlamaBenchChartRows -MarkdownOutput ([string]$Result.StdOut)
+    $ExportedChartPath = Export-BenchmarkBarChartSvg -Rows $ChartRows -Title ([string]$Definition.Title) -OutputPath $ChartPath
+    $LogLines = New-Object System.Collections.Generic.List[string]
+    $LogLines.Add("# llama.cpp Benchmark")
+    $LogLines.Add("")
+    $LogLines.Add(("- Mode: {0}" -f [string]$Definition.Title))
+    $LogLines.Add(("- Model: {0}" -f [string]$ModelEntry.name))
+    $LogLines.Add(("- Path: {0}" -f (Resolve-ModelPath -Path ([string]$ModelEntry.path))))
+    $LogLines.Add(("- Started: {0}" -f $StartedAt.ToString("o")))
+    $LogLines.Add(("- Finished: {0}" -f $FinishedAt.ToString("o")))
+    $LogLines.Add(("- ExitCode: {0}" -f $Result.ExitCode))
+    if ($Definition.PSObject.Properties["ModelCard"] -and $Definition.ModelCard) {
+        $LogLines.Add(("- Estimate: {0}" -f (Format-BenchmarkModelCardSummary -Card $Definition.ModelCard)))
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$ExportedChartPath)) {
+        $LogLines.Add(("- Chart: {0}" -f [string]$ExportedChartPath))
+    }
+    $LogLines.Add("")
+    $LogLines.Add('```powershell')
+    $LogLines.Add($CommandLine)
+    $LogLines.Add('```')
+    $LogLines.Add("")
+    if (-not [string]::IsNullOrWhiteSpace($Result.StdOut)) {
+        $LogLines.Add("## Output")
+        $LogLines.Add("")
+        $LogLines.Add($Result.StdOut.TrimEnd())
+        $LogLines.Add("")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Result.StdErr)) {
+        $LogLines.Add("## Error / Backend Info")
+        $LogLines.Add("")
+        $LogLines.Add('```text')
+        $LogLines.Add($Result.StdErr.TrimEnd())
+        $LogLines.Add('```')
+        $LogLines.Add("")
+    }
+    $LogLines | Set-Content -LiteralPath $LogPath -Encoding UTF8
+
+    Show-MenuHeader -Title $Definition.Title -Subtitle (Format-BilingualText -ChineseText "Benchmark 完成。" -EnglishText "Benchmark completed.")
+    Write-BilingualField -ChineseLabel "結果" -EnglishLabel "Result" -ChineseValue $(if ($Result.ExitCode -eq 0) { "完成" } else { "結束碼 $($Result.ExitCode)" }) -EnglishValue $(if ($Result.ExitCode -eq 0) { "completed" } else { "exit code $($Result.ExitCode)" }) -ForegroundColor $(if ($Result.ExitCode -eq 0) { "Green" } else { "Yellow" })
+    Write-BilingualField -ChineseLabel "記錄檔" -EnglishLabel "Log" -ChineseValue $LogPath -EnglishValue $LogPath -ForegroundColor Cyan
+    if (-not [string]::IsNullOrWhiteSpace([string]$ExportedChartPath)) {
+        Write-BilingualField -ChineseLabel "長條圖" -EnglishLabel "Chart" -ChineseValue ([string]$ExportedChartPath) -EnglishValue ([string]$ExportedChartPath) -ForegroundColor Cyan
+    }
+    elseif ($Result.ExitCode -eq 0) {
+        Write-BilingualField -ChineseLabel "長條圖" -EnglishLabel "Chart" -ChineseValue "未偵測到可繪圖的 t/s 表格" -EnglishValue "no drawable t/s table detected" -ForegroundColor Yellow
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Result.StdOut)) {
+        Write-Host ""
+        Write-Host ($Result.StdOut.TrimEnd()) -ForegroundColor Gray
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Result.StdErr)) {
+        Write-Host ""
+        Write-Host (Format-BilingualText -ChineseText "後端資訊 / 錯誤輸出已寫入記錄檔。" -EnglishText "Backend info / stderr was written to the log file.") -ForegroundColor DarkGray
+    }
+    Wait-MenuContinue
+}
+
 function Show-MainLauncherMenu {
     $Options = @(
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "快速啟動" -EnglishText "Quick Start"; Description = Format-BilingualText -ChineseText "先選模型，再選背景服務或 Web UI。" -EnglishText "Pick a model, then choose background service or Web UI."; Value = "QuickStart" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch"; Description = Format-BilingualText -ChineseText "先選模型，再編輯參數矩陣後啟動。" -EnglishText "Pick a model, edit a parameter matrix, then start."; Value = "TuneLaunch" },
+        [pscustomobject]@{ Name = Format-BilingualText -ChineseText "效能測試" -EnglishText "Benchmark"; Description = Format-BilingualText -ChineseText "用懶人模式跑 llama-bench，測速度、長上下文或批次甜點。" -EnglishText "Run llama-bench with easy presets for speed, long context, or batch sweet spots."; Value = "Benchmark" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "服務狀態" -EnglishText "Server Status"; Description = Format-BilingualText -ChineseText "顯示追蹤中的服務狀態、執行參數與 GPU 卸載摘要。" -EnglishText "Show tracked server status, runtime settings, and GPU offload summary."; Value = "Status" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "維護" -EnglishText "Maintenance"; Description = Format-BilingualText -ChineseText "刪除已儲存設定檔，或修改模型掃描路徑。" -EnglishText "Delete saved profiles or edit model scan paths."; Value = "Maintenance" },
         [pscustomobject]@{ Name = Format-BilingualText -ChineseText "停止目前服務" -EnglishText "Stop Running Server"; Description = Format-BilingualText -ChineseText "停止目前被追蹤的 llama.cpp 服務。" -EnglishText "Stop the currently tracked llama.cpp server."; Value = "Stop" },
@@ -6954,6 +7917,43 @@ function Export-SavedLaunchProfileCommandFile {
     }
 }
 
+function Export-LaunchConfigCommandFile {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $ResolvedModelPath = Resolve-ModelPath -Path ([string]$Config.ModelPath)
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath) -or -not (Test-Path -LiteralPath $ResolvedModelPath -PathType Leaf)) {
+        throw (Format-BilingualText -ChineseText "目前頁面缺少有效模型路徑，無法輸出一鍵啟動檔。" -EnglishText "The current page has no valid model path, so a one-shot launcher file cannot be exported.")
+    }
+
+    $ExportRoot = Join-Path $ScriptRoot "exports\profiles"
+    if (-not (Test-Path -LiteralPath $ExportRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $ExportRoot -Force | Out-Null
+    }
+
+    $BaseName = if (-not [string]::IsNullOrWhiteSpace([string]$Config.ProfileName)) {
+        [string]$Config.ProfileName
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$Config.ModelName)) {
+        [string]$Config.ModelName
+    }
+    else {
+        [System.IO.Path]::GetFileNameWithoutExtension($ResolvedModelPath)
+    }
+
+    $SafeName = ConvertTo-SafeCommandFileName -Value ("{0}_{1}" -f $BaseName, (Get-Date).ToString("yyyyMMdd-HHmmss"))
+    $OutputPath = Join-Path $ExportRoot ("start_{0}.cmd" -f $SafeName)
+    $Content = New-ProfileCommandFileContent -Config $Config -ProfileName $BaseName
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($OutputPath, $Content, $Utf8NoBom)
+
+    return [pscustomobject]@{
+        Path              = $OutputPath
+        ResolvedModelPath = $ResolvedModelPath
+    }
+}
+
 function Show-SavedLaunchProfileCommandExport {
     param(
         [string]$IndexPath
@@ -7174,7 +8174,8 @@ function Show-MaintenanceFlow {
 function New-LaunchConfig {
     param(
         $ModelEntry,
-        [System.Collections.IDictionary]$ForwardConfig
+        [System.Collections.IDictionary]$ForwardConfig,
+        [switch]$ApplyTuneDefault
     )
 
     if (-not $ForwardConfig) {
@@ -7205,6 +8206,7 @@ function New-LaunchConfig {
         TopK              = [string]$ForwardConfig.TopK
         TopP              = [string]$ForwardConfig.TopP
         MinP              = [string]$ForwardConfig.MinP
+        PresencePenalty   = [string]$ForwardConfig.PresencePenalty
         Host              = if ($ForwardConfig.Host) { [string]$ForwardConfig.Host } else { "127.0.0.1" }
         Metrics           = [bool]$ForwardConfig.Metrics
         ApiKey            = [string]$ForwardConfig.ApiKey
@@ -7225,6 +8227,12 @@ function New-LaunchConfig {
     Sync-LaunchConfigReasoningFields -Config $Config
     Sync-LaunchConfigMtpFields -Config $Config
     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $ModelIndexPath
+    if ($ApplyTuneDefault) {
+        $TuneDefault = Get-SavedLaunchDefaultForModel -ModelPath ([string]$Config.ModelPath)
+        if ($TuneDefault) {
+            Apply-SavedLaunchProfileToConfig -Config $Config -Profile $TuneDefault -IndexPath $ModelIndexPath
+        }
+    }
     return $Config
 }
 
@@ -7249,10 +8257,11 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數；Gemma 4 MTP 預設 4，其他 MTP 預設 2" -EnglishText "positive integer; Gemma 4 MTP defaults to 4, other MTP defaults to 2") },
         [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
         [pscustomobject]@{ Key = "Slots"; Label = "Slots"; Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空使用 1；多請求才調高" -EnglishText "blank uses 1; raise only for concurrent requests") },
-        [pscustomobject]@{ Key = "Temperature"; Label = "Temp"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.3" -EnglishText "blank uses the default; example: 0.3") },
+        [pscustomobject]@{ Key = "Temperature"; Label = "Temp"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 1.0" -EnglishText "blank uses the default; example: 1.0") },
         [pscustomobject]@{ Key = "TopK"; Label = "Top K"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 20" -EnglishText "blank uses the default; example: 20") },
         [pscustomobject]@{ Key = "TopP"; Label = "Top P"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.95" -EnglishText "blank uses the default; example: 0.95") },
-        [pscustomobject]@{ Key = "MinP"; Label = "Min P"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0" -EnglishText "blank uses the default; example: 0") },
+        [pscustomobject]@{ Key = "MinP"; Label = "Min P"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.00" -EnglishText "blank uses the default; example: 0.00") },
+        [pscustomobject]@{ Key = "PresencePenalty"; Label = "Presence Penalty"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 1.5" -EnglishText "blank uses the default; example: 1.5") },
         [pscustomobject]@{ Key = "Host"; Label = "Host"; Type = "text"; Hint = "127.0.0.1 or 0.0.0.0" },
         [pscustomobject]@{ Key = "Metrics"; Label = "Metrics"; Type = "bool" },
         [pscustomobject]@{ Key = "ApiKey"; Label = "API Key"; Type = "text" },
@@ -7264,6 +8273,8 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "ExtraArgs"; Label = (Format-BilingualText -ChineseText "額外參數" -EnglishText "Extra Args"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空代表不加額外參數" -EnglishText "blank means no extra args") },
         [pscustomobject]@{ Key = "ApplyAutoTune"; Label = (Format-BilingualText -ChineseText "套用自動調校學習值" -EnglishText "Apply Auto Tune Learned Values"); Type = "actionAutoTuneApply" },
         [pscustomobject]@{ Key = "SaveProfile"; Label = (Format-BilingualText -ChineseText "儲存設定檔" -EnglishText "Save Profile"); Type = "actionSave" },
+        [pscustomobject]@{ Key = "ExportProfile"; Label = (Format-BilingualText -ChineseText "輸出設定檔" -EnglishText "Export Profile"); Type = "actionExportProfile" },
+        [pscustomobject]@{ Key = "SaveDefault"; Label = (Format-BilingualText -ChineseText "儲存預設值" -EnglishText "Save Defaults"); Type = "actionSaveDefault" },
         [pscustomobject]@{ Key = "ExportCommand"; Label = (Format-BilingualText -ChineseText "輸出啟動命令" -EnglishText "Export Launch Command"); Type = "actionExportCommand" },
         [pscustomobject]@{ Key = "Start"; Label = (Format-BilingualText -ChineseText "開始啟動" -EnglishText "Start Launch"); Type = "actionStart" },
         [pscustomobject]@{ Key = "Back"; Label = (Format-BilingualText -ChineseText "返回" -EnglishText "Back"); Type = "actionBack" }
@@ -7300,10 +8311,11 @@ function Get-LaunchConfigDefaultText {
         "SpecDraftNMax" { return Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
         "Slots" { return ("{0} active request slot" -f $FixedLlamaServerParallelSlots) }
-        "Temperature" { return "0.3" }
+        "Temperature" { return "1.0" }
         "TopK" { return "20" }
         "TopP" { return "0.95" }
-        "MinP" { return "0" }
+        "MinP" { return "0.00" }
+        "PresencePenalty" { return "1.5" }
         "ApiKey" { return "none" }
         "Device" { return "auto" }
         "SplitMode" { return "llama.cpp default" }
@@ -7436,6 +8448,13 @@ function Get-LaunchConfigValueText {
 
             return [string]$Config.MinP
         }
+        "PresencePenalty" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.PresencePenalty)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.PresencePenalty
+        }
         "ApiKey" {
             if ([string]::IsNullOrWhiteSpace($Config.ApiKey)) {
                 return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
@@ -7466,6 +8485,8 @@ function Get-LaunchConfigValueText {
         }
         "ApplyAutoTune" { return (Format-BilingualText -ChineseText "按 Enter 套用" -EnglishText "Press Enter to apply") }
         "SaveProfile" { return (Format-BilingualText -ChineseText "儲存目前設定" -EnglishText "Save current settings") }
+        "ExportProfile" { return (Format-BilingualText -ChineseText "輸出成 .cmd" -EnglishText "Export as .cmd") }
+        "SaveDefault" { return (Format-BilingualText -ChineseText "設為此模型的微調預設" -EnglishText "Set as this model's tuning default") }
         "ExportCommand" { return (Format-BilingualText -ChineseText "按 Enter 輸出" -EnglishText "Press Enter to export") }
         "Start" { return "Launch now" }
         "Back" { return "Return" }
@@ -7607,7 +8628,7 @@ function Get-LaunchConfigItemHelp {
         "Temperature" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "控制採樣溫度，決定輸出要保守還是更發散。" -EnglishText "Controls sampling temperature, which shifts output between conservative and more varied behavior."
-                Recommendation = Format-BilingualText -ChineseText "先從 `0.3` 開始。要更穩定就往下調；要更有變化再慢慢往上加，不要一次拉太高。" -EnglishText "Start at 0.3. Lower it for more stable output, or raise it gradually when you want more variation."
+                Recommendation = Format-BilingualText -ChineseText "先從 `1.0` 開始。要更穩定就往下調；要更有變化再慢慢往上加，不要一次拉太高。" -EnglishText "Start at 1.0. Lower it for more stable output, or raise it gradually when you want more variation."
             }
         }
         "TopK" {
@@ -7625,7 +8646,13 @@ function Get-LaunchConfigItemHelp {
         "MinP" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定最小機率門檻，用來過濾過低機率的候選 token。" -EnglishText "Sets a minimum probability threshold that filters out very low-probability token candidates."
-                Recommendation = Format-BilingualText -ChineseText "先維持 `0`。只有你已經確認模型會亂飄，才再逐步往上調。" -EnglishText "Keep this at 0 initially. Raise it gradually only after confirming the model is drifting too much."
+                Recommendation = Format-BilingualText -ChineseText "先維持 `0.00`。只有你已經確認模型會亂飄，才再逐步往上調。" -EnglishText "Keep this at 0.00 initially. Raise it gradually only after confirming the model is drifting too much."
+            }
+        }
+        "PresencePenalty" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "提高已出現內容再次出現的成本，降低重複貼近同一主題或句型的機率。" -EnglishText "Raises the cost of already-present content so responses are less likely to repeat the same topic or phrasing."
+                Recommendation = Format-BilingualText -ChineseText "先從 `1.5` 開始。若回答變得太跳或漏掉必要重述，再往下調。" -EnglishText "Start with 1.5. Lower it if responses become too jumpy or avoid necessary restatement."
             }
         }
         "Host" {
@@ -7692,6 +8719,18 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "把目前頁面上的設定存成可重用的自訂設定檔。" -EnglishText "Saves the current page settings as a reusable custom profile."
                 Recommendation = Format-BilingualText -ChineseText "建議用清楚的名稱，例如模型用途、量化版本或顯卡配置。之後在 Quick Start 就能直接挑這個設定檔來啟動。" -EnglishText "Use a clear name such as the model purpose, quant, or GPU layout. After saving, Quick Start can launch directly with this profile."
+            }
+        }
+        "ExportProfile" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "把目前頁面上的設定直接輸出成可雙擊的一鍵啟動 `.cmd`。" -EnglishText "Exports the current page settings directly as a double-click one-shot `.cmd` launcher."
+                Recommendation = Format-BilingualText -ChineseText "適合把這次調好的設定放到桌面或排程使用；它會走 Start_LCPP.ps1 包裝器，因此保留自動 fit、vision 與 MTP sidecar 邏輯。" -EnglishText "Use this for desktop shortcuts or scheduled runs; it goes through the Start_LCPP.ps1 wrapper, preserving auto-fit, vision, and MTP sidecar behavior."
+            }
+        }
+        "SaveDefault" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "把目前頁面上的設定設為此模型的微調預設值；下次進入這個模型的 Tune And Launch 時會自動帶入。" -EnglishText "Sets the current page settings as this model's tuning defaults; the next Tune And Launch for this model opens with them already applied."
+                Recommendation = Format-BilingualText -ChineseText "適合保存你希望每次調校這個模型時一開始就看到的基準值。這不會新增 Quick Start 設定檔，也不需要設定檔名稱。" -EnglishText "Use this for the baseline values you want to see whenever tuning this model. It does not add a Quick Start profile and does not need a profile name."
             }
         }
         "ExportCommand" {
@@ -7766,6 +8805,10 @@ function Edit-LaunchConfigItem {
                 Sync-LaunchConfigMtpFields -Config $Config
                 if ([string]$Config.VisionSelectionMode -eq "auto") {
                     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $IndexPath
+                }
+                $TuneDefault = Get-SavedLaunchDefaultForModel -ModelPath ([string]$Config.ModelPath)
+                if ($TuneDefault) {
+                    Apply-SavedLaunchProfileToConfig -Config $Config -Profile $TuneDefault -IndexPath $IndexPath
                 }
             }
         }
@@ -7847,6 +8890,12 @@ function Edit-LaunchConfigItem {
                 [double]$ParsedMinP = 0
                 if (-not [double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$ParsedMinP) -or $ParsedMinP -lt 0 -or $ParsedMinP -gt 1) {
                     throw "Min P must be blank or a number between 0 and 1."
+                }
+            }
+            if ($Item.Key -eq "PresencePenalty" -and -not [string]::IsNullOrWhiteSpace($Value)) {
+                [double]$ParsedPresencePenalty = 0
+                if (-not [double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$ParsedPresencePenalty)) {
+                    throw "Presence Penalty must be blank or a number."
                 }
             }
             $Config[$Item.Key] = $Value
@@ -8047,6 +9096,7 @@ function Get-LlamaServerArgsFromLaunchConfig {
         $MtpDefaultSpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value $MtpDefaultSpecDraftNMax
+        Add-Gemma4MtpDraftModelDefault -TargetArguments $Arguments -UserArguments $CombinedArgs -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-fa|--flash-attn)(?:=|$)') -Flag "--flash-attn" -Value "on"
         if (Test-IsQwen36MtpModel -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath) {
             Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctk|--cache-type-k)(?:=|$)') -Flag "--cache-type-k" -Value "q8_0"
@@ -8143,6 +9193,20 @@ function Show-LaunchConfigCommandExport {
     catch {
     }
 
+    Write-Host (Format-BilingualText -ChineseText "按 Enter 返回調校頁面..." -EnglishText "Press Enter to return to tune page...") -ForegroundColor Yellow
+    Read-Host | Out-Null
+}
+
+function Show-LaunchConfigProfileExport {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $Export = Export-LaunchConfigCommandFile -Config $Config
+    Write-Host ""
+    Write-Host (Format-BilingualText -ChineseText "已輸出一鍵啟動設定檔。" -EnglishText "One-shot profile launcher exported.") -ForegroundColor Green
+    Write-BilingualField -ChineseLabel "檔案" -EnglishLabel "File" -ChineseValue ([string]$Export.Path) -EnglishValue ([string]$Export.Path) -ForegroundColor Cyan
+    Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue ([string]$Export.ResolvedModelPath) -EnglishValue ([string]$Export.ResolvedModelPath)
     Write-Host (Format-BilingualText -ChineseText "按 Enter 返回調校頁面..." -EnglishText "Press Enter to return to tune page...") -ForegroundColor Yellow
     Read-Host | Out-Null
 }
@@ -8267,6 +9331,31 @@ function Show-LaunchConfigGrid {
                     }
                     continue
                 }
+                if ($SelectedItem.Type -eq "actionExportProfile") {
+                    try {
+                        Show-LaunchConfigProfileExport -Config $Config
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
+                if ($SelectedItem.Type -eq "actionSaveDefault") {
+                    try {
+                        $SaveResult = Save-SavedLaunchDefault -Config $Config
+                        Write-Host ""
+                        Write-Host (Format-BilingualText -ChineseText ("已儲存此模型的微調預設值：{0}" -f $SaveResult.ModelName) -EnglishText ("Saved tuning defaults for this model: {0}" -f $SaveResult.ModelName)) -ForegroundColor Green
+                        Start-Sleep -Seconds 1
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
                 if ($SelectedItem.Type -eq "actionExportCommand") {
                     Show-LaunchConfigCommandExport -Config $Config
                     continue
@@ -8312,6 +9401,31 @@ function Show-LaunchConfigGrid {
                             Write-Host (Format-BilingualText -ChineseText ("已儲存設定檔：{0}" -f $SaveResult.Name) -EnglishText ("Saved profile: {0}" -f $SaveResult.Name)) -ForegroundColor Green
                             Start-Sleep -Seconds 1
                         }
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
+                if ($SelectedItem.Type -eq "actionExportProfile") {
+                    try {
+                        Show-LaunchConfigProfileExport -Config $Config
+                    }
+                    catch {
+                        Write-Host ""
+                        Write-Host $_.Exception.Message -ForegroundColor Red
+                        Start-Sleep -Seconds 1
+                    }
+                    continue
+                }
+                if ($SelectedItem.Type -eq "actionSaveDefault") {
+                    try {
+                        $SaveResult = Save-SavedLaunchDefault -Config $Config
+                        Write-Host ""
+                        Write-Host (Format-BilingualText -ChineseText ("已儲存此模型的微調預設值：{0}" -f $SaveResult.ModelName) -EnglishText ("Saved tuning defaults for this model: {0}" -f $SaveResult.ModelName)) -ForegroundColor Green
+                        Start-Sleep -Seconds 1
                     }
                     catch {
                         Write-Host ""
@@ -8538,7 +9652,7 @@ function Invoke-InteractiveLauncher {
                 }
 
                 $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $LlamaArgs
-                $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig
+                $Config = New-LaunchConfig -ModelEntry $ModelEntry -ForwardConfig $ForwardConfig -ApplyTuneDefault
                 if ($Config.LaunchMode -eq "Open Web UI" -and $Config.OpenPath -eq "/v1/models") {
                     $Config.OpenPath = "/"
                 }
@@ -8550,6 +9664,9 @@ function Invoke-InteractiveLauncher {
 
                 Apply-LaunchSelection -Config $EditedConfig
                 return $true
+            }
+            "Benchmark" {
+                Show-BenchmarkFlow -IndexPath $IndexPath
             }
             "Status" {
                 Show-LiveServerStatusView
@@ -10246,7 +11363,7 @@ function Show-ServerStatus {
             $TrackedModelPath = Resolve-ModelPath -Path $TrackedSettings.ModelPath
         }
         $TrackedPort = if ($TrackedSettings -and $TrackedSettings.Port -match '^\d+$') { [int]$TrackedSettings.Port } else { $Port }
-        $TrackedBaseUrl = "http://127.0.0.1:$TrackedPort"
+        $TrackedBaseUrl = "http://localhost:$TrackedPort"
         $TrackedRuntimeProperties = Get-TrackedServerRuntimeProperties -ServerBaseUrl $TrackedBaseUrl
         $TrackedGpuOffloadInfo = Get-GpuOffloadInfo -Process $TrackedProcess
         $TrackedTokenSnapshot = Get-LlamaRuntimeTokenSnapshot -LogPath $TrackedLogPaths.StdErrLog
@@ -10262,11 +11379,11 @@ function Show-ServerStatus {
             Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue $TrackedModelPath -EnglishValue $TrackedModelPath
         }
         if ($TrackedRuntimeProperties -and -not [string]::IsNullOrWhiteSpace([string]$TrackedRuntimeProperties.model_alias)) {
-            Write-BilingualField -ChineseLabel "別名" -EnglishLabel "Alias" -ChineseValue ("{0}（執行期模型別名）" -f $TrackedRuntimeProperties.model_alias) -EnglishValue ("{0} (runtime model alias)" -f $TrackedRuntimeProperties.model_alias)
+            Write-BilingualField -ChineseLabel "別名" -EnglishLabel "Alias" -ChineseValue ("{0}（執行期模型別名）" -f $TrackedRuntimeProperties.model_alias) -EnglishValue ("{0} (runtime model alias)" -f $TrackedRuntimeProperties.model_alias) -ForegroundColor Cyan
         }
         if ($TrackedSettings) {
             $GenerationSettings = Get-TrackedServerGenerationSettings -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties
-            Write-BilingualField -ChineseLabel "上下文" -EnglishLabel "Ctx" -ChineseValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties) -EnglishValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties)
+            Write-BilingualField -ChineseLabel "上下文" -EnglishLabel "Ctx" -ChineseValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties) -EnglishValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties) -ForegroundColor Cyan
             if ($TrackedTokenSnapshot) {
                 $TokenValue = Format-TrackedServerTokenUsageValue -TokenSnapshot $TrackedTokenSnapshot -RuntimeProperties $TrackedRuntimeProperties
                 Write-BilingualField -ChineseLabel "Token" -EnglishLabel "Tokens" -ChineseValue ("{0}，llama.cpp 最近一次看到的真實提示詞" -f $TokenValue) -EnglishValue ("{0} last real prompt seen by llama.cpp" -f $TokenValue)
@@ -10317,14 +11434,15 @@ function Show-ServerStatus {
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ReasoningBudget)) {
                 Write-BilingualField -ChineseLabel "思考預算" -EnglishLabel "Budget" -ChineseValue ("{0}，思考 token 預算（--reasoning-budget）" -f $TrackedSettings.ReasoningBudget) -EnglishValue ("{0} thinking token budget (--reasoning-budget)" -f $TrackedSettings.ReasoningBudget)
             }
-            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecType)) {
-                Write-BilingualField -ChineseLabel "MTP" -EnglishLabel "MTP" -ChineseValue ("{0}，推測式解碼模式（--spec-type）" -f $TrackedSettings.SpecType) -EnglishValue ("{0} speculative decoding mode (--spec-type)" -f $TrackedSettings.SpecType)
-            }
+            $MtpStatusText = if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecType)) { [string]$TrackedSettings.SpecType } else { "off / server default" }
+            $MtpColor = if ($MtpStatusText -match '(^|,)draft-mtp(,|$)') { "Green" } else { "Yellow" }
+            Write-BilingualField -ChineseLabel "MTP" -EnglishLabel "MTP" -ChineseValue ("{0}，推測式解碼模式（--spec-type）" -f $MtpStatusText) -EnglishValue ("{0} speculative decoding mode (--spec-type)" -f $MtpStatusText) -ForegroundColor $MtpColor
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftNMax)) {
                 Write-BilingualField -ChineseLabel "草稿 Token 上限" -EnglishLabel "Draft" -ChineseValue ("{0}，最大推測 token 數（--spec-draft-n-max）" -f $TrackedSettings.SpecDraftNMax) -EnglishValue ("{0} max speculative tokens (--spec-draft-n-max)" -f $TrackedSettings.SpecDraftNMax)
             }
             $FlashAttention2Value = Format-TrackedServerSettingValue -Value $TrackedSettings.FlashAttention2 -WhenMissing 'server default'
-            Write-BilingualField -ChineseLabel "FlashAttn2" -EnglishLabel "FlashAttn2" -ChineseValue ("{0}，Flash Attention 2 模式（--flash-attn）" -f $FlashAttention2Value) -EnglishValue ("{0} Flash Attention 2 mode (--flash-attn)" -f $FlashAttention2Value)
+            $FlashAttention2Color = if ($FlashAttention2Value -match '^(on|true|1)$') { "Green" } elseif ($FlashAttention2Value -match '^(off|false|0)$') { "Yellow" } else { "Cyan" }
+            Write-BilingualField -ChineseLabel "FlashAttn2" -EnglishLabel "FlashAttn2" -ChineseValue ("{0}，Flash Attention 2 模式（--flash-attn）" -f $FlashAttention2Value) -EnglishValue ("{0} Flash Attention 2 mode (--flash-attn)" -f $FlashAttention2Value) -ForegroundColor $FlashAttention2Color
             Write-BilingualField -ChineseLabel "監控指標" -EnglishLabel "Metrics" -ChineseValue $(if ($TrackedSettings.Metrics) { "開啟（Prometheus /metrics 端點）" } else { "關閉（Prometheus /metrics 端點）" }) -EnglishValue $(if ($TrackedSettings.Metrics) { "on (Prometheus /metrics endpoint)" } else { "off (Prometheus /metrics endpoint)" })
             if ($TrackedSettings.ApiKey) {
                 Write-BilingualField -ChineseLabel "API 金鑰" -EnglishLabel "API Key" -ChineseValue "已設定（已啟用請求驗證）" -EnglishValue "set (request authentication enabled)"
@@ -10490,7 +11608,7 @@ try {
     $ResolvedThreads = Resolve-RequestedThreads -RequestedThreads $RawThreads -RequestedThreadsBatch $RawThreadsBatch
     $Threads = $ResolvedThreads.Threads
     $ThreadsBatch = $ResolvedThreads.ThreadsBatch
-    $BaseUrl = "http://127.0.0.1:$Port"
+    $BaseUrl = "http://localhost:$Port"
 
     Write-Host (Format-BilingualText -ChineseText "正在檢查檔案..." -EnglishText "Checking files...") -ForegroundColor Cyan
 

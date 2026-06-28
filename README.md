@@ -246,8 +246,14 @@ The first screen provides these main entry points:
   Pick a model, then choose `Background Service` or `Open Web UI`. If that model already has saved custom profiles, Quick Start shows them first so you can launch with one directly.
 
 - `Tune And Launch`
-  先選模型，再進入可用鍵盤操作的參數矩陣畫面。用方向鍵移動，按 `Enter` 或 `Space` 編輯目前格子。矩陣裡包含 `GPU Layers`、`Repeating Layers`、`Reasoning`、`Think Level`、`MTP`、`SPEC_DRAFT_N_MAX`、`Context Size`，以及可直接調整的 `Temp`、`Top K`、`Top P`、`Min P`，再加上 `Auto Tune`、`Apply Auto Tune Learned Values` 和 `Save Profile` 動作。當你用方向鍵移動高亮欄位時，畫面下方會同步顯示該選項的功能與建議數值，方便直接在選單裡判斷要不要改。`Auto Tune` 開啟後，腳本會在這次啟動真的完整塞進 GPU 且 VRAM 使用率接近目標時，把學到的參數寫進 `model-tuning.json`；`Apply Auto Tune Learned Values` 可以把匹配到的 learned profile 直接轉成這一頁的明確設定；而 `Save Profile` 會把你目前這一頁的手動設定存進 `launch-profiles.json`，供之後在 Quick Start 直接套用。  
-  Pick a model, then open a keyboard-driven parameter matrix. Use arrow keys to move and press `Enter` or `Space` to edit the current cell. The matrix now includes fields such as `GPU Layers`, `Repeating Layers`, `Reasoning`, `Think Level`, `MTP`, `SPEC_DRAFT_N_MAX`, `Context Size`, plus directly adjustable `Temp`, `Top K`, `Top P`, and `Min P`, along with `Auto Tune`, `Apply Auto Tune Learned Values`, and `Save Profile` actions. As you move the highlight with the arrow keys, the bottom panel updates with a plain-language explanation and a recommended starting value for the selected field. When `Auto Tune` is enabled, the script saves learned parameters to `model-tuning.json` after a launch that fully fits on GPU and lands near the target VRAM usage; `Apply Auto Tune Learned Values` can materialize a matching learned profile into explicit values on the current page; `Save Profile` stores the current manual page settings in `launch-profiles.json` so Quick Start can reuse them later.
+  先選模型，再進入可用鍵盤操作的參數矩陣畫面。用方向鍵移動，按 `Enter` 或 `Space` 編輯目前格子。矩陣裡包含 `GPU Layers`、`Repeating Layers`、`Reasoning`、`Think Level`、`MTP`、`SPEC_DRAFT_N_MAX`、`Context Size`，以及可直接調整的 `Temp`、`Top K`、`Top P`、`Min P`、`Presence Penalty`，再加上 `Auto Tune`、`Apply Auto Tune Learned Values`、`Save Profile`、`Export Profile`、`Save Defaults` 動作。當你用方向鍵移動高亮欄位時，畫面下方會同步顯示該選項的功能與建議數值，方便直接在選單裡判斷要不要改。`Auto Tune` 開啟後，腳本會在這次啟動真的完整塞進 GPU 且 VRAM 使用率接近目標時，把學到的參數寫進 `model-tuning.json`；`Apply Auto Tune Learned Values` 可以把匹配到的 learned profile 直接轉成這一頁的明確設定；`Save Profile` 會把目前頁面的手動設定存進 `launch-profiles.json` 供 Quick Start 直接套用；`Export Profile` 會把目前頁面直接輸出成 `exports\profiles\start_<名稱>.cmd`；`Save Defaults` 則會覆寫目前模型的微調預設值，之後每次進入這個模型的 Tune And Launch 都會先顯示這組值。  
+  Pick a model, then open a keyboard-driven parameter matrix. Use arrow keys to move and press `Enter` or `Space` to edit the current cell. The matrix now includes fields such as `GPU Layers`, `Repeating Layers`, `Reasoning`, `Think Level`, `MTP`, `SPEC_DRAFT_N_MAX`, `Context Size`, plus directly adjustable `Temp`, `Top K`, `Top P`, `Min P`, and `Presence Penalty`, along with `Auto Tune`, `Apply Auto Tune Learned Values`, `Save Profile`, `Export Profile`, and `Save Defaults` actions. As you move the highlight with the arrow keys, the bottom panel updates with a plain-language explanation and a recommended starting value for the selected field. When `Auto Tune` is enabled, the script saves learned parameters to `model-tuning.json` after a launch that fully fits on GPU and lands near the target VRAM usage; `Apply Auto Tune Learned Values` can materialize a matching learned profile into explicit values on the current page; `Save Profile` stores the current manual page settings in `launch-profiles.json` so Quick Start can reuse them later; `Export Profile` writes the current page directly to `exports\profiles\start_<name>.cmd`; `Save Defaults` overwrites the current model's tuning defaults so future Tune And Launch sessions for that model open with those values already shown.
+
+- `Benchmark`
+  先選模型，再選一個懶人測試模式，launcher 會自動呼叫 `llama-bench.exe`，把原始結果存到 `logs/bench-*.md`，並另外輸出 `logs/bench-*.svg` 長條圖。`Quick Speed Test` 只測常用的 `pp512` 和 `tg128`；`Long Context Test` 會看 512/2048/8192/16384 prompt 的 prefill 速度；`Batch Sweet Spot` 會先依模型檔名/大小估算本機模型卡，包括參數量、量化、MTP sidecar、支援 CTX 與可用 VRAM，從支援 CTX 的一半開始測；如果起點太高就用 1024 階梯往下找能跑的點，穩定後再用 1024 階梯往上探，並在每輪掃 `ubatch` 256/512/1024，直到最佳 `pp` 明顯下降、實測失敗或碰到估算上限才停止；`CPU/GPU Quick Compare` 會用短測比較 `-ngl 0` 和 `-ngl 99`。表格裡 `pp` 代表 prompt processing / prefill，越高越適合貼長文或 RAG；`tg` 代表 token generation，越高聊天輸出快。  
+  Pick a model, then choose an easy benchmark preset. The launcher runs `llama-bench.exe`, saves the raw result to `logs/bench-*.md`, and also exports an SVG bar chart to `logs/bench-*.svg`. `Quick Speed Test` checks common `pp512` and `tg128`; `Long Context Test` checks 512/2048/8192/16384 prompt prefill speed; `Batch Sweet Spot` first estimates a local model card from filename, file size, quantization, MTP sidecar, supported CTX, and available VRAM. It starts at half of the supported CTX; if that is too high, it downshifts in 1024-token steps, then probes upward in 1024-token steps while sweeping `ubatch` 256/512/1024 until best `pp` clearly drops, a run fails, or the estimated limit is reached; `CPU/GPU Quick Compare` runs a short comparison between `-ngl 0` and `-ngl 99`. In the result table, `pp` means prompt processing / prefill, useful for long prompts and RAG; `tg` means token generation, useful for chat output speed.
+  如果需要覆寫估算值，可以新增 `json/model-cards.json`，用 `id`、`path` 或 `name` 對應模型，並填入 `parameters_b`、`quantization`、`supported_context` 或 `n_ctx_train`。  
+  To override the estimate, create `json/model-cards.json` and match a model by `id`, `path`, or `name`, then provide `parameters_b`, `quantization`, `supported_context`, or `n_ctx_train`.
 
 - `Server Status` / `Stop Running Server` / `llama-server Help`
   常用維護動作也保留在主選單。  
@@ -1221,21 +1227,24 @@ For every supported MTP model, the launcher auto-adds:
 - `--spec-draft-n-max 4` for Gemma 4 MTP, otherwise `2`
 - `--flash-attn on`
 
+Gemma 4 QAT/MTP 若主模型旁邊有 `mtp*.gguf` sidecar，launcher 也會自動補上 `--spec-draft-model <sidecar>`，例如 `mtp-gemma-4-12B-it.gguf`。  
+For Gemma 4 QAT/MTP layouts with a neighboring `mtp*.gguf` sidecar, the launcher also auto-adds `--spec-draft-model <sidecar>`, for example `mtp-gemma-4-12B-it.gguf`.
+
 Qwen3.6 MTP 另外保留原本的專屬預設：  
 Qwen3.6 MTP also keeps its previous model-specific defaults:
 
 - `--cache-type-k q8_0`
 - `--cache-type-v q8_0`
 - `--jinja`
-- `--temp 0.6`
+- `--temp 1.0`
 - `--top-p 0.95`
 - `--top-k 20`
-- `--min-p 0.0`
-- `--presence-penalty 0`
+- `--min-p 0.00`
+- `--presence-penalty 1.5`
 - `--repeat-penalty 1`
 
-這些預設只會套用在偵測為支援 MTP 的 GGUF 上；一般非 MTP GGUF 不會被強行加上 `MTP` 參數，避免啟動失敗。你也仍然可以在命令列後面自己覆寫這些值。  
-These defaults only apply to GGUFs detected as MTP-capable. Regular non-MTP GGUFs are left alone so the launcher does not force incompatible `MTP` flags. You can still override any of these values through trailing command-line arguments.
+MTP 專屬旗標只會套用在偵測為支援 MTP 的 GGUF 上；一般非 MTP GGUF 不會被強行加上 `MTP` 參數，避免啟動失敗。採樣預設仍可在命令列或微調選單覆寫。  
+MTP-specific flags only apply to GGUFs detected as MTP-capable. Regular non-MTP GGUFs are left alone so the launcher does not force incompatible `MTP` flags. Sampling defaults can still be overridden through command-line arguments or the tuning menu.
 
 這台機器另外補了兩個可直接雙擊的雙 GPU MTP preset：  
 This machine now also includes two double-click dual-GPU MTP presets:
