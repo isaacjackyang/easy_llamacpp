@@ -26,6 +26,11 @@ Allowed values are:
 Default is auto. In auto mode, the wrapper leaves --gpu-layers unset so llama.cpp
 can fit the model to the detected device memory.
 
+.PARAMETER VramAllocationStrategy
+Controls multi-GPU model distribution. smart is the default and derives an asymmetric
+tensor split from current free VRAM after reserving primary-GPU mmproj and MTP overhead.
+auto leaves distribution to llama.cpp. manual uses explicit --split-mode/--tensor-split values.
+
 .PARAMETER Threads
 Value passed to --threads.
 Use a positive integer to set it manually.
@@ -173,6 +178,8 @@ param(
     [int]$Port = 8080,
     [ValidatePattern('^(auto|all|\d+)$')]
     [string]$GpuLayers = "auto",
+    [ValidateSet("smart", "auto", "manual")]
+    [string]$VramAllocationStrategy = "smart",
     [int]$Threads = -1,
     [int]$ThreadsBatch = -1,
     [string]$ModelPath = $null,
@@ -289,7 +296,9 @@ $script:LaunchModelEntry = $null
 $script:LaunchMmprojPath = $null
 $script:ModelGenerationArgs = @()
 $script:ManagedDefaultContextSize = 131072
+$script:ManagedDefaultMaxOutputTokens = 32768
 $script:RequestedParallelSlots = ""
+$script:VramAllocationStrategy = $VramAllocationStrategy
 $script:LastAutoTuneProfile = $null
 $script:BackgroundStartupProgressLineLength = 0
 $script:BackgroundStartupProgressLastText = $null
@@ -472,6 +481,9 @@ function Write-LaunchAuditRecord {
                 use_managed_gpu_layers = if ($AutoTuning) { [bool]$AutoTuning.UseManagedGpuLayers } else { $false }
                 extreme_mode = [bool]$ExtremeMode
                 auto_tune = [bool]$AutoTune
+                vram_allocation_strategy = [string]$script:VramAllocationStrategy
+                smart_tensor_split = if ($AutoTuning -and $AutoTuning.PSObject.Properties["SmartVramPlan"] -and $AutoTuning.SmartVramPlan) { [string]$AutoTuning.SmartVramPlan.TensorSplit } else { $null }
+                smart_primary_fixed_mib = if ($AutoTuning -and $AutoTuning.PSObject.Properties["SmartVramPlan"] -and $AutoTuning.SmartVramPlan) { [int]$AutoTuning.SmartVramPlan.FixedPrimaryMiB } else { $null }
             }
             invocation = [ordered]@{
                 current = $CurrentProcessInfo
@@ -814,6 +826,17 @@ function Get-ServerArgs {
         $CombinedArgs += $Argument
     }
 
+    if ($AutoTuning -and $AutoTuning.PSObject.Properties["SmartVramPlan"] -and $AutoTuning.SmartVramPlan) {
+        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--split-mode|-sm)(?:=|$)'))) {
+            $Arguments.Add("--split-mode")
+            $Arguments.Add([string]$AutoTuning.SmartVramPlan.SplitMode)
+        }
+        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--tensor-split|-ts)(?:=|$)'))) {
+            $Arguments.Add("--tensor-split")
+            $Arguments.Add([string]$AutoTuning.SmartVramPlan.TensorSplit)
+        }
+    }
+
     if (Test-MtpDefaultsEnabled -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath -Arguments $CombinedArgs) {
         $MtpDefaultSpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
@@ -1082,6 +1105,110 @@ function Get-PrimaryAcceleratorInfo {
         Name     = [string]$Inventory[0].Name
         TotalMiB = [int]$Inventory[0].TotalMiB
         FreeMiB  = [int]$Inventory[0].FreeMiB
+    }
+}
+
+function Get-SmartVramAllocationPlan {
+    param(
+        [object[]]$AcceleratorInventory,
+        [string[]]$Arguments,
+        [string]$ResolvedModelPath,
+        $ModelEntry,
+        [string]$ResolvedMmprojPath,
+        [Nullable[int]]$FitTargetMiB
+    )
+
+    if (-not $AcceleratorInventory -or $AcceleratorInventory.Count -lt 2) {
+        return $null
+    }
+
+    $ArgumentText = Get-ArgumentSearchText -Arguments $Arguments
+    if ($ArgumentText -match '(?:^|\s)(?:--tensor-split|-ts)(?:=|\s+)') {
+        return $null
+    }
+
+    $RequestedSplitMode = Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^(?:--split-mode|-sm)(?:=(.+))?$')
+    if (-not [string]::IsNullOrWhiteSpace($RequestedSplitMode) -and $RequestedSplitMode.Trim().ToLowerInvariant() -notin @("layer", "row")) {
+        return $null
+    }
+
+    $SelectedInventory = @($AcceleratorInventory | Sort-Object Index)
+    $RequestedDevices = Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^(?:--device|-dev)(?:=(.+))?$')
+    if (-not [string]::IsNullOrWhiteSpace($RequestedDevices)) {
+        $RequestedIds = @($RequestedDevices -split ',' | ForEach-Object { $_.Trim().ToUpperInvariant() } | Where-Object { $_ })
+        $SelectedInventory = @(
+            foreach ($RequestedId in $RequestedIds) {
+                $AcceleratorInventory | Where-Object { $_.Id.ToString().ToUpperInvariant() -eq $RequestedId } | Select-Object -First 1
+            }
+        )
+    }
+    if ($SelectedInventory.Count -lt 2) {
+        return $null
+    }
+
+    $EffectiveFitTargetMiB = if ($null -ne $FitTargetMiB) { [double]$FitTargetMiB } else { 1024.0 }
+    $FixedPrimaryMiB = 0.0
+    $MmprojMiB = 0.0
+    if (-not [string]::IsNullOrWhiteSpace($ResolvedMmprojPath) -and (Test-Path -LiteralPath $ResolvedMmprojPath -PathType Leaf)) {
+        $MmprojMiB = [Math]::Ceiling(((Get-Item -LiteralPath $ResolvedMmprojPath).Length / 1MB) * 1.18 + 64.0)
+        $FixedPrimaryMiB += $MmprojMiB
+    }
+
+    $ContextSize = Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^--ctx-size(?:=(.+))?$')
+    [long]$ParsedContextSize = $script:ManagedDefaultContextSize
+    if (-not [long]::TryParse([string]$ContextSize, [ref]$ParsedContextSize) -or $ParsedContextSize -lt 1) {
+        $ParsedContextSize = $script:ManagedDefaultContextSize
+    }
+
+    $MtpMiB = 0.0
+    if (Test-MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $Arguments) {
+        # The in-model MTP draft context is concentrated on the primary CUDA device.
+        # 6.5 KiB/token closely tracks current Qwen 3.x MTP builds; keep a floor for shorter contexts.
+        $MtpMiB = [Math]::Ceiling([Math]::Max(512.0, ([double]$ParsedContextSize * 6.5 / 1024.0)))
+        $DraftModelPath = Resolve-Gemma4MtpDraftModelPath -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+        if (-not [string]::IsNullOrWhiteSpace($DraftModelPath) -and (Test-Path -LiteralPath $DraftModelPath -PathType Leaf)) {
+            $MtpMiB += [Math]::Ceiling(((Get-Item -LiteralPath $DraftModelPath).Length / 1MB) * 1.12 + 64.0)
+        }
+        $FixedPrimaryMiB += $MtpMiB
+    }
+
+    $Capacities = New-Object System.Collections.Generic.List[double]
+    for ($Index = 0; $Index -lt $SelectedInventory.Count; $Index++) {
+        $Capacity = [double]$SelectedInventory[$Index].FreeMiB - $EffectiveFitTargetMiB
+        if ($Index -eq 0) {
+            $Capacity -= $FixedPrimaryMiB
+        }
+        $Capacities.Add([Math]::Max(256.0, $Capacity))
+    }
+
+    $CapacityTotal = [double](($Capacities | Measure-Object -Sum).Sum)
+    if ($CapacityTotal -le 0) {
+        return $null
+    }
+
+    $Percentages = @($Capacities | ForEach-Object { [int][Math]::Floor(($_ / $CapacityTotal) * 100.0) })
+    $Remainder = 100 - [int](($Percentages | Measure-Object -Sum).Sum)
+    $Fractions = @(
+        for ($Index = 0; $Index -lt $Capacities.Count; $Index++) {
+            [pscustomobject]@{
+                Index    = $Index
+                Fraction = (($Capacities[$Index] / $CapacityTotal) * 100.0) - $Percentages[$Index]
+            }
+        }
+    )
+    foreach ($Entry in @($Fractions | Sort-Object Fraction -Descending | Select-Object -First $Remainder)) {
+        $Percentages[$Entry.Index]++
+    }
+
+    return [pscustomobject]@{
+        SplitMode        = if ([string]::IsNullOrWhiteSpace($RequestedSplitMode)) { "layer" } else { $RequestedSplitMode.Trim().ToLowerInvariant() }
+        TensorSplit      = ($Percentages -join ',')
+        FixedPrimaryMiB  = [int][Math]::Ceiling($FixedPrimaryMiB)
+        MmprojMiB        = [int][Math]::Ceiling($MmprojMiB)
+        MtpMiB           = [int][Math]::Ceiling($MtpMiB)
+        FitTargetMiB     = [int][Math]::Ceiling($EffectiveFitTargetMiB)
+        Devices          = @($SelectedInventory | ForEach-Object { [string]$_.Id })
+        AvailableMiB     = @($Capacities | ForEach-Object { [int][Math]::Floor($_) })
     }
 }
 
@@ -4564,6 +4691,7 @@ function Convert-ForwardArgsToMenuConfig {
 
     $Config = [ordered]@{
         ContextSize     = ""
+        MaxOutputTokens = [string]$script:ManagedDefaultMaxOutputTokens
         Temperature     = ""
         TopK            = ""
         TopP            = ""
@@ -4597,6 +4725,9 @@ function Convert-ForwardArgsToMenuConfig {
         switch -Regex ($Argument) {
             '^--ctx-size(?:=(.+))?$' {
                 $Config.ContextSize = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:-n|--predict|--n-predict)(?:=(.+))?$' {
+                $Config.MaxOutputTokens = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
             '^--temp(?:=(.+))?$' {
                 $Config.Temperature = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
@@ -4708,6 +4839,11 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add([string]$Config.ContextSize)
     }
 
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.MaxOutputTokens)) {
+        $Arguments.Add("--predict")
+        $Arguments.Add([string]$Config.MaxOutputTokens)
+    }
+
     if (-not [string]::IsNullOrWhiteSpace([string]$Config.Slots)) {
         $Arguments.Add("--parallel")
         $Arguments.Add([string]$Config.Slots)
@@ -4757,12 +4893,19 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add([string]$Config.Device)
     }
 
-    if ($Config.SplitMode) {
+    $AllocationStrategy = if ($Config.Contains("VramAllocationStrategy") -and -not [string]::IsNullOrWhiteSpace([string]$Config.VramAllocationStrategy)) {
+        ([string]$Config.VramAllocationStrategy).Trim().ToLowerInvariant()
+    }
+    else {
+        "smart"
+    }
+
+    if ($AllocationStrategy -eq "manual" -and $Config.SplitMode) {
         $Arguments.Add("--split-mode")
         $Arguments.Add([string]$Config.SplitMode)
     }
 
-    if ($Config.TensorSplit) {
+    if ($AllocationStrategy -eq "manual" -and $Config.TensorSplit) {
         $Arguments.Add("--tensor-split")
         $Arguments.Add([string]$Config.TensorSplit)
     }
@@ -4969,6 +5112,7 @@ function Get-SavedLaunchProfilePersistedKeys {
         "ReadyTimeoutSec"
         "OpenPath"
         "ContextSize"
+        "MaxOutputTokens"
         "Temperature"
         "TopK"
         "TopP"
@@ -4978,6 +5122,7 @@ function Get-SavedLaunchProfilePersistedKeys {
         "Metrics"
         "ApiKey"
         "Device"
+        "VramAllocationStrategy"
         "SplitMode"
         "TensorSplit"
         "Fit"
@@ -5561,6 +5706,8 @@ function Get-LaunchTuningContext {
 
     $ForwardConfig = Convert-ForwardArgsToMenuConfig -Arguments $Arguments
     $RelevantArgs = New-Object System.Collections.Generic.List[string]
+    $RelevantArgs.Add("--wrapper-vram-allocation")
+    $RelevantArgs.Add($(if ([string]::IsNullOrWhiteSpace([string]$script:VramAllocationStrategy)) { "smart" } else { ([string]$script:VramAllocationStrategy).Trim().ToLowerInvariant() }))
     if (-not [string]::IsNullOrWhiteSpace([string]$ForwardConfig.ContextSize)) {
         $RelevantArgs.Add("--ctx-size")
         $RelevantArgs.Add([string]$ForwardConfig.ContextSize)
@@ -7790,6 +7937,8 @@ function Get-LaunchConfigWrapperArguments {
         $Arguments.Add("-GpuLayers")
         $Arguments.Add([string]$Config.GpuLayers)
     }
+    $Arguments.Add("-VramAllocationStrategy")
+    $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.VramAllocationStrategy)) { "smart" } else { [string]$Config.VramAllocationStrategy }))
     if (-not [string]::IsNullOrWhiteSpace([string]$Config.Threads)) {
         $Arguments.Add("-Threads")
         $Arguments.Add([string]$Config.Threads)
@@ -8202,6 +8351,7 @@ function New-LaunchConfig {
         ReadyTimeoutSec   = [string]$ReadyTimeoutSec
         OpenPath          = if ($OpenPath) { $OpenPath } else { "/" }
         ContextSize       = [string]$ForwardConfig.ContextSize
+        MaxOutputTokens   = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.MaxOutputTokens)) { [string]$script:ManagedDefaultMaxOutputTokens } else { [string]$ForwardConfig.MaxOutputTokens }
         Temperature       = [string]$ForwardConfig.Temperature
         TopK              = [string]$ForwardConfig.TopK
         TopP              = [string]$ForwardConfig.TopP
@@ -8211,6 +8361,7 @@ function New-LaunchConfig {
         Metrics           = [bool]$ForwardConfig.Metrics
         ApiKey            = [string]$ForwardConfig.ApiKey
         Device            = [string]$ForwardConfig.Device
+        VramAllocationStrategy = if (-not [string]::IsNullOrWhiteSpace([string]$ForwardConfig.SplitMode) -or -not [string]::IsNullOrWhiteSpace([string]$ForwardConfig.TensorSplit)) { "manual" } else { [string]$VramAllocationStrategy }
         SplitMode         = [string]$ForwardConfig.SplitMode
         TensorSplit       = [string]$ForwardConfig.TensorSplit
         Fit               = [string]$ForwardConfig.Fit
@@ -8256,6 +8407,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "MtpEnabled"; Label = "MTP"; Type = "bool" },
         [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數；Gemma 4 MTP 預設 4，其他 MTP 預設 2" -EnglishText "positive integer; Gemma 4 MTP defaults to 4, other MTP defaults to 2") },
         [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
+        [pscustomobject]@{ Key = "MaxOutputTokens"; Label = (Format-BilingualText -ChineseText "最大輸出長度" -EnglishText "Max Output Length"); Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數，或 -1 代表不限" -EnglishText "positive integer, or -1 for unlimited") },
         [pscustomobject]@{ Key = "Slots"; Label = "Slots"; Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空使用 1；多請求才調高" -EnglishText "blank uses 1; raise only for concurrent requests") },
         [pscustomobject]@{ Key = "Temperature"; Label = "Temp"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 1.0" -EnglishText "blank uses the default; example: 1.0") },
         [pscustomobject]@{ Key = "TopK"; Label = "Top K"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 20" -EnglishText "blank uses the default; example: 20") },
@@ -8266,6 +8418,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "Metrics"; Label = "Metrics"; Type = "bool" },
         [pscustomobject]@{ Key = "ApiKey"; Label = "API Key"; Type = "text" },
         [pscustomobject]@{ Key = "Device"; Label = "Device"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 CUDA0,CUDA1" -EnglishText "blank uses auto; example: CUDA0,CUDA1") },
+        [pscustomobject]@{ Key = "VramAllocationStrategy"; Label = (Format-BilingualText -ChineseText "顯存分配策略" -EnglishText "VRAM Allocation"); Type = "choice"; Choices = @("smart", "auto", "manual") },
         [pscustomobject]@{ Key = "SplitMode"; Label = (Format-BilingualText -ChineseText "分割模式" -EnglishText "Split Mode"); Type = "choice"; Choices = @("", "layer", "row", "none") },
         [pscustomobject]@{ Key = "TensorSplit"; Label = (Format-BilingualText -ChineseText "張量分配" -EnglishText "Tensor Split"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 3,2" -EnglishText "blank uses auto; example: 3,2") },
         [pscustomobject]@{ Key = "Fit"; Label = "Fit"; Type = "choice"; Choices = @("", "on", "off") },
@@ -8310,6 +8463,7 @@ function Get-LaunchConfigDefaultText {
         "MtpEnabled" { return $(if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for supported MTP GGUF" } else { "off" }) }
         "SpecDraftNMax" { return Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
+        "MaxOutputTokens" { return [string]$script:ManagedDefaultMaxOutputTokens }
         "Slots" { return ("{0} active request slot" -f $FixedLlamaServerParallelSlots) }
         "Temperature" { return "1.0" }
         "TopK" { return "20" }
@@ -8318,6 +8472,7 @@ function Get-LaunchConfigDefaultText {
         "PresencePenalty" { return "1.5" }
         "ApiKey" { return "none" }
         "Device" { return "auto" }
+        "VramAllocationStrategy" { return "smart" }
         "SplitMode" { return "llama.cpp default" }
         "TensorSplit" { return "auto" }
         "Fit" { return "llama.cpp default" }
@@ -8361,6 +8516,13 @@ function Get-LaunchConfigValueText {
         "Metrics" { return $(if ($Config.Metrics) { "On" } else { "Off" }) }
         "ExtremeMode" { return $(if ($Config.ExtremeMode) { "On" } else { "Off" }) }
         "AutoTune" { return $(if ($Config.AutoTune) { "On" } else { "Off" }) }
+        "VramAllocationStrategy" {
+            return $(switch (([string]$Config.VramAllocationStrategy).Trim().ToLowerInvariant()) {
+                "manual" { Format-BilingualText -ChineseText "手動" -EnglishText "manual" }
+                "auto" { Format-BilingualText -ChineseText "一般自動" -EnglishText "normal auto" }
+                default { Format-BilingualText -ChineseText "智慧分配" -EnglishText "smart" }
+            })
+        }
         "ReasoningMode" { return ([string]$Config.ReasoningMode).ToUpperInvariant() }
         "ThinkLevel" {
             if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
@@ -8412,6 +8574,12 @@ function Get-LaunchConfigValueText {
             }
 
             return [string]$Config.SpecDraftNMax
+        }
+        "MaxOutputTokens" {
+            if ([string]$Config.MaxOutputTokens -eq "-1") {
+                return (Format-BilingualText -ChineseText "-1（不限）" -EnglishText "-1 (unlimited)")
+            }
+            return ("{0} tokens" -f [string]$Config.MaxOutputTokens)
         }
         "Slots" {
             if ([string]::IsNullOrWhiteSpace([string]$Config.Slots)) {
@@ -8619,6 +8787,12 @@ function Get-LaunchConfigItemHelp {
                 Recommendation = Format-BilingualText -ChineseText "除非你已經驗證過更大的 context，否則先用管理預設值。遇到 VRAM 壓力導致啟動失敗時，第一步先往下降。" -EnglishText "Start at the managed default unless you already validated a larger context. Lower it first when VRAM pressure causes startup failures."
             }
         }
+        "MaxOutputTokens" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "設定單次回應最多可生成多少 token，對應 llama.cpp 的 `--predict`。這是上限，不會強迫模型輸出到指定長度。" -EnglishText "Sets the maximum generated tokens per response via llama.cpp --predict. This is a ceiling and does not force responses to reach it."
+                Recommendation = Format-BilingualText -ChineseText "Qwen 一般使用建議 32768；設為 -1 代表 server 不設上限，但 API 客戶端的 max_tokens 仍可能另外限制。" -EnglishText "Use 32768 for normal Qwen workloads. -1 removes the server default limit, though an API client's max_tokens may still impose one."
+            }
+        }
         "Slots" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定 llama-server 的 `--parallel`，也就是同時可服務的請求槽位數。" -EnglishText "Sets llama-server `--parallel`, the number of simultaneous request slots."
@@ -8677,6 +8851,12 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "指定 llama.cpp 要使用哪些加速裝置。" -EnglishText "Pins which accelerators llama.cpp should target."
                 Recommendation = Format-BilingualText -ChineseText "留空代表自動選擇。這台機器若要同時用兩張 5070 Ti，可填 `CUDA0,CUDA1`。" -EnglishText "Leave blank for automatic selection. On this machine, use CUDA0,CUDA1 when you want both 5070 Ti cards."
+            }
+        }
+        "VramAllocationStrategy" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "選擇多 GPU 顯存如何分配：智慧分配會考慮每卡可用顯存，以及集中在主 GPU 的 mmproj/MTP 負擔；一般自動完全交給 llama.cpp；手動則使用下方 Split Mode 與 Tensor Split。" -EnglishText "Chooses multi-GPU VRAM allocation. Smart accounts for per-device free VRAM and mmproj/MTP load concentrated on the primary GPU; normal auto delegates to llama.cpp; manual uses Split Mode and Tensor Split below."
+                Recommendation = Format-BilingualText -ChineseText "建議保持智慧分配。只有疑難排解時改一般自動，或已有實測比例時改手動。" -EnglishText "Keep smart for normal use. Choose normal auto for troubleshooting, or manual when you already have a measured split."
             }
         }
         "SplitMode" {
@@ -8936,6 +9116,11 @@ function Edit-LaunchConfigItem {
                         throw "SPEC_DRAFT_N_MAX must be a positive integer."
                     }
                 }
+                "MaxOutputTokens" {
+                    if ([int]$Value -ne -1 -and [int]$Value -lt 1) {
+                        throw "Max Output Length must be -1 or a positive integer."
+                    }
+                }
             }
 
             $Config[$Item.Key] = [string]$Value
@@ -9053,6 +9238,7 @@ function Get-LlamaServerArgsFromLaunchConfig {
     $ForwardArgs = @(Remove-LlamaParallelArgs -Arguments $RawForwardArgs)
     $LaunchModelEntry = Get-ModelIndexEntryByPath -IndexPath $ModelIndexPath -ResolvedModelPath $ResolvedModelPath
     $ModelGenerationArgs = @(Get-ModelGenerationArgs -ModelEntry $LaunchModelEntry -UserArguments $ForwardArgs)
+    $VisionResolution = Resolve-LaunchConfigVisionMmprojPathForCommand -Config $Config -LaunchModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath
     $AutoLaunchTuning = Get-AutoLaunchTuning `
         -ResolvedModelPath $ResolvedModelPath `
         -RequestedGpuLayers ([string]$Config.GpuLayers) `
@@ -9060,8 +9246,19 @@ function Get-LlamaServerArgsFromLaunchConfig {
         -UseExtremeMode ([bool]$Config.ExtremeMode) `
         -EnableAutoTune ([bool]$Config.AutoTune) `
         -RequestedParallelSlots $RequestedParallelSlots
-
-    $VisionResolution = Resolve-LaunchConfigVisionMmprojPathForCommand -Config $Config -LaunchModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath
+    $PreviewAllocationStrategy = if ([string]::IsNullOrWhiteSpace([string]$Config.VramAllocationStrategy)) { "smart" } else { ([string]$Config.VramAllocationStrategy).Trim().ToLowerInvariant() }
+    if ($PreviewAllocationStrategy -eq "smart") {
+        $SmartVramPlan = Get-SmartVramAllocationPlan `
+            -AcceleratorInventory $AutoLaunchTuning.AcceleratorInventory `
+            -Arguments $ForwardArgs `
+            -ResolvedModelPath $ResolvedModelPath `
+            -ModelEntry $LaunchModelEntry `
+            -ResolvedMmprojPath ([string]$VisionResolution.Path) `
+            -FitTargetMiB $AutoLaunchTuning.FitTargetMiB
+        if ($SmartVramPlan) {
+            $AutoLaunchTuning | Add-Member -NotePropertyName SmartVramPlan -NotePropertyValue $SmartVramPlan -Force
+        }
+    }
     $Arguments = New-Object System.Collections.Generic.List[string]
     $Arguments.Add("-m")
     $Arguments.Add($ResolvedModelPath)
@@ -9090,6 +9287,17 @@ function Get-LlamaServerArgsFromLaunchConfig {
     }
     foreach ($Argument in $ForwardArgs) {
         $CombinedArgs += [string]$Argument
+    }
+
+    if ($AutoLaunchTuning.PSObject.Properties["SmartVramPlan"] -and $AutoLaunchTuning.SmartVramPlan) {
+        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--split-mode|-sm)(?:=|$)'))) {
+            $Arguments.Add("--split-mode")
+            $Arguments.Add([string]$AutoLaunchTuning.SmartVramPlan.SplitMode)
+        }
+        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--tensor-split|-ts)(?:=|$)'))) {
+            $Arguments.Add("--tensor-split")
+            $Arguments.Add([string]$AutoLaunchTuning.SmartVramPlan.TensorSplit)
+        }
     }
 
     if (Test-MtpDefaultsEnabled -ModelEntry $LaunchModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $CombinedArgs) {
@@ -9484,6 +9692,7 @@ function Apply-LaunchSelection {
     $script:ModelPath = Resolve-ModelPath -Path $Config.ModelPath
     $script:Port = [int]$Config.Port
     $script:GpuLayers = [string]$Config.GpuLayers
+    $script:VramAllocationStrategy = if ([string]::IsNullOrWhiteSpace([string]$Config.VramAllocationStrategy)) { "smart" } else { ([string]$Config.VramAllocationStrategy).Trim().ToLowerInvariant() }
     $script:ExtremeMode = [bool]$Config.ExtremeMode
     $script:AutoTune = [bool]$Config.AutoTune
     $script:RawThreads = [int]$Config.Threads
@@ -9863,6 +10072,7 @@ function Get-TrackedServerLaunchSettings {
             MmprojPath       = ""
             Port             = ""
             ContextSize      = ""
+            MaxOutputTokens  = ""
             Host             = ""
             GpuLayers        = ""
             Threads          = ""
@@ -9909,6 +10119,9 @@ function Get-TrackedServerLaunchSettings {
                 }
                 '^--ctx-size(?:=(.+))?$' {
                     $Settings.ContextSize = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^(?:-n|--predict|--n-predict)(?:=(.+))?$' {
+                    $Settings.MaxOutputTokens = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
                 }
                 '^--host(?:=(.+))?$' {
                     $Settings.Host = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
@@ -11384,6 +11597,10 @@ function Show-ServerStatus {
         if ($TrackedSettings) {
             $GenerationSettings = Get-TrackedServerGenerationSettings -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties
             Write-BilingualField -ChineseLabel "上下文" -EnglishLabel "Ctx" -ChineseValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties) -EnglishValue (Format-TrackedServerContextValue -TrackedSettings $TrackedSettings -RuntimeProperties $TrackedRuntimeProperties) -ForegroundColor Cyan
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.MaxOutputTokens)) {
+                $OutputLimitText = if ([string]$TrackedSettings.MaxOutputTokens -eq "-1") { "-1 (unlimited)" } else { ("{0} tokens" -f $TrackedSettings.MaxOutputTokens) }
+                Write-BilingualField -ChineseLabel "最大輸出" -EnglishLabel "Max Output" -ChineseValue ("{0}（--predict）" -f $OutputLimitText) -EnglishValue ("{0} (--predict)" -f $OutputLimitText) -ForegroundColor Cyan
+            }
             if ($TrackedTokenSnapshot) {
                 $TokenValue = Format-TrackedServerTokenUsageValue -TokenSnapshot $TrackedTokenSnapshot -RuntimeProperties $TrackedRuntimeProperties
                 Write-BilingualField -ChineseLabel "Token" -EnglishLabel "Tokens" -ChineseValue ("{0}，llama.cpp 最近一次看到的真實提示詞" -f $TokenValue) -EnglishValue ("{0} last real prompt seen by llama.cpp" -f $TokenValue)
@@ -11629,12 +11846,24 @@ try {
         throw (Format-BilingualText -ChineseText ("連接埠 $Port 已被 PID $($Listener.OwningProcess) 佔用。" ) -EnglishText ("Port $Port is already in use by PID $($Listener.OwningProcess)."))
     }
 
+    $LaunchMmprojPath = Resolve-LaunchMmprojPath -ModelPath $ModelPath -ModelEntry $LaunchModelEntry
     $AutoLaunchTuning = Get-AutoLaunchTuning -ResolvedModelPath $ModelPath -RequestedGpuLayers $GpuLayers -Arguments $LlamaArgs -UseExtremeMode $ExtremeMode -EnableAutoTune $AutoTune -RequestedParallelSlots $script:RequestedParallelSlots
+    if (([string]$script:VramAllocationStrategy).Trim().ToLowerInvariant() -eq "smart") {
+        $SmartVramPlan = Get-SmartVramAllocationPlan `
+            -AcceleratorInventory $AutoLaunchTuning.AcceleratorInventory `
+            -Arguments $LlamaArgs `
+            -ResolvedModelPath $ModelPath `
+            -ModelEntry $LaunchModelEntry `
+            -ResolvedMmprojPath $LaunchMmprojPath `
+            -FitTargetMiB $AutoLaunchTuning.FitTargetMiB
+        if ($SmartVramPlan) {
+            $AutoLaunchTuning | Add-Member -NotePropertyName SmartVramPlan -NotePropertyValue $SmartVramPlan -Force
+        }
+    }
 
     Write-Host (Format-BilingualText -ChineseText "正在啟動 llama.cpp 服務..." -EnglishText "Starting llama.cpp server...") -ForegroundColor Green
     Write-BilingualField -ChineseLabel "伺服器" -EnglishLabel "Server" -ChineseValue $ServerExe -EnglishValue $ServerExe
     Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue $ModelPath -EnglishValue $ModelPath
-    $LaunchMmprojPath = Resolve-LaunchMmprojPath -ModelPath $ModelPath -ModelEntry $LaunchModelEntry
     if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
         Write-BilingualField -ChineseLabel "Mmproj" -EnglishLabel "Mmproj" -ChineseValue $LaunchMmprojPath -EnglishValue $LaunchMmprojPath
     }
@@ -11669,6 +11898,23 @@ try {
     }
     if ($null -ne $AutoLaunchTuning.FitTargetMiB) {
         Write-BilingualField -ChineseLabel "顯存保留" -EnglishLabel "Fit" -ChineseValue ("目標保留邊界 $($AutoLaunchTuning.FitTargetMiB) MiB") -EnglishValue ("target margin $($AutoLaunchTuning.FitTargetMiB) MiB")
+    }
+    $AllocationStrategyLabelZh = switch (([string]$script:VramAllocationStrategy).Trim().ToLowerInvariant()) {
+        "manual" { "手動" }
+        "auto" { "一般自動" }
+        default { "智慧分配" }
+    }
+    $AllocationStrategyLabelEn = switch (([string]$script:VramAllocationStrategy).Trim().ToLowerInvariant()) {
+        "manual" { "manual" }
+        "auto" { "normal auto" }
+        default { "smart" }
+    }
+    if ($AutoLaunchTuning.PSObject.Properties["SmartVramPlan"] -and $AutoLaunchTuning.SmartVramPlan) {
+        $Plan = $AutoLaunchTuning.SmartVramPlan
+        Write-BilingualField -ChineseLabel "顯存分配" -EnglishLabel "VRAM Split" -ChineseValue ("{0}，{1}（主 GPU 固定負擔約 {2} MiB：mmproj {3} + MTP {4}）" -f $AllocationStrategyLabelZh, $Plan.TensorSplit, $Plan.FixedPrimaryMiB, $Plan.MmprojMiB, $Plan.MtpMiB) -EnglishValue ("{0}, {1} (about {2} MiB fixed on primary GPU: mmproj {3} + MTP {4})" -f $AllocationStrategyLabelEn, $Plan.TensorSplit, $Plan.FixedPrimaryMiB, $Plan.MmprojMiB, $Plan.MtpMiB)
+    }
+    else {
+        Write-BilingualField -ChineseLabel "顯存分配" -EnglishLabel "VRAM Split" -ChineseValue $AllocationStrategyLabelZh -EnglishValue $AllocationStrategyLabelEn
     }
     if ($null -ne $AutoLaunchTuning.CacheRamMiB) {
         Write-BilingualField -ChineseLabel "快取" -EnglishLabel "Cache" -ChineseValue ("提示詞快取上限 $($AutoLaunchTuning.CacheRamMiB) MiB") -EnglishValue ("prompt cache limit $($AutoLaunchTuning.CacheRamMiB) MiB")
