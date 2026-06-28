@@ -180,6 +180,25 @@ If you only want to install the Windows autostart scheduled task by itself, use:
 .\PS1\Install_LCPP_Autostart.ps1 -TriggerMode Startup
 ```
 
+## 本機 PDF 翻譯 CLI / Local PDF Translation CLI
+
+先用 `Start.cmd` 啟動本機模型，再雙擊或從終端執行：
+Start a local model with `Start.cmd`, then double-click or run:
+
+```bat
+.\Translate_PDF.cmd
+```
+
+終端選單可選 PDF、翻譯方向、單語／雙語輸出、本機模型、LLM batch 與 PDF 排版相容性。翻譯固定使用 localhost 的 llama.cpp OpenAI-compatible API，並透過 guarded BabelDOC wrapper 執行；互動模式預設啟用較快的 LLM batch、使用 `QPS 1`、移除浮水印，輸出到來源 PDF 旁的 `<檔名>_<語言>` 資料夾。模型若無法正確回傳批次 JSON，再於選單停用 batch，改用較慢的逐段 fallback。
+The terminal menu selects the PDF, language direction, mono/dual output, local model, LLM batching, and PDF layout compatibility. Translation is restricted to the localhost llama.cpp OpenAI-compatible API and runs through the guarded BabelDOC wrapper. Interactive mode defaults to faster LLM batching, `QPS 1`, no watermark, and an output folder named `<file>_<language>` beside the source PDF. Disable batching in the menu only when a model cannot return valid batch JSON and needs the slower paragraph fallback.
+
+也支援非互動呼叫：
+Non-interactive usage is also available:
+
+```bat
+.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\paper.pdf" -TargetLanguage zh-TW -OutputMode both -UseLlmBatch
+```
+
 ## 服務監看 GUI / Service Monitor GUI
 
 目前 repo 內建一個單檔 GUI 監看工具：[Monitor.py](F:/Documents/GitHub/easy_llamacpp/Monitor.py)。  
