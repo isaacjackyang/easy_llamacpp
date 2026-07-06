@@ -1,4 +1,4 @@
-﻿# llama.cpp Launcher / llama.cpp 啟動器
+# llama.cpp Launcher / llama.cpp 啟動器
 
 這個資料夾現在是純 `llama.cpp` Windows 啟動器，重點是 `Start_LCPP.ps1` 與它的 `Start.cmd`、`stop.cmd`、`stop_llamacpp.cmd`、`install.cmd`、`install_latest.cmd` 包裝器。它們負責啟動主 `llama-server.exe`、在同一個服務上掛 `--mmproj` 視覺能力、切換模型、背景執行、清理舊進程，以及安裝或更新本機 `bin\` 下的 `llama.cpp`。
 This folder is now a pure `llama.cpp` Windows launcher. The main entry points are `Start_LCPP.ps1` plus the simpler `Start.cmd`, `stop.cmd`, `stop_llamacpp.cmd`, `install.cmd`, and `install_latest.cmd` wrappers. They manage the primary `llama-server.exe`, attach vision through `--mmproj` on the same service, switch models, run in the background, clean stale processes, and install or update the local `bin\` llama.cpp files.
@@ -189,14 +189,14 @@ Start a local model with `Start.cmd`, then double-click or run:
 .\Translate_PDF.cmd
 ```
 
-終端選單可選 PDF、翻譯方向、單語／雙語輸出、本機模型、LLM batch 與 PDF 排版相容性。翻譯固定使用 localhost 的 llama.cpp OpenAI-compatible API，並透過 guarded BabelDOC wrapper 執行；互動模式預設啟用較快的 LLM batch、使用 `QPS 1`、移除浮水印，輸出到來源 PDF 旁的 `<檔名>_<語言>` 資料夾。模型若無法正確回傳批次 JSON，再於選單停用 batch，改用較慢的逐段 fallback。
-The terminal menu selects the PDF, language direction, mono/dual output, local model, LLM batching, and PDF layout compatibility. Translation is restricted to the localhost llama.cpp OpenAI-compatible API and runs through the guarded BabelDOC wrapper. Interactive mode defaults to faster LLM batching, `QPS 1`, no watermark, and an output folder named `<file>_<language>` beside the source PDF. Disable batching in the menu only when a model cannot return valid batch JSON and needs the slower paragraph fallback.
+終端選單可選 PDF、翻譯方向、單語／雙語輸出、本機模型與處理模式。預設的「穩定模式」會先用 BabelDOC venv 內的 RapidOCR 精確定位圖片文字框，再讓本機 llama.cpp 只翻譯字串，清除原字並以完整 RGB PNG 覆蓋重繪；RapidOCR 完全偵測不到文字時，才使用視覺模型框作 fallback。之後再使用逐段翻譯、Rich Text、OCR workaround 與增強 PDF 相容性。「快速模式」略過圖片文字，改用 LLM JSON batch；「手動調參」可自行選擇圖片重繪、batch、rich text、相容性、OCR workaround、表格與術語翻譯，以及 graphic/form/curve 處理。圖片結果依內容雜湊快取。`Translate_PDF.cmd` 啟動時會檢查目前 llama.cpp 的 `modalities.vision`，以及 BabelDOC venv 的 PyMuPDF、Pillow、OpenCV、NumPy、requests 與 RapidOCR。缺少 OCR 依賴時可執行 `install_ocr_request.cmd`；加上 `--check` 只檢查版本，不會更動套件。三種模式都維持 `QPS 1`。
+The terminal menu selects the PDF, language direction, mono/dual output, local model, and processing mode. Stable mode (the default) uses RapidOCR in the BabelDOC venv for precise raster-text boxes, asks local llama.cpp to translate strings only, and redraws with a full RGB PNG overlay. Vision-model boxes are a fallback only when RapidOCR detects no text. It then runs paragraph translation with Rich Text, the OCR workaround, and enhanced PDF compatibility. Fast mode skips image text and uses LLM JSON batching. Manual mode exposes image redrawing, batching, rich text, compatibility, OCR workaround, table and glossary translation, plus graphic/form/curve processing. Results are cached by content hash. At startup, `Translate_PDF.cmd` verifies llama.cpp `modalities.vision` and the BabelDOC venv imports for PyMuPDF, Pillow, OpenCV, NumPy, requests, and RapidOCR. Run `install_ocr_request.cmd` when OCR dependencies are missing, or add `--check` to verify versions without changing packages. All modes keep `QPS 1`.
 
 也支援非互動呼叫：
 Non-interactive usage is also available:
 
 ```bat
-.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\paper.pdf" -TargetLanguage zh-TW -OutputMode both -UseLlmBatch
+.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\paper.pdf" -TargetLanguage zh-TW -OutputMode both -ProcessingMode stable
 ```
 
 ## 服務監看 GUI / Service Monitor GUI
@@ -208,7 +208,6 @@ This repo now includes a single-file GUI monitor: [Monitor.py](F:/Documents/GitH
 It shows the live status of these local services in one place:
 
 - `llama.cpp`
-- `llama Watchdog`
 - `Hermes Dashboard`
 - `Hermes Gateway`
 - `Hermes Main Entry`
@@ -248,8 +247,6 @@ The GUI currently provides:
   Per-service `Start / Stop` buttons
 - 用卡片右上角的 `拖拉 / Drag` 標籤重排區塊順序，並把順序保存到下次開啟  
   Reorder cards by dragging the `拖拉 / Drag` label in the top-right corner, with the layout persisted across launches
-- `llama Watchdog` 卡片，可查看 watchdog PID、追蹤中的 server PID、runtime 狀態與自動重啟次數  
-  A `llama Watchdog` card showing the watchdog PID, tracked server PID, runtime state, and restart count
 
 `Compact` 模式下，卡片只保留服務名稱、按鈕與 `OK / WARN / DOWN` 狀態。  
 In `Compact` mode, each card only keeps the service name, buttons, and the `OK / WARN / DOWN` badge.
@@ -265,8 +262,8 @@ The first screen provides these main entry points:
   Pick a model, then choose `Background Service` or `Open Web UI`. If that model already has saved custom profiles, Quick Start shows them first so you can launch with one directly.
 
 - `Tune And Launch`
-  先選模型，再進入可用鍵盤操作的參數矩陣畫面。用方向鍵移動，按 `Enter` 或 `Space` 編輯目前格子。矩陣裡包含 `GPU Layers`、`Repeating Layers`、`Reasoning`、`Think Level`、`MTP`、`SPEC_DRAFT_N_MAX`、`Context Size`，以及可直接調整的 `Temp`、`Top K`、`Top P`、`Min P`、`Presence Penalty`，再加上 `Auto Tune`、`Apply Auto Tune Learned Values`、`Save Profile`、`Export Profile`、`Save Defaults` 動作。當你用方向鍵移動高亮欄位時，畫面下方會同步顯示該選項的功能與建議數值，方便直接在選單裡判斷要不要改。`Auto Tune` 開啟後，腳本會在這次啟動真的完整塞進 GPU 且 VRAM 使用率接近目標時，把學到的參數寫進 `model-tuning.json`；`Apply Auto Tune Learned Values` 可以把匹配到的 learned profile 直接轉成這一頁的明確設定；`Save Profile` 會把目前頁面的手動設定存進 `launch-profiles.json` 供 Quick Start 直接套用；`Export Profile` 會把目前頁面直接輸出成 `exports\profiles\start_<名稱>.cmd`；`Save Defaults` 則會覆寫目前模型的微調預設值，之後每次進入這個模型的 Tune And Launch 都會先顯示這組值。  
-  Pick a model, then open a keyboard-driven parameter matrix. Use arrow keys to move and press `Enter` or `Space` to edit the current cell. The matrix now includes fields such as `GPU Layers`, `Repeating Layers`, `Reasoning`, `Think Level`, `MTP`, `SPEC_DRAFT_N_MAX`, `Context Size`, plus directly adjustable `Temp`, `Top K`, `Top P`, `Min P`, and `Presence Penalty`, along with `Auto Tune`, `Apply Auto Tune Learned Values`, `Save Profile`, `Export Profile`, and `Save Defaults` actions. As you move the highlight with the arrow keys, the bottom panel updates with a plain-language explanation and a recommended starting value for the selected field. When `Auto Tune` is enabled, the script saves learned parameters to `model-tuning.json` after a launch that fully fits on GPU and lands near the target VRAM usage; `Apply Auto Tune Learned Values` can materialize a matching learned profile into explicit values on the current page; `Save Profile` stores the current manual page settings in `launch-profiles.json` so Quick Start can reuse them later; `Export Profile` writes the current page directly to `exports\profiles\start_<name>.cmd`; `Save Defaults` overwrites the current model's tuning defaults so future Tune And Launch sessions for that model open with those values already shown.
+  先選模型，再進入可用鍵盤操作的參數矩陣畫面。`Auto Tune` 會依序實測 CTX 1024、30720、61440；每個候選值都會重新計算 Smart VRAM，並依兩張卡實測剩餘 VRAM 動態調整 tensor split、重測相同 CTX。模型載入後還會執行一次最短推論，而不只檢查 health；log 中單獨出現 OOM 字樣不會直接判定失敗，只有程序退出、health timeout 或 smoke test 失敗才算失敗。搜尋過程維護只會上升的成功下界與只會下降的失敗上界，最後收斂到 1024-token 精度。
+  Pick a model, then open the keyboard-driven parameter matrix. `Auto Tune` probes CTX 1024, 30720, and 61440, recalculates Smart VRAM for every candidate, dynamically balances tensor split from measured per-GPU free VRAM, and runs a minimal inference after health becomes ready. It maintains monotonic success and failure bounds and converges to 1024-token precision before saving the model default and launching normally.
 
 - `Benchmark`
   先選模型，再選一個懶人測試模式，launcher 會自動呼叫 `llama-bench.exe`，把原始結果存到 `logs/bench-*.md`，並另外輸出 `logs/bench-*.svg` 長條圖。`Quick Speed Test` 只測常用的 `pp512` 和 `tg128`；`Long Context Test` 會看 512/2048/8192/16384 prompt 的 prefill 速度；`Batch Sweet Spot` 會先依模型檔名/大小估算本機模型卡，包括參數量、量化、MTP sidecar、支援 CTX 與可用 VRAM，從支援 CTX 的一半開始測；如果起點太高就用 1024 階梯往下找能跑的點，穩定後再用 1024 階梯往上探，並在每輪掃 `ubatch` 256/512/1024，直到最佳 `pp` 明顯下降、實測失敗或碰到估算上限才停止；`CPU/GPU Quick Compare` 會用短測比較 `-ngl 0` 和 `-ngl 99`。表格裡 `pp` 代表 prompt processing / prefill，越高越適合貼長文或 RAG；`tg` 代表 token generation，越高聊天輸出快。  
@@ -601,8 +598,6 @@ Stop the currently tracked server:
 若 vision 啟動異常，先檢查三件事：主 server 狀態是否有 `Mmproj : <path>`、`logs\llama-server.stderr.log` 實際載入的是哪顆模型、以及 `json\model-index.json` 裡該模型是否仍保有正確的手動 `mmproj_path`。
 If vision startup behaves unexpectedly, first check three things: whether the primary server status shows `Mmproj : <path>`, which model `logs\llama-server.stderr.log` actually loaded, and whether the matching model entry in `json\model-index.json` still keeps the correct manual `mmproj_path`.
 
-若只想補啟或停止 background watchdog，而不重啟 `llama-server.exe`，可直接用 `start_watchdog.cmd` 與 `stop_watchdog.cmd`。  
-If you only want to start or stop the background watchdog without restarting `llama-server.exe`, use `start_watchdog.cmd` and `stop_watchdog.cmd` directly.
 
 查看底層 `llama-server.exe` 全部參數：  
 Show all underlying `llama-server.exe` parameters:
@@ -626,7 +621,6 @@ If no tracked server is running, the script starts a new one.
 每次進入實際啟動流程前，腳本都會先清理這個工作資料夾下舊的 `llama-server.exe` 進程，再啟動新的 server。  
 Before each actual launch, the script clears older `llama-server.exe` processes started from this workspace, then starts a fresh server.
 
-Background launches now go through a single PowerShell watchdog manager that writes runtime ownership state to `logs/llama-runtime-owner.json`, starts `llama-server.exe`, keeps watching it with `Wait-Process`, and automatically relaunches it if the child exits unexpectedly. `-Status`, `-Stop`, `start.cmd`, and `stop.ps1` treat that ownership state as authoritative and automatically clear untracked workspace `llama-server.exe` instances.
 
 如果 `-GpuLayers` 保持 `auto`，腳本還會在啟動時偵測目前可用的 GPU VRAM 與系統 RAM，動態調整 `--fit-target`、`--cache-ram`，目標是盡量吃滿 VRAM，但減少把壓力打到 pagefile / SSD 的機率。`llama.cpp` server slot 會固定帶 `--parallel 1`。  
 If `-GpuLayers` stays at `auto`, the script also detects currently available GPU VRAM and system RAM at launch time and adjusts `--fit-target` and `--cache-ram`, aiming to fill VRAM while reducing the chance of spilling pressure into the pagefile / SSD. The `llama.cpp` server always uses `--parallel 1`.
@@ -634,8 +628,8 @@ If `-GpuLayers` stays at `auto`, the script also detects currently available GPU
 如果再加上 `-ExtremeMode`，這套自動調整會更激進，通常會換成更小的 VRAM 保留空間，並把 prompt cache 壓得更低；slots 仍固定為 1。  
 If you also add `-ExtremeMode`, the auto-tuning becomes more aggressive, usually with a smaller VRAM margin and lower prompt-cache overhead; slots remain fixed at 1.
 
-如果你開啟 `-AutoTune`，而這次載入最終完整塞進 GPU 並落在目標 VRAM 區間，腳本會把這次驗證成功的組合記下來；之後再啟動同一模型時，就會優先套用該 profile。若目前可用 VRAM 比當初學到時更少，腳本會自動退回即時自動 fitting，不會硬套舊設定。  
-If you enable `-AutoTune` and a launch fully fits on GPU within the target VRAM window, the script remembers that validated combination and prefers it on later launches of the same model. If current free VRAM is lower than when the profile was learned, the script automatically falls back to live adaptive fitting instead of forcing the old settings.
+開啟 `-AutoTune` 後，腳本會在正式啟動前以實際模型載入測試搜尋最大穩定 Context Size，將結果寫入該模型的 tuning default，再使用該 CTX 正式啟動。調校期間模型會被載入多次。
+With `-AutoTune`, the script performs real model-load probes before the final launch, finds the maximum stable Context Size, stores it as the model's tuning default, and then launches normally with that CTX. The model is loaded multiple times during tuning.
 
 這表示你可以直接用一條指令切換模型：  
 This means you can switch models directly with a single command:
@@ -789,11 +783,7 @@ Rollback steps:
 - `logs/launch-audit.jsonl`：每次實際進入啟動流程時追加一筆 JSONL 審計紀錄，包含入口腳本、PowerShell / cmd 呼叫鏈、模型、埠號與完整 `llama-server.exe` 參數。  
   `logs/launch-audit.jsonl`: Appends one JSONL audit record for each real launch attempt, including the entry script, PowerShell / cmd caller chain, model, port, and full `llama-server.exe` arguments.
 
-- `logs/llama-runtime-owner.json`：目前受管 runtime 的 ownership state，包含 `server_pid`、watchdog PID、模型路徑、啟動參數，以及自動恢復狀態（例如 `restart_count`、`last_restart_at`、`last_exit_code`）。背景模式下是 unified watchdog 直接持有 child lifecycle，並在子程序異常退出時自動重啟。只要這份 state 消失，`-Status` / `-Stop` / watchdog 會把殘留的 workspace `llama-server.exe` 當成 untracked instance 清掉。  
-  `logs/llama-runtime-owner.json`: Ownership state for the managed runtime, including `server_pid`, watchdog PID, model path, launch arguments, and auto-recovery metadata such as `restart_count`, `last_restart_at`, and `last_exit_code`. In background mode the unified watchdog directly owns the child lifecycle and automatically restarts the server if it exits unexpectedly. If this state disappears, `-Status`, `-Stop`, and the watchdog treat any remaining workspace `llama-server.exe` as an untracked instance and clear it.
 
-- `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`：統一 watchdog manager 的 PID 與事件紀錄。它同時負責啟動 `llama-server.exe`、定期巡檢、清除非法的 workspace server，並在 managed server 異常退出時自動恢復。  
-  `logs/llama-watchdog.pid` / `logs/llama-watchdog.log`: PID and event log for the unified watchdog manager. It is responsible for launching `llama-server.exe`, performing periodic reconciliation, clearing illegal workspace servers, and automatically recovering the managed server after unexpected exits.
 
 - `json/model-index.json`：互動式選單使用的模型索引。  
   `json/model-index.json`: Model index used by the interactive launcher.
@@ -1183,6 +1173,8 @@ Notes:
 - `--tensor-split 1,1` 代表大致平均分配。  
   `--tensor-split 1,1` means an approximately even split.
 
+雙 GPU 的 Smart VRAM 模式預設使用 `--device CUDA1,CUDA0`，讓第二張實體卡成為主要裝置；tensor split 也會依這個裝置順序重新計算。這會連同 mmproj、KV cache、MTP 與部分中間運算一起移到新的主要裝置，而不是只移動 mmproj。
+
 - 如果啟動失敗，可以先退回 `-GpuLayers auto` 或把 `--ctx-size` 從 `131072` 降到 `65536`。  
   If startup fails, first fall back to `-GpuLayers auto` or reduce `--ctx-size` from `131072` to `65536`.
 
@@ -1478,4 +1470,3 @@ Because this machine uses an RTX 5070 Ti with 16 GB VRAM, start with these recom
 - [llama-server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 - [GBNF Guide](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md)
 - [llama-quantize README](https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md)
-

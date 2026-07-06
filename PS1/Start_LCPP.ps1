@@ -27,8 +27,10 @@ Default is auto. In auto mode, the wrapper leaves --gpu-layers unset so llama.cp
 can fit the model to the detected device memory.
 
 .PARAMETER VramAllocationStrategy
-Controls multi-GPU model distribution. smart is the default and derives an asymmetric
-tensor split from current free VRAM after reserving primary-GPU mmproj and MTP overhead.
+Controls multi-GPU model distribution. smart is the default and derives per-device fit
+headroom from current free VRAM plus primary-GPU mmproj/MTP overhead. It leaves tensor
+split unset so llama.cpp can fit dynamically, then raises the failed device's reserve and
+retries when startup reports a CUDA allocation failure.
 auto leaves distribution to llama.cpp. manual uses explicit --split-mode/--tensor-split values.
 
 .PARAMETER Threads
@@ -273,14 +275,11 @@ $StdErrLog = Join-Path $LogRoot "llama-server.stderr.log"
 $LaunchAuditLog = Join-Path $LogRoot "launch-audit.jsonl"
 $RuntimeOwnerStateFile = Join-Path $LogRoot "llama-runtime-owner.json"
 $SupervisorPidFile = Join-Path $LogRoot "llama-supervisor.pid"
-$WatchdogPidFile = Join-Path $LogRoot "llama-watchdog.pid"
-$WatchdogLog = Join-Path $LogRoot "llama-watchdog.log"
 $TuningProfileFile = Join-Path $JsonRoot "model-tuning.json"
 $SavedLaunchProfileFile = Join-Path $JsonRoot "launch-profiles.json"
 $BenchmarkModelCardsFile = Join-Path $JsonRoot "model-cards.json"
 $ModelSwitchTimingFile = Join-Path $JsonRoot "model-switch-times.json"
 $SupervisorScriptPath = Join-Path $Ps1Root "llama_supervisor.ps1"
-$WatchdogScriptPath = Join-Path $Ps1Root "llama_watchdog.ps1"
 $BaseUrl = "http://localhost:$Port"
 $BrowserJob = $null
 $UsedInteractiveMenu = $false
@@ -291,6 +290,7 @@ $RawThreadsBatch = $ThreadsBatch
 $script:ModelFileSizeBytesCache = @{}
 $script:ModelFileSizeLabelCache = @{}
 $script:ModelRepeatingLayerCountCache = @{}
+$script:ModelTrainingContextCache = @{}
 $script:MmprojPathCache = @{}
 $script:LaunchModelEntry = $null
 $script:LaunchMmprojPath = $null
@@ -300,8 +300,11 @@ $script:ManagedDefaultMaxOutputTokens = 32768
 $script:RequestedParallelSlots = ""
 $script:VramAllocationStrategy = $VramAllocationStrategy
 $script:LastAutoTuneProfile = $null
+$script:ActiveLaunchConfig = $null
+$script:AutoTuneTensorSplitOverride = $null
 $script:BackgroundStartupProgressLineLength = 0
 $script:BackgroundStartupProgressLastText = $null
+$script:StatusCardCollector = $null
 $script:SelectedVisionModelEntry = $null
 $script:SelectedVisionModelPath = $null
 $script:SelectedVisionMmprojPath = $null
@@ -323,7 +326,6 @@ $AutoTuneMinUsagePercent = 93.0
 $AutoTuneMaxUsagePercent = 98.5
 $AutoTuneReuseHeadroomMiB = 128
 $FixedLlamaServerParallelSlots = 1
-$WatchdogIntervalSec = 15
 
 foreach ($DirectoryPath in @($LogRoot, $JsonRoot)) {
     if (-not (Test-Path -LiteralPath $DirectoryPath -PathType Container)) {
@@ -539,11 +541,42 @@ function Read-RuntimeOwnerState {
     }
 }
 
+function Write-RuntimeOwnerState {
+    param(
+        [int]$ServerPid,
+        [string]$ResolvedModelPath,
+        [string]$ResolvedServerExe,
+        [int]$ServerPort
+    )
+
+    if ($ServerPid -le 0) {
+        throw 'Cannot track a runtime owner without a valid server PID.'
+    }
+
+    $State = [ordered]@{
+        version        = 1
+        server_pid     = $ServerPid
+        supervisor_pid = $null
+        server_exe     = $ResolvedServerExe
+        model_path     = $ResolvedModelPath
+        port           = $ServerPort
+        launcher_pid   = $PID
+        created_at     = (Get-Date).ToString('o')
+    }
+    $TemporaryPath = "$RuntimeOwnerStateFile.tmp-$PID"
+    try {
+        $State | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $TemporaryPath -Encoding UTF8
+        Move-Item -LiteralPath $TemporaryPath -Destination $RuntimeOwnerStateFile -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $TemporaryPath -ErrorAction SilentlyContinue
+    }
+}
+
 function Remove-RuntimeOwnershipArtifacts {
     foreach ($ArtifactPath in @(
             $RuntimeOwnerStateFile,
-            $SupervisorPidFile,
-            $WatchdogPidFile
+            $SupervisorPidFile
         )) {
         Remove-Item -LiteralPath $ArtifactPath -ErrorAction SilentlyContinue
     }
@@ -625,10 +658,6 @@ function Get-WorkspaceSupervisorProcesses {
     return @(Get-WorkspaceScriptProcesses -ScriptPath $SupervisorScriptPath)
 }
 
-function Get-WorkspaceWatchdogProcesses {
-    return @(Get-WorkspaceScriptProcesses -ScriptPath $WatchdogScriptPath)
-}
-
 function Get-LiveRuntimeOwnerState {
     $RuntimeState = Read-RuntimeOwnerState
     if (-not $RuntimeState) {
@@ -636,7 +665,6 @@ function Get-LiveRuntimeOwnerState {
     }
 
     [int]$ServerPid = 0
-    [int]$WatchdogPid = 0
     if (-not [int]::TryParse([string]$RuntimeState.server_pid, [ref]$ServerPid) -or $ServerPid -le 0) {
         return $null
     }
@@ -653,24 +681,10 @@ function Get-LiveRuntimeOwnerState {
     $HasValidServerProcess = Test-WorkspaceServerProcessInfo -ProcessInfo $ServerProcessInfo
     $HasLiveServerProcess = Get-Process -Id $ServerPid -ErrorAction SilentlyContinue
 
-    $HasValidWatchdogProcess = $false
-    if ([int]::TryParse([string]$RuntimeState.watchdog_pid, [ref]$WatchdogPid) -and $WatchdogPid -gt 0) {
-        $WatchdogProcessInfo = Get-ProcessInfoById -ProcessId ([Nullable[int]]$WatchdogPid)
-        $HasValidWatchdogProcess = $WatchdogProcessInfo -and (Test-CommandLineReferencesPath -CommandLine ([string]$WatchdogProcessInfo.CommandLine) -Path $WatchdogScriptPath)
-        if (-not $HasValidWatchdogProcess) {
-            $RuntimeState | Add-Member -NotePropertyName watchdog_pid -NotePropertyValue $null -Force
-        }
-    }
-    else {
-        $RuntimeState | Add-Member -NotePropertyName watchdog_pid -NotePropertyValue $null -Force
-    }
-
     if ($HasValidServerProcess) {
-        $RuntimeState | Add-Member -NotePropertyName watchdog_managed -NotePropertyValue $HasValidWatchdogProcess -Force
         $RuntimeState | Add-Member -NotePropertyName startup_grace -NotePropertyValue $false -Force
     }
-    elseif ($StateInStartupGrace -and ($HasLiveServerProcess -or $HasValidWatchdogProcess)) {
-        $RuntimeState | Add-Member -NotePropertyName watchdog_managed -NotePropertyValue $HasValidWatchdogProcess -Force
+    elseif ($StateInStartupGrace -and $HasLiveServerProcess) {
         $RuntimeState | Add-Member -NotePropertyName startup_grace -NotePropertyValue $true -Force
     }
     else {
@@ -689,11 +703,9 @@ function Invoke-WorkspaceRuntimeGuard {
     $FallbackState = if ($LiveState) { $LiveState } else { Read-RuntimeOwnerState }
     $AllowedServerPid = $null
     $AllowedSupervisorPid = $null
-    $AllowedWatchdogPid = $null
     if ($FallbackState) {
         [int]$ParsedServerPid = 0
         [int]$ParsedSupervisorPid = 0
-        [int]$ParsedWatchdogPid = 0
         if ([int]::TryParse([string]$FallbackState.server_pid, [ref]$ParsedServerPid) -and $ParsedServerPid -gt 0 -and (Get-Process -Id $ParsedServerPid -ErrorAction SilentlyContinue)) {
             $AllowedServerPid = $ParsedServerPid
         }
@@ -702,9 +714,6 @@ function Invoke-WorkspaceRuntimeGuard {
             $AllowedSupervisorPid = $ParsedSupervisorPid
         }
 
-        if ([int]::TryParse([string]$FallbackState.watchdog_pid, [ref]$ParsedWatchdogPid) -and $ParsedWatchdogPid -gt 0 -and (Get-Process -Id $ParsedWatchdogPid -ErrorAction SilentlyContinue)) {
-            $AllowedWatchdogPid = $ParsedWatchdogPid
-        }
     }
 
     $TargetIds = New-Object System.Collections.Generic.List[int]
@@ -723,14 +732,6 @@ function Invoke-WorkspaceRuntimeGuard {
         }
 
         $TargetIds.Add([int]$SupervisorProcess.ProcessId)
-    }
-
-    foreach ($WatchdogProcess in @(Get-WorkspaceWatchdogProcesses)) {
-        if ($AllowedWatchdogPid -and ([int]$WatchdogProcess.ProcessId -eq $AllowedWatchdogPid)) {
-            continue
-        }
-
-        $TargetIds.Add([int]$WatchdogProcess.ProcessId)
     }
 
     $UniqueTargetIds = @($TargetIds | Select-Object -Unique)
@@ -827,13 +828,23 @@ function Get-ServerArgs {
     }
 
     if ($AutoTuning -and $AutoTuning.PSObject.Properties["SmartVramPlan"] -and $AutoTuning.SmartVramPlan) {
+        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--device|-dev)(?:=|$)'))) {
+            $Arguments.Add("--device")
+            $Arguments.Add([string]$AutoTuning.SmartVramPlan.DeviceOrder)
+        }
         if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--split-mode|-sm)(?:=|$)'))) {
             $Arguments.Add("--split-mode")
             $Arguments.Add([string]$AutoTuning.SmartVramPlan.SplitMode)
         }
-        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--tensor-split|-ts)(?:=|$)'))) {
+        if ((-not $AutoTuning.SmartVramPlan.UsesFitManagedSplit) -and -not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--tensor-split|-ts)(?:=|$)'))) {
             $Arguments.Add("--tensor-split")
             $Arguments.Add([string]$AutoTuning.SmartVramPlan.TensorSplit)
+        }
+        if ($AutoTuning.SmartVramPlan.UsesFitManagedSplit -and -not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:-lv|--verbosity|--verbose)(?:=|$)'))) {
+            # Smart balancing needs the fitted GPU-layer count that llama.cpp
+            # only prints at verbose level. The final fixed launch omits this.
+            $Arguments.Add("-lv")
+            $Arguments.Add("4")
         }
     }
 
@@ -856,9 +867,14 @@ function Get-ServerArgs {
     }
 
     if ($AutoTuning) {
-        if ($null -ne $AutoTuning.FitTargetMiB) {
+        $UsesFixedSmartSplit = $AutoTuning.PSObject.Properties['SmartVramPlan'] -and $AutoTuning.SmartVramPlan -and -not $AutoTuning.SmartVramPlan.UsesFitManagedSplit
+        if ($UsesFixedSmartSplit -and -not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--fit|-fit)(?:=|$)'))) {
+            $Arguments.Add("--fit")
+            $Arguments.Add("off")
+        }
+        elseif ($null -ne $AutoTuning.FitTargetMiB) {
             $Arguments.Add("--fit-target")
-            $Arguments.Add([string]$AutoTuning.FitTargetMiB)
+            $Arguments.Add($(if ($AutoTuning.PSObject.Properties['SmartVramPlan'] -and $AutoTuning.SmartVramPlan -and $AutoTuning.SmartVramPlan.UsesFitManagedSplit) { [string]$AutoTuning.SmartVramPlan.FitTarget } else { [string]$AutoTuning.FitTargetMiB }))
         }
 
         if ($null -ne $AutoTuning.CacheRamMiB) {
@@ -1036,12 +1052,17 @@ function Get-AcceleratorInventory {
     $Inventory = New-Object System.Collections.Generic.List[object]
 
     try {
-        $DeviceOutput = & $ServerExe --list-devices 2>&1
-        foreach ($Line in $DeviceOutput) {
-            if ([string]$Line -match '^\s*(CUDA\d+):\s+(.+?)\s+\((\d+)\s+MiB,\s+(\d+)\s+MiB free\)') {
+        # nvidia-smi reflects allocations made by the already-running server.
+        # llama-server --list-devices can report the pre-launch free value from
+        # a separate CUDA context, which makes post-load balancing see a false
+        # perfect balance.
+        $SmiOutput = & nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits 2>$null
+        foreach ($Line in $SmiOutput) {
+            if ([string]$Line -match '^\s*(\d+)\s*,\s*(.+?)\s*,\s*(\d+)\s*,\s*(\d+)\s*$') {
+                $GpuIndex = [int]$Matches[1]
                 $Inventory.Add([pscustomobject]@{
-                    Id       = [string]$Matches[1].Trim()
-                    Index    = [int]([regex]::Match($Matches[1], '\d+').Value)
+                    Id       = "CUDA$GpuIndex"
+                    Index    = $GpuIndex
                     Name     = [string]$Matches[2].Trim()
                     TotalMiB = [int]$Matches[3]
                     FreeMiB  = [int]$Matches[4]
@@ -1057,13 +1078,12 @@ function Get-AcceleratorInventory {
     }
 
     try {
-        $SmiOutput = & nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits 2>$null
-        foreach ($Line in $SmiOutput) {
-            if ([string]$Line -match '^\s*(\d+)\s*,\s*(.+?)\s*,\s*(\d+)\s*,\s*(\d+)\s*$') {
-                $GpuIndex = [int]$Matches[1]
+        $DeviceOutput = & $ServerExe --list-devices 2>&1
+        foreach ($Line in $DeviceOutput) {
+            if ([string]$Line -match '^\s*(CUDA\d+):\s+(.+?)\s+\((\d+)\s+MiB,\s+(\d+)\s+MiB free\)') {
                 $Inventory.Add([pscustomobject]@{
-                    Id       = "CUDA$GpuIndex"
-                    Index    = $GpuIndex
+                    Id       = [string]$Matches[1].Trim()
+                    Index    = [int]([regex]::Match($Matches[1], '\d+').Value)
                     Name     = [string]$Matches[2].Trim()
                     TotalMiB = [int]$Matches[3]
                     FreeMiB  = [int]$Matches[4]
@@ -1108,6 +1128,165 @@ function Get-PrimaryAcceleratorInfo {
     }
 }
 
+function Get-SmartVramFitTargets {
+    param(
+        [object[]]$SelectedInventory,
+        [double]$BaseFitTargetMiB,
+        [double]$FixedPrimaryMiB
+    )
+
+    $Targets = New-Object System.Collections.Generic.List[int]
+    for ($Index = 0; $Index -lt $SelectedInventory.Count; $Index++) {
+        $Target = $BaseFitTargetMiB
+        if ($Index -eq 0) {
+            $Target += $FixedPrimaryMiB
+        }
+        $Targets.Add([int][Math]::Ceiling([Math]::Max(64.0, $Target)))
+    }
+    return [int[]]$Targets.ToArray()
+}
+
+function Get-SmartVramOomRetryAdjustment {
+    param(
+        $Plan,
+        [string]$FailureLog
+    )
+
+    if (-not $Plan -or [string]::IsNullOrWhiteSpace($FailureLog) -or
+        -not $Plan.PSObject.Properties['UsesFitManagedSplit'] -or -not [bool]$Plan.UsesFitManagedSplit) {
+        return $null
+    }
+
+    $FailedDevice = $null
+    if ($FailureLog -match '(?i)failed to allocate\s+(CUDA\d+)\s+buffer') {
+        $FailedDevice = $Matches[1].ToUpperInvariant()
+    }
+    elseif ($FailureLog -match '(?i)allocating\s+[\d.]+\s+MiB\s+on device\s+(\d+)') {
+        $FailedDevice = "CUDA$($Matches[1])"
+    }
+    $Devices = @($Plan.Devices | ForEach-Object { ([string]$_).ToUpperInvariant() })
+    $Targets = @($Plan.FitTargetsMiB | ForEach-Object { [int]$_ })
+    if ($Targets.Count -ne $Devices.Count) {
+        return $null
+    }
+
+    $RequiredMiB = 0.0
+    if ($FailureLog -match '(?i)failed to allocate\s+CUDA\d+\s+buffer of size\s+(\d+)') {
+        $RequiredMiB = [double]$Matches[1] / 1MB
+    }
+    elseif ($FailureLog -match '(?i)allocating\s+([\d.]+)\s+MiB\s+on device') {
+        $RequiredMiB = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($FailedDevice)) {
+        if ($FailureLog -notmatch '(?i)cudaMalloc failed|out of memory|GGML_ASSERT\(.+\) failed') {
+            return $null
+        }
+        # Some Windows launcher shims exit before the detailed CUDA line is
+        # flushed. The least-protected device is the safest conservative guess.
+        $MinimumTarget = [int](($Targets | Measure-Object -Minimum).Minimum)
+        $FailedIndex = [Array]::IndexOf([int[]]$Targets, $MinimumTarget)
+        $FailedDevice = $Devices[$FailedIndex]
+    }
+    else {
+        $FailedIndex = [Array]::IndexOf([string[]]$Devices, [string]$FailedDevice)
+    }
+    if ($FailedIndex -lt 0) {
+        return $null
+    }
+
+    # A failed allocation is usually a single coarse layer/buffer. Reserve the
+    # whole failed allocation plus guard space so the retry cannot land on the
+    # same fragmentation boundary again.
+    $MinimumIncreaseMiB = if ($RequiredMiB -gt 0) { 512.0 } else { 1024.0 }
+    $IncreaseMiB = [int][Math]::Ceiling([Math]::Min(4096.0, [Math]::Max($MinimumIncreaseMiB, $RequiredMiB + 256.0)))
+    $Targets[$FailedIndex] += $IncreaseMiB
+
+    return [pscustomobject]@{
+        FailedDevice   = $FailedDevice
+        RequiredMiB    = [int][Math]::Ceiling($RequiredMiB)
+        IncreaseMiB    = $IncreaseMiB
+        FitTargetsMiB  = [int[]]$Targets
+        FitTarget      = ($Targets -join ',')
+    }
+}
+
+function Get-SmartVramBalanceAdjustment {
+    param(
+        $Plan,
+        [object[]]$AcceleratorInventory,
+        [double]$ModelSizeMiB,
+        [double]$MinimumDifferenceMiB = 768.0
+    )
+
+    if (-not $Plan -or -not $AcceleratorInventory -or $AcceleratorInventory.Count -lt 2 -or $ModelSizeMiB -le 0) {
+        return $null
+    }
+
+    $Devices = @($Plan.Devices | ForEach-Object { ([string]$_).ToUpperInvariant() })
+    $SplitValues = @(([string]$Plan.TensorSplit) -split ',' | ForEach-Object { [double]::Parse($_.Trim(), [Globalization.CultureInfo]::InvariantCulture) })
+    if ($Devices.Count -ne $SplitValues.Count) {
+        return $null
+    }
+
+    $Samples = @(
+        foreach ($Device in $Devices) {
+            $Match = $AcceleratorInventory | Where-Object { ([string]$_.Id).ToUpperInvariant() -eq $Device } | Select-Object -First 1
+            if (-not $Match) { return $null }
+            [pscustomobject]@{ Id = $Device; FreeMiB = [double]$Match.FreeMiB }
+        }
+    )
+    $Low = $Samples | Sort-Object FreeMiB | Select-Object -First 1
+    $High = $Samples | Sort-Object FreeMiB -Descending | Select-Object -First 1
+    $DifferenceMiB = [double]$High.FreeMiB - [double]$Low.FreeMiB
+    if ($DifferenceMiB -lt $MinimumDifferenceMiB) {
+        return $null
+    }
+
+    $LowIndex = [Array]::IndexOf([string[]]$Devices, [string]$Low.Id)
+    $HighIndex = [Array]::IndexOf([string[]]$Devices, [string]$High.Id)
+    if ($LowIndex -lt 0 -or $HighIndex -lt 0 -or $LowIndex -eq $HighIndex) {
+        return $null
+    }
+
+    # Moving X MiB from the fuller card to the emptier card closes the free
+    # memory gap by roughly 2X. Convert that measured correction to a model
+    # tensor percentage and leave at least 5% on every selected device.
+    $ShiftPercent = [Math]::Min(12.0, [Math]::Max(1.0, (($DifferenceMiB / 2.0) / $ModelSizeMiB) * 100.0))
+    $ShiftPercent = [Math]::Min($ShiftPercent, [Math]::Max(0.0, $SplitValues[$LowIndex] - 5.0))
+    if ($ShiftPercent -le 0) {
+        return $null
+    }
+    $SplitValues[$LowIndex] -= $ShiftPercent
+    $SplitValues[$HighIndex] += $ShiftPercent
+
+    return [pscustomobject]@{
+        LowDevice        = [string]$Low.Id
+        HighDevice       = [string]$High.Id
+        DifferenceMiB    = [int][Math]::Round($DifferenceMiB)
+        ShiftPercent     = $ShiftPercent
+        TensorSplit      = ($SplitValues | ForEach-Object { $_.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture) }) -join ','
+    }
+}
+
+function Get-FittedGpuLayerCount {
+    param(
+        [string]$LogPath,
+        [string]$LogText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LogText) -and -not [string]::IsNullOrWhiteSpace($LogPath) -and (Test-Path -LiteralPath $LogPath)) {
+        $LogText = Get-Content -LiteralPath $LogPath -Raw -ErrorAction SilentlyContinue
+    }
+    if ($LogText -match '(?im)offloaded\s+(\d+)\s*/\s*(\d+)\s+layers\s+to\s+GPU') {
+        return [pscustomobject]@{
+            GpuLayers   = [int]$Matches[1]
+            TotalLayers = [int]$Matches[2]
+        }
+    }
+    return $null
+}
+
 function Get-SmartVramAllocationPlan {
     param(
         [object[]]$AcceleratorInventory,
@@ -1141,6 +1320,13 @@ function Get-SmartVramAllocationPlan {
                 $AcceleratorInventory | Where-Object { $_.Id.ToString().ToUpperInvariant() -eq $RequestedId } | Select-Object -First 1
             }
         )
+    }
+    elseif ($SelectedInventory.Count -eq 2 -and
+            [string]$SelectedInventory[0].Id -eq "CUDA0" -and
+            [string]$SelectedInventory[1].Id -eq "CUDA1") {
+        # Put the second physical GPU first. Primary-device allocations such
+        # as mmproj, KV/intermediate buffers, and MTP will follow CUDA1.
+        $SelectedInventory = @($SelectedInventory[1], $SelectedInventory[0])
     }
     if ($SelectedInventory.Count -lt 2) {
         return $null
@@ -1200,15 +1386,25 @@ function Get-SmartVramAllocationPlan {
         $Percentages[$Entry.Index]++
     }
 
+    $FitTargetsMiB = @(Get-SmartVramFitTargets -SelectedInventory $SelectedInventory -BaseFitTargetMiB $EffectiveFitTargetMiB -FixedPrimaryMiB $FixedPrimaryMiB)
+
     return [pscustomobject]@{
         SplitMode        = if ([string]::IsNullOrWhiteSpace($RequestedSplitMode)) { "layer" } else { $RequestedSplitMode.Trim().ToLowerInvariant() }
         TensorSplit      = ($Percentages -join ',')
+        EstimatedTensorSplit = ($Percentages -join ',')
+        UsesFitManagedSplit = $true
         FixedPrimaryMiB  = [int][Math]::Ceiling($FixedPrimaryMiB)
         MmprojMiB        = [int][Math]::Ceiling($MmprojMiB)
         MtpMiB           = [int][Math]::Ceiling($MtpMiB)
         FitTargetMiB     = [int][Math]::Ceiling($EffectiveFitTargetMiB)
         Devices          = @($SelectedInventory | ForEach-Object { [string]$_.Id })
+        DeviceOrder      = (@($SelectedInventory | ForEach-Object { [string]$_.Id }) -join ',')
         AvailableMiB     = @($Capacities | ForEach-Object { [int][Math]::Floor($_) })
+        FitTargetsMiB    = [int[]]$FitTargetsMiB
+        FitTarget        = ($FitTargetsMiB -join ',')
+        OomRetryCount    = 0
+        BalanceRetryCount = 0
+        FittedGpuLayers  = $null
     }
 }
 
@@ -5252,6 +5448,527 @@ function Save-SavedLaunchDefault {
     }
 }
 
+function Get-GgufTrainingContextSize {
+    param([string]$Path)
+
+    $ResolvedPath = Resolve-ModelPath -Path $Path
+    if ([string]::IsNullOrWhiteSpace($ResolvedPath) -or -not (Test-Path -LiteralPath $ResolvedPath -PathType Leaf)) {
+        return $null
+    }
+    if ($script:ModelTrainingContextCache.ContainsKey($ResolvedPath)) {
+        return $script:ModelTrainingContextCache[$ResolvedPath]
+    }
+
+    $TrainingContext = $null
+    $Reader = $null
+    $Stream = $null
+    try {
+        $Stream = [System.IO.File]::Open($ResolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $Reader = New-Object System.IO.BinaryReader($Stream)
+        if ([System.Text.Encoding]::ASCII.GetString($Reader.ReadBytes(4)) -ne 'GGUF') {
+            throw 'Unsupported model format.'
+        }
+        $Version = $Reader.ReadUInt32()
+        if ($Version -lt 2 -or $Version -gt 3) {
+            throw "Unsupported GGUF version: $Version"
+        }
+        $null = $Reader.ReadUInt64()
+        $MetadataCount = $Reader.ReadUInt64()
+        for ($Index = 0; $Index -lt [int]$MetadataCount; $Index++) {
+            $Key = Read-GgufString -Reader $Reader
+            $Type = $Reader.ReadUInt32()
+            if ($Key -match '(^|\.)(context_length|n_ctx_train)$') {
+                $Value = Read-GgufScalarValue -Reader $Reader -Type $Type
+                if ($Value -is [ValueType] -and [int64]$Value -ge 1024) {
+                    $TrainingContext = [int]$Value
+                    break
+                }
+            }
+            else {
+                Skip-GgufValue -Reader $Reader -Type $Type
+            }
+        }
+    }
+    catch {
+        $TrainingContext = $null
+    }
+    finally {
+        if ($Reader) { $Reader.Close() }
+        elseif ($Stream) { $Stream.Close() }
+    }
+
+    $script:ModelTrainingContextCache[$ResolvedPath] = $TrainingContext
+    return $TrainingContext
+}
+
+function Set-LlamaContextArgument {
+    param(
+        [string[]]$Arguments,
+        [int]$ContextSize
+    )
+
+    $Result = New-Object System.Collections.Generic.List[string]
+    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
+        $Argument = [string]$Arguments[$Index]
+        if ($Argument -match '^--ctx-size=') {
+            continue
+        }
+        if ($Argument -eq '--ctx-size') {
+            $Index++
+            continue
+        }
+        $Result.Add($Argument)
+    }
+    $Result.Add('--ctx-size')
+    $Result.Add([string]$ContextSize)
+    return @($Result)
+}
+
+function Get-AutoTuneCandidateServerArgs {
+    param(
+        [int]$ContextSize,
+        $AutoTuning,
+        $ModelEntry
+    )
+
+    $OriginalLlamaArgs = @($script:LlamaArgs)
+    try {
+        $script:LlamaArgs = @(Set-LlamaContextArgument -Arguments $OriginalLlamaArgs -ContextSize $ContextSize)
+        $CandidateTuning = $AutoTuning | Select-Object * -ExcludeProperty SmartVramPlan
+        if (([string]$script:VramAllocationStrategy).Trim().ToLowerInvariant() -eq 'smart') {
+            $CandidatePlan = Get-SmartVramAllocationPlan `
+                -AcceleratorInventory $CandidateTuning.AcceleratorInventory `
+                -Arguments $script:LlamaArgs `
+                -ResolvedModelPath $ModelPath `
+                -ModelEntry $ModelEntry `
+                -ResolvedMmprojPath (Resolve-LaunchMmprojPath -ModelPath $ModelPath -ModelEntry $ModelEntry) `
+                -FitTargetMiB $CandidateTuning.FitTargetMiB
+            if ($CandidatePlan) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$script:AutoTuneTensorSplitOverride)) {
+                    $CandidatePlan | Add-Member -NotePropertyName TensorSplit -NotePropertyValue ([string]$script:AutoTuneTensorSplitOverride) -Force
+                }
+                $CandidateTuning | Add-Member -NotePropertyName SmartVramPlan -NotePropertyValue $CandidatePlan -Force
+            }
+        }
+        return @(Get-ServerArgs -AutoTuning $CandidateTuning)
+    }
+    finally {
+        $script:LlamaArgs = $OriginalLlamaArgs
+    }
+}
+
+function Test-AutoTuneContextCandidate {
+    param(
+        [string[]]$BaseArguments,
+        [int]$ContextSize,
+        [int]$TimeoutSec,
+        $AutoTuning = $null,
+        $ModelEntry = $null
+    )
+
+    $ProbeRoot = Join-Path $LogRoot 'auto-tune'
+    if (-not (Test-Path -LiteralPath $ProbeRoot)) {
+        [void](New-Item -ItemType Directory -Path $ProbeRoot -Force)
+    }
+    $ProbeOut = Join-Path $ProbeRoot ("ctx-{0}.stdout.log" -f $ContextSize)
+    $ProbeErr = Join-Path $ProbeRoot ("ctx-{0}.stderr.log" -f $ContextSize)
+    Remove-Item -LiteralPath $ProbeOut, $ProbeErr -Force -ErrorAction SilentlyContinue
+
+    $ProbeArguments = if ($AutoTuning) {
+        @(Get-AutoTuneCandidateServerArgs -ContextSize $ContextSize -AutoTuning $AutoTuning -ModelEntry $ModelEntry)
+    }
+    else {
+        @(Set-LlamaContextArgument -Arguments $BaseArguments -ContextSize $ContextSize)
+    }
+    $ProbeProcess = $null
+    try {
+        $ProbeProcess = Start-Process -FilePath $ServerExe `
+            -ArgumentList (ConvertTo-ArgumentString -Arguments $ProbeArguments) `
+            -WorkingDirectory $ScriptRoot `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $ProbeOut `
+            -RedirectStandardError $ProbeErr `
+            -PassThru
+        $Deadline = (Get-Date).AddSeconds([Math]::Max(30, $TimeoutSec))
+        $LastProgressAt = Get-Date
+        [long]$LastLogLength = -1
+        while ((Get-Date) -lt $Deadline) {
+            $ProbeStillRunning = Get-Process -Id $ProbeProcess.Id -ErrorAction SilentlyContinue
+            if (-not $ProbeStillRunning) {
+                return [pscustomobject]@{ Passed = $false; ContextSize = $ContextSize; RamFreeMiB = $null; GpuFreeMiB = $null; GpuDevices = @(); FailureReason = 'server process exited during startup' }
+            }
+            if (Test-Path -LiteralPath $ProbeErr) {
+                $LogFile = Get-Item -LiteralPath $ProbeErr -ErrorAction SilentlyContinue
+                if ($LogFile -and [long]$LogFile.Length -ne $LastLogLength) {
+                    $LastLogLength = [long]$LogFile.Length
+                    $LastProgressAt = Get-Date
+                }
+                $TerminalLog = Get-Content -LiteralPath $ProbeErr -Tail 40 -ErrorAction SilentlyContinue | Out-String
+                if ($TerminalLog -match '(?i)failed to initialize the context|failed to create (?:MTP )?context with model|exiting due to model loading error|GGML_ASSERT\(.+\) failed') {
+                    Stop-Process -Id $ProbeProcess.Id -Force -ErrorAction SilentlyContinue
+                    return [pscustomobject]@{ Passed = $false; ContextSize = $ContextSize; RamFreeMiB = $null; GpuFreeMiB = $null; GpuDevices = @(); FailureReason = 'terminal model-load failure' }
+                }
+            }
+            if (((Get-Date) - $LastProgressAt).TotalSeconds -ge 90) {
+                Stop-Process -Id $ProbeProcess.Id -Force -ErrorAction SilentlyContinue
+                return [pscustomobject]@{ Passed = $false; ContextSize = $ContextSize; RamFreeMiB = $null; GpuFreeMiB = $null; GpuDevices = @(); FailureReason = 'no startup progress for 90 seconds' }
+            }
+            try {
+                $Response = Invoke-WebRequest -Uri "$BaseUrl/health" -UseBasicParsing -TimeoutSec 3
+                if ($Response.StatusCode -ge 200 -and $Response.StatusCode -lt 300) {
+                    $SmokeBody = @{ prompt = 'Auto Tune stability probe'; n_predict = 1; cache_prompt = $false } | ConvertTo-Json -Compress
+                    $SmokeHeaders = @{}
+                    $ProbeApiKey = Get-LlamaArgumentValue -Arguments $ProbeArguments -Patterns @('^--api-key(?:=(.+))?$')
+                    if (-not [string]::IsNullOrWhiteSpace([string]$ProbeApiKey)) {
+                        $SmokeHeaders['Authorization'] = "Bearer $ProbeApiKey"
+                    }
+                    try {
+                        $null = Invoke-RestMethod -Uri "$BaseUrl/completion" -Method Post -ContentType 'application/json' -Headers $SmokeHeaders -Body $SmokeBody -TimeoutSec 30
+                    }
+                    catch {
+                        return [pscustomobject]@{ Passed = $false; ContextSize = $ContextSize; RamFreeMiB = $null; GpuFreeMiB = $null; GpuDevices = @(); FailureReason = ('inference smoke test failed: ' + $_.Exception.Message) }
+                    }
+                    $Ram = Get-SystemMemoryInfo
+                    $Gpu = @(Get-AcceleratorInventory)
+                    $GpuFreeMiB = if ($Gpu.Count -gt 0) { [double](($Gpu | Measure-Object -Property FreeMiB -Sum).Sum) } else { $null }
+                    return [pscustomobject]@{
+                        Passed     = $true
+                        ContextSize = $ContextSize
+                        RamFreeMiB = if ($Ram) { [double]$Ram.FreeMiB } else { $null }
+                        GpuFreeMiB = $GpuFreeMiB
+                        GpuDevices = @($Gpu | ForEach-Object { [pscustomobject]@{ Id = [string]$_.Id; FreeMiB = [double]$_.FreeMiB; TotalMiB = [double]$_.TotalMiB } })
+                        DeviceOrder = [string](Get-LlamaArgumentValue -Arguments $ProbeArguments -Patterns @('^(?:--device|-dev)(?:=(.+))?$'))
+                        TensorSplit = [string](Get-LlamaArgumentValue -Arguments $ProbeArguments -Patterns @('^(?:--tensor-split|-ts)(?:=(.+))?$'))
+                        FailureReason = ''
+                    }
+                }
+            }
+            catch {
+            }
+            Start-Sleep -Seconds 1
+            $ProbeProcess.Refresh()
+        }
+        return [pscustomobject]@{ Passed = $false; ContextSize = $ContextSize; RamFreeMiB = $null; GpuFreeMiB = $null; GpuDevices = @(); FailureReason = 'startup health check timed out' }
+    }
+    catch {
+        return [pscustomobject]@{ Passed = $false; ContextSize = $ContextSize; RamFreeMiB = $null; GpuFreeMiB = $null; GpuDevices = @(); FailureReason = $_.Exception.Message }
+    }
+    finally {
+        if ($ProbeProcess -and (Get-Process -Id $ProbeProcess.Id -ErrorAction SilentlyContinue)) {
+            Stop-Process -Id $ProbeProcess.Id -Force -ErrorAction SilentlyContinue
+            try { [void]$ProbeProcess.WaitForExit(10000) } catch {}
+        }
+        Start-Sleep -Milliseconds 750
+    }
+}
+
+function Test-AutoTuneBalancedContextCandidate {
+    param(
+        [string[]]$BaseArguments,
+        [int]$ContextSize,
+        [int]$TimeoutSec,
+        $AutoTuning,
+        $ModelEntry
+    )
+
+    $LastGood = $null
+    $LastGoodOverride = [string]$script:AutoTuneTensorSplitOverride
+    for ($BalanceAttempt = 0; $BalanceAttempt -lt 3; $BalanceAttempt++) {
+        $Result = Test-AutoTuneContextCandidate -BaseArguments $BaseArguments -ContextSize $ContextSize -TimeoutSec $TimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+        if (-not $Result.Passed) {
+            if ($LastGood) {
+                $script:AutoTuneTensorSplitOverride = $LastGoodOverride
+                Write-Host ("Auto Tune: split adjustment failed at CTX {0:N0}; restored split {1}." -f $ContextSize, $LastGoodOverride) -ForegroundColor Yellow
+                return $LastGood
+            }
+            return $Result
+        }
+
+        $LastGood = $Result
+        $LastGoodOverride = [string]$Result.TensorSplit
+        if (([string]$script:VramAllocationStrategy).Trim().ToLowerInvariant() -ne 'smart' -or
+            $Result.GpuDevices.Count -lt 2 -or
+            [string]::IsNullOrWhiteSpace([string]$Result.DeviceOrder) -or
+            [string]::IsNullOrWhiteSpace([string]$Result.TensorSplit)) {
+            return $Result
+        }
+
+        $Devices = @($Result.GpuDevices | Sort-Object FreeMiB)
+        $LowFreeDevice = $Devices[0]
+        $HighFreeDevice = $Devices[-1]
+        $FreeDifferenceMiB = [double]$HighFreeDevice.FreeMiB - [double]$LowFreeDevice.FreeMiB
+        if ($FreeDifferenceMiB -le 512) {
+            return $Result
+        }
+        if ($BalanceAttempt -ge 2) {
+            $script:AutoTuneTensorSplitOverride = $LastGoodOverride
+            return $Result
+        }
+
+        $DeviceOrder = @($Result.DeviceOrder -split ',' | ForEach-Object { $_.Trim().ToUpperInvariant() })
+        $SplitValues = @($Result.TensorSplit -split ',' | ForEach-Object { [double]::Parse($_.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) })
+        if ($DeviceOrder.Count -ne $SplitValues.Count) {
+            return $Result
+        }
+        $LowIndex = [Array]::IndexOf($DeviceOrder, ([string]$LowFreeDevice.Id).ToUpperInvariant())
+        $HighIndex = [Array]::IndexOf($DeviceOrder, ([string]$HighFreeDevice.Id).ToUpperInvariant())
+        if ($LowIndex -lt 0 -or $HighIndex -lt 0 -or $LowIndex -eq $HighIndex) {
+            return $Result
+        }
+
+        $ModelSizeMiB = [Math]::Max(1.0, (Get-Item -LiteralPath $ModelPath).Length / 1MB)
+        $ShiftPercent = [Math]::Min(10.0, [Math]::Max(1.0, (($FreeDifferenceMiB / 2.0) / $ModelSizeMiB) * 100.0))
+        $ShiftPercent = [Math]::Min($ShiftPercent, [Math]::Max(0.0, $SplitValues[$LowIndex] - 5.0))
+        if ($ShiftPercent -le 0) {
+            return $Result
+        }
+        $SplitValues[$LowIndex] -= $ShiftPercent
+        $SplitValues[$HighIndex] += $ShiftPercent
+        $script:AutoTuneTensorSplitOverride = ($SplitValues | ForEach-Object { $_.ToString('0.##', [System.Globalization.CultureInfo]::InvariantCulture) }) -join ','
+        Write-Host (Format-BilingualText -ChineseText ("Auto Tune：{0} 比 {1} 少 {2:N0} MiB 可用顯存；tensor split {3} -> {4}，重測相同 CTX。" -f $LowFreeDevice.Id, $HighFreeDevice.Id, $FreeDifferenceMiB, $Result.TensorSplit, $script:AutoTuneTensorSplitOverride) -EnglishText ("Auto Tune: {0} has {2:N0} MiB less free VRAM than {1}; tensor split {3} -> {4}, retrying the same CTX." -f $LowFreeDevice.Id, $HighFreeDevice.Id, $FreeDifferenceMiB, $Result.TensorSplit, $script:AutoTuneTensorSplitOverride)) -ForegroundColor Cyan
+    }
+    $script:AutoTuneTensorSplitOverride = $LastGoodOverride
+    return $LastGood
+}
+
+function Invoke-MaxContextAutoTune {
+    param(
+        [string[]]$BaseArguments,
+        $ModelEntry,
+        $AutoTuning
+    )
+
+    $script:AutoTuneTensorSplitOverride = $null
+    $Card = Get-BenchmarkModelCardEstimate -ModelEntry $ModelEntry -ModelPath $ModelPath
+    $Step = 1024
+    $Maximum = [Math]::Max($Step, [int]([Math]::Floor([int]$Card.SupportedContext / $Step) * $Step))
+    $Best = 0
+    $KnownBad = $null
+    Write-Host (Format-BilingualText -ChineseText ("Auto Tune：開始搜尋最大可用 CTX，上限 {0:N0}。" -f $Maximum) -EnglishText ("Auto Tune: searching for the maximum usable CTX up to {0:N0}." -f $Maximum)) -ForegroundColor Cyan
+
+    Write-Host (Format-BilingualText -ChineseText "Auto Tune：基準測試 CTX 1,024..." -EnglishText "Auto Tune: baseline probe at CTX 1,024...") -ForegroundColor Cyan
+    $First = Test-AutoTuneBalancedContextCandidate -BaseArguments $BaseArguments -ContextSize 1024 -TimeoutSec $ReadyTimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+    if (-not $First.Passed) {
+        throw (Format-BilingualText -ChineseText "Auto Tune：連最低 CTX 1024 都無法成功啟動模型。" -EnglishText "Auto Tune: the model could not start even at the minimum CTX 1024.")
+    }
+    $Best = 1024
+    $BestResult = $First
+
+    $SecondContext = [Math]::Min(30720, $Maximum)
+    Write-Host (Format-BilingualText -ChineseText ("Auto Tune：斜率測試 CTX {0:N0}..." -f $SecondContext) -EnglishText ("Auto Tune: memory-slope probe at CTX {0:N0}..." -f $SecondContext)) -ForegroundColor Cyan
+    $Second = Test-AutoTuneBalancedContextCandidate -BaseArguments $BaseArguments -ContextSize $SecondContext -TimeoutSec $ReadyTimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+    if ($Second.Passed) { $Best = $SecondContext; $BestResult = $Second }
+    else {
+        $KnownBad = $SecondContext
+        Write-Host ("Auto Tune: CTX {0:N0} failed ({1}); continuing automatically." -f $SecondContext, $Second.FailureReason) -ForegroundColor Yellow
+    }
+
+    $CalibrationContext = [Math]::Min(61440, $Maximum)
+    $Calibration = $null
+    if ($Second.Passed -and $CalibrationContext -gt $SecondContext) {
+        Write-Host (Format-BilingualText -ChineseText ("Auto Tune：高 CTX 校準測試 {0:N0}..." -f $CalibrationContext) -EnglishText ("Auto Tune: high-CTX calibration probe at {0:N0}..." -f $CalibrationContext)) -ForegroundColor Cyan
+        $Calibration = Test-AutoTuneBalancedContextCandidate -BaseArguments $BaseArguments -ContextSize $CalibrationContext -TimeoutSec $ReadyTimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+        if ($Calibration.Passed) { $Best = $CalibrationContext; $BestResult = $Calibration }
+        else {
+            $KnownBad = $CalibrationContext
+            Write-Host ("Auto Tune: CTX {0:N0} failed ({1}); correcting automatically." -f $CalibrationContext, $Calibration.FailureReason) -ForegroundColor Yellow
+        }
+    }
+
+    $SlopeFirst = $First
+    $SlopeSecond = $Second
+    if ($Calibration -and $Calibration.Passed) {
+        $SlopeFirst = $Second
+        $SlopeSecond = $Calibration
+    }
+
+    if ($Second.Passed) {
+        $RamSampleText = if ($null -ne $First.RamFreeMiB -and $null -ne $Second.RamFreeMiB) { "{0:N0} -> {1:N0} MiB" -f $First.RamFreeMiB, $Second.RamFreeMiB } else { "unavailable" }
+        $GpuSampleText = if ($Second.GpuDevices -and $Second.GpuDevices.Count -gt 0) {
+            (@($Second.GpuDevices | ForEach-Object {
+                $Device = $_
+                $FirstDevice = @($First.GpuDevices | Where-Object { $_.Id -eq $Device.Id } | Select-Object -First 1)
+                if ($FirstDevice) { "{0} {1:N0}->{2:N0} MiB" -f $Device.Id, $FirstDevice[0].FreeMiB, $Device.FreeMiB } else { "{0} {1:N0} MiB" -f $Device.Id, $Device.FreeMiB }
+            })) -join '; '
+        } else { "unavailable" }
+        Write-Host (Format-BilingualText -ChineseText ("Auto Tune：實測剩餘 RAM {0}；VRAM {1}。" -f $RamSampleText, $GpuSampleText) -EnglishText ("Auto Tune: measured free RAM {0}; VRAM {1}." -f $RamSampleText, $GpuSampleText)) -ForegroundColor DarkCyan
+    }
+
+    $PredictionSource = ""
+    $RawPrediction = $null
+    $Predicted = if (-not $Second.Passed) {
+        $PredictionSource = "30720 probe failed; conservative third probe"
+        16384
+    }
+    else {
+        $DeltaTokens = [double]($SlopeSecond.ContextSize - $SlopeFirst.ContextSize)
+        $Candidates = New-Object System.Collections.Generic.List[double]
+        if ($null -ne $SlopeFirst.RamFreeMiB -and $null -ne $SlopeSecond.RamFreeMiB) {
+            $RamPerToken = ([double]$SlopeFirst.RamFreeMiB - [double]$SlopeSecond.RamFreeMiB) / $DeltaTokens
+            if (($SlopeFirst.RamFreeMiB - $SlopeSecond.RamFreeMiB) -ge 16 -and $RamPerToken -gt 0) {
+                $Candidates.Add($SlopeSecond.ContextSize + ([Math]::Max(0, [double]$SlopeSecond.RamFreeMiB - 4096) / $RamPerToken))
+            }
+        }
+        foreach ($SecondDevice in @($SlopeSecond.GpuDevices)) {
+            $FirstDevice = @($SlopeFirst.GpuDevices | Where-Object { $_.Id -eq $SecondDevice.Id } | Select-Object -First 1)
+            if (-not $FirstDevice) { continue }
+            $DeviceDeltaMiB = [double]$FirstDevice[0].FreeMiB - [double]$SecondDevice.FreeMiB
+            $GpuPerToken = $DeviceDeltaMiB / $DeltaTokens
+            if ($DeviceDeltaMiB -ge 16 -and $GpuPerToken -gt 0) {
+                # Each GPU is an independent hard limit. Fixed model/mmproj/MTP
+                # allocations are already reflected in SecondDevice.FreeMiB.
+                $GpuReserveMiB = [Math]::Max(256.0, [double]$AutoTuneReuseHeadroomMiB)
+                $Candidates.Add($SlopeSecond.ContextSize + ([Math]::Max(0, [double]$SecondDevice.FreeMiB - $GpuReserveMiB) / $GpuPerToken))
+                Write-Host (Format-BilingualText -ChineseText ("Auto Tune：{0} 每 1K CTX 約增加 {1:N1} MiB，剩餘 {2:N0} MiB。" -f $SecondDevice.Id, ($GpuPerToken * 1024), $SecondDevice.FreeMiB) -EnglishText ("Auto Tune: {0} adds about {1:N1} MiB per 1K CTX; {2:N0} MiB remains." -f $SecondDevice.Id, ($GpuPerToken * 1024), $SecondDevice.FreeMiB)) -ForegroundColor DarkCyan
+            }
+        }
+        if ($Candidates.Count -gt 0) {
+            $PredictionSource = "measured RAM/VRAM slope"
+            $RawPrediction = [double](($Candidates | Measure-Object -Minimum).Minimum)
+            $RawPrediction
+        }
+        else {
+            $PredictionSource = "memory delta too small or noisy; conservative third probe"
+            [double][Math]::Min($Maximum, 8192)
+        }
+    }
+    $GrowthBase = if ($Calibration -and $Calibration.Passed) { $CalibrationContext } else { $SecondContext }
+    $SafetyAdjustedPrediction = $null
+    if ($null -ne $RawPrediction) {
+        # Memory growth becomes less linear at high CTX because of allocation
+        # granularity, fragmentation, KV/MTP buffers, and per-device limits.
+        # Preserve the measured-good base and halve only the unverified gain.
+        $SafetyAdjustedPrediction = $GrowthBase + ([Math]::Max(0.0, [double]$RawPrediction - $GrowthBase) * 0.5)
+        $Predicted = $SafetyAdjustedPrediction
+        $PredictionSource = "measured slope with 0.5 safety factor on unverified CTX growth"
+    }
+    if ($Calibration -and -not $Calibration.Passed) {
+        $PredictionSource = "61440 calibration failed; correcting inside the measured bracket"
+        $Predicted = [int][Math]::Floor((($SecondContext + $CalibrationContext) / 2) / $Step) * $Step
+        $RawPrediction = $null
+        $SafetyAdjustedPrediction = $null
+    }
+    $ConservativeGrowthLimit = [Math]::Min($Maximum, $GrowthBase * 2)
+    $Predicted = [Math]::Min($ConservativeGrowthLimit, [Math]::Max($Step, [int]([Math]::Floor($Predicted / $Step) * $Step)))
+    $Predicted = [Math]::Max($Best, $Predicted)
+    if ($null -ne $KnownBad) {
+        $Predicted = [Math]::Min($Predicted, $KnownBad - $Step)
+    }
+    if ($Predicted -ne 1024 -and $Predicted -ne $SecondContext -and $Predicted -ne $CalibrationContext) {
+        if ($null -ne $SafetyAdjustedPrediction) {
+            Write-Host (Format-BilingualText -ChineseText ("Auto Tune：原始估算 {0:N0}；以成功基準 {1:N0} 對額外增量套用 0.5 安全係數後，本次測試 {2:N0}。" -f $RawPrediction, $GrowthBase, $Predicted) -EnglishText ("Auto Tune: raw estimate {0:N0}; after applying a 0.5 safety factor to growth beyond the proven base {1:N0}, probing {2:N0}." -f $RawPrediction, $GrowthBase, $Predicted)) -ForegroundColor Cyan
+        }
+        elseif ($null -ne $RawPrediction -and $RawPrediction -gt $ConservativeGrowthLimit) {
+            Write-Host (Format-BilingualText -ChineseText ("Auto Tune：記憶體斜率原始估算 {0:N0}，為避免直接跳到極限，本次測試限制為 {1:N0}。" -f $RawPrediction, $Predicted) -EnglishText ("Auto Tune: raw memory-slope estimate is {0:N0}; limited to {1:N0} to avoid jumping directly to the extreme." -f $RawPrediction, $Predicted)) -ForegroundColor Cyan
+        }
+        else {
+            Write-Host (Format-BilingualText -ChineseText ("Auto Tune：第三次測試 CTX {0:N0}（{1}）。" -f $Predicted, $PredictionSource) -EnglishText ("Auto Tune: third probe CTX {0:N0} ({1})." -f $Predicted, $PredictionSource)) -ForegroundColor Cyan
+        }
+        $PredictionProbe = Test-AutoTuneBalancedContextCandidate -BaseArguments $BaseArguments -ContextSize $Predicted -TimeoutSec $ReadyTimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+        if ($PredictionProbe.Passed) {
+            $Best = $Predicted
+            $BestResult = $PredictionProbe
+        }
+        else {
+            $KnownBad = if ($null -eq $KnownBad) { $Predicted } else { [Math]::Min($KnownBad, $Predicted) }
+            Write-Host ("Auto Tune: CTX {0:N0} failed ({1}); searching below it automatically." -f $Predicted, $PredictionProbe.FailureReason) -ForegroundColor Yellow
+            $CorrectionLow = $Best + $Step
+            $CorrectionHigh = $Predicted - $Step
+            while ($CorrectionLow -le $CorrectionHigh) {
+                $Candidate = [int]([Math]::Floor((($CorrectionLow + $CorrectionHigh) / 2) / $Step) * $Step)
+                $Result = Test-AutoTuneBalancedContextCandidate -BaseArguments $BaseArguments -ContextSize $Candidate -TimeoutSec $ReadyTimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+                if ($Result.Passed) {
+                    $Best = $Candidate
+                    $BestResult = $Result
+                    $CorrectionLow = $Candidate + $Step
+                }
+                else {
+                    $KnownBad = if ($null -eq $KnownBad) { $Candidate } else { [Math]::Min($KnownBad, $Candidate) }
+                    Write-Host ("Auto Tune: CTX {0:N0} failed ({1}); lowering automatically." -f $Candidate, $Result.FailureReason) -ForegroundColor Yellow
+                    $CorrectionHigh = $Candidate - $Step
+                }
+            }
+        }
+    }
+
+    # A successful prediction is not the maximum. Keep growing until the first
+    # failure establishes an upper bound, or the GGUF training limit succeeds.
+    while ($null -eq $KnownBad -and $Best -lt $Maximum) {
+        $GrowthCandidate = [int]([Math]::Floor(([Math]::Min($Maximum, [Math]::Max($Best + $Step, $Best * 1.5))) / $Step) * $Step)
+        if ($GrowthCandidate -le $Best) { break }
+        Write-Host ("Auto Tune: extending the proven range with CTX {0:N0}..." -f $GrowthCandidate) -ForegroundColor Cyan
+        $GrowthResult = Test-AutoTuneBalancedContextCandidate -BaseArguments $BaseArguments -ContextSize $GrowthCandidate -TimeoutSec $ReadyTimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+        if ($GrowthResult.Passed) {
+            $Best = $GrowthCandidate
+            $BestResult = $GrowthResult
+        }
+        else {
+            $KnownBad = $GrowthCandidate
+            Write-Host ("Auto Tune: CTX {0:N0} failed ({1}); upper bound established." -f $GrowthCandidate, $GrowthResult.FailureReason) -ForegroundColor Yellow
+        }
+    }
+
+    # Converge to 1024-token precision between the highest proven success and
+    # the lowest observed failure. knownGood never moves backwards.
+    if ($null -ne $KnownBad) {
+        $CorrectionLow = $Best + $Step
+        $CorrectionHigh = $KnownBad - $Step
+        while ($CorrectionLow -le $CorrectionHigh) {
+            $Candidate = [int]([Math]::Floor((($CorrectionLow + $CorrectionHigh) / 2) / $Step) * $Step)
+            if ($Candidate -le $Best) { break }
+            $Result = Test-AutoTuneBalancedContextCandidate -BaseArguments $BaseArguments -ContextSize $Candidate -TimeoutSec $ReadyTimeoutSec -AutoTuning $AutoTuning -ModelEntry $ModelEntry
+            if ($Result.Passed) {
+                $Best = $Candidate
+                $BestResult = $Result
+                $CorrectionLow = $Candidate + $Step
+            }
+            else {
+                $KnownBad = [Math]::Min($KnownBad, $Candidate)
+                $CorrectionHigh = $Candidate - $Step
+            }
+        }
+    }
+
+    if ($script:ActiveLaunchConfig) {
+        $script:ActiveLaunchConfig.ContextSize = [string]$Best
+        $script:ActiveLaunchConfig.AutoTune = $false
+        [void](Save-SavedLaunchDefault -Config $script:ActiveLaunchConfig)
+    }
+    $script:LlamaArgs = @(Set-LlamaContextArgument -Arguments $LlamaArgs -ContextSize $Best)
+    if (([string]$script:VramAllocationStrategy).Trim().ToLowerInvariant() -eq 'smart') {
+        $BestPlan = Get-SmartVramAllocationPlan `
+            -AcceleratorInventory $AutoTuning.AcceleratorInventory `
+            -Arguments $script:LlamaArgs `
+            -ResolvedModelPath $ModelPath `
+            -ModelEntry $ModelEntry `
+            -ResolvedMmprojPath (Resolve-LaunchMmprojPath -ModelPath $ModelPath -ModelEntry $ModelEntry) `
+            -FitTargetMiB $AutoTuning.FitTargetMiB
+        if ($BestPlan) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$script:AutoTuneTensorSplitOverride)) {
+                $BestPlan | Add-Member -NotePropertyName TensorSplit -NotePropertyValue ([string]$script:AutoTuneTensorSplitOverride) -Force
+            }
+            $AutoTuning | Add-Member -NotePropertyName SmartVramPlan -NotePropertyValue $BestPlan -Force
+        }
+    }
+    if ($BestResult -and $BestResult.GpuDevices) {
+        $DisplayDevices = @(
+            $BestResult.GpuDevices |
+                Sort-Object { [int]([regex]::Match([string]$_.Id, '\d+').Value) } |
+                Select-Object -First 2
+        )
+        foreach ($Device in $DisplayDevices) {
+            Write-BilingualField `
+                -ChineseLabel ("{0} 剩餘顯存" -f $Device.Id) `
+                -EnglishLabel ("{0} Free VRAM" -f $Device.Id) `
+                -ChineseValue ("{0:N0} MiB / {1:N0} MiB（最佳 CTX probe 完成時）" -f $Device.FreeMiB, $Device.TotalMiB) `
+                -EnglishValue ("{0:N0} MiB / {1:N0} MiB (after the best-CTX probe)" -f $Device.FreeMiB, $Device.TotalMiB) `
+                -ForegroundColor Cyan
+        }
+    }
+    Write-Host (Format-BilingualText -ChineseText ("Auto Tune：最大穩定 CTX 為 {0:N0}，已儲存為模型預設值。" -f $Best) -EnglishText ("Auto Tune: maximum stable CTX is {0:N0}; saved as the model default." -f $Best)) -ForegroundColor Green
+    return $Best
+}
+
 function Get-SavedLaunchDefaultForModel {
     param(
         [string]$ModelPath
@@ -5932,6 +6649,16 @@ function Write-BilingualField {
 
     $LabelText = Format-BilingualText -ChineseText $ChineseLabel -EnglishText $EnglishLabel
     $ValueText = Format-BilingualText -ChineseText $ChineseValue -EnglishText $EnglishValue
+    if ($null -ne $script:StatusCardCollector) {
+        $script:StatusCardCollector.Add([pscustomobject]@{
+                ChineseLabel   = $ChineseLabel
+                EnglishLabel   = $EnglishLabel
+                ChineseValue   = $ChineseValue
+                EnglishValue   = $EnglishValue
+                ForegroundColor = $ForegroundColor
+            })
+        return
+    }
     $Line = "{0}: {1}" -f $LabelText, $ValueText
     if ((Get-TextDisplayWidth -Text $Line) -gt ((Get-ConsoleWidth) - 2)) {
         $TextColor = if ([string]::IsNullOrWhiteSpace($ForegroundColor)) { "Gray" } else { $ForegroundColor }
@@ -5940,6 +6667,113 @@ function Write-BilingualField {
     }
 
     if ([string]::IsNullOrWhiteSpace($ForegroundColor)) { Write-Host $Line } else { Write-Host $Line -ForegroundColor $ForegroundColor }
+}
+
+function Get-StatusCardCategory {
+    param([string]$EnglishLabel)
+
+    switch ($EnglishLabel) {
+        { $_ -in @('Status', 'PID', 'URL', 'Port', 'State', 'Web UI', 'Build', 'Metrics', 'Track') } { return 'Overview' }
+        { $_ -in @('Server', 'Model', 'Alias', 'Ctx', 'Max Output', 'Tokens', 'GPU', 'Layers') } { return 'Model' }
+        { $_ -in @('Buffer', 'Threads', 'Batch', 'Host', 'Slots', 'Fit', 'Cache', 'Device', 'Split', 'Tensor') } { return 'Resources' }
+        { $_ -in @('Think', 'Budget', 'MTP', 'Draft', 'FlashAttn2', 'Sample', 'Penalty', 'Seed', 'Stream', 'Sampler', 'Extra', 'API Key') } { return 'Inference' }
+        default { return 'Files' }
+    }
+}
+
+function Split-StatusCardText {
+    param(
+        [string]$Text,
+        [int]$Width
+    )
+
+    $SafeText = if ($null -eq $Text) { '' } else { [string]$Text }
+    $Lines = New-Object System.Collections.Generic.List[string]
+    foreach ($SourceLine in ($SafeText -split "\r?\n")) {
+        $Builder = New-Object System.Text.StringBuilder
+        $CurrentWidth = 0
+        foreach ($Char in $SourceLine.ToCharArray()) {
+            $CharText = [string]$Char
+            $CharWidth = Get-TextDisplayWidth -Text $CharText
+            if ($Builder.Length -gt 0 -and ($CurrentWidth + $CharWidth) -gt $Width) {
+                $Lines.Add($Builder.ToString().TrimEnd())
+                [void]$Builder.Clear()
+                $CurrentWidth = 0
+            }
+            [void]$Builder.Append($Char)
+            $CurrentWidth += $CharWidth
+        }
+        $Lines.Add($Builder.ToString().TrimEnd())
+    }
+    if ($Lines.Count -eq 0) { $Lines.Add('') }
+    return [string[]]$Lines.ToArray()
+}
+
+function Add-StatusCardPadding {
+    param(
+        [string]$Text,
+        [int]$Width
+    )
+
+    $SafeText = if ($null -eq $Text) { '' } else { [string]$Text }
+    $Padding = [Math]::Max(0, $Width - (Get-TextDisplayWidth -Text $SafeText))
+    return $SafeText + (' ' * $Padding)
+}
+
+function Write-StatusAsciiCard {
+    param(
+        [string]$Title,
+        [object[]]$Fields,
+        [int]$Width
+    )
+
+    if (-not $Fields -or $Fields.Count -eq 0) { return }
+    $InnerWidth = $Width - 2
+    $TitleText = "[ $Title ]"
+    $TopFill = [Math]::Max(0, $InnerWidth - (Get-TextDisplayWidth -Text $TitleText))
+    Write-Host ('+' + $TitleText + ('-' * $TopFill) + '+') -ForegroundColor DarkCyan
+
+    $LabelWidth = [Math]::Min(24, [Math]::Max(16, [int](($Fields | ForEach-Object {
+                        Get-TextDisplayWidth -Text (Format-BilingualText -ChineseText $_.ChineseLabel -EnglishText $_.EnglishLabel)
+                    } | Measure-Object -Maximum).Maximum)))
+    $ValueWidth = [Math]::Max(20, $InnerWidth - $LabelWidth - 3)
+
+    foreach ($Field in $Fields) {
+        $Label = Format-BilingualText -ChineseText $Field.ChineseLabel -EnglishText $Field.EnglishLabel
+        $Value = if ([string]::Equals(([string]$Field.ChineseValue).Trim(), ([string]$Field.EnglishValue).Trim(), [StringComparison]::OrdinalIgnoreCase)) {
+            [string]$Field.ChineseValue
+        }
+        else {
+            Format-BilingualText -ChineseText $Field.ChineseValue -EnglishText $Field.EnglishValue
+        }
+        $ValueLines = @(Split-StatusCardText -Text $Value -Width $ValueWidth)
+        for ($Index = 0; $Index -lt $ValueLines.Count; $Index++) {
+            $CurrentLabel = if ($Index -eq 0) { $Label } else { '' }
+            $Separator = if ($Index -eq 0) { ' : ' } else { '   ' }
+            $Body = (Add-StatusCardPadding -Text $CurrentLabel -Width $LabelWidth) + $Separator + (Add-StatusCardPadding -Text $ValueLines[$Index] -Width $ValueWidth)
+            $Color = if ([string]::IsNullOrWhiteSpace([string]$Field.ForegroundColor)) { 'Gray' } else { [string]$Field.ForegroundColor }
+            Write-Host ('|' + $Body + '|') -ForegroundColor $Color
+        }
+    }
+    Write-Host ('+' + ('-' * $InnerWidth) + '+') -ForegroundColor DarkCyan
+    Write-Host ''
+}
+
+function Write-StatusCardDashboard {
+    param([object[]]$Fields)
+
+    $Width = [Math]::Min(132, [Math]::Max(80, (Get-ConsoleWidth) - 2))
+    $Cards = @(
+        [pscustomobject]@{ Key = 'Overview'; Title = 'OVERVIEW / 總覽' },
+        [pscustomobject]@{ Key = 'Model'; Title = 'MODEL / 模型與上下文' },
+        [pscustomobject]@{ Key = 'Resources'; Title = 'RESOURCES / GPU 與資源' },
+        [pscustomobject]@{ Key = 'Inference'; Title = 'INFERENCE / 推理設定' },
+        [pscustomobject]@{ Key = 'Files'; Title = 'VISION & FILES / 視覺與檔案' }
+    )
+    foreach ($Card in $Cards) {
+        $CardFields = @($Fields | Where-Object { (Get-StatusCardCategory -EnglishLabel $_.EnglishLabel) -eq $Card.Key })
+        Write-StatusAsciiCard -Title $Card.Title -Fields $CardFields -Width $Width
+    }
 }
 
 function Get-WrappedTextLines {
@@ -7106,7 +7940,8 @@ function Get-BenchmarkModelCardEstimate {
     }
 
     $CardOverride = Get-BenchmarkModelCardOverride -ModelEntry $ModelEntry -ModelPath $ResolvedModelPath
-    $SupportedContext = $script:ManagedDefaultContextSize
+    $MetadataTrainingContext = Get-GgufTrainingContextSize -Path $ResolvedModelPath
+    $SupportedContext = if ($null -ne $MetadataTrainingContext) { [int]$MetadataTrainingContext } else { $script:ManagedDefaultContextSize }
     $ContextMatches = [regex]::Matches($IdentityText, '(?i)(\d{2,6})\s*k(?:[^a-z0-9]|$)|(?:ctx|context|n_ctx)[-_. =]*(\d{4,6})')
     foreach ($Match in $ContextMatches) {
         $ValueText = if ($Match.Groups[1].Success) { $Match.Groups[1].Value } else { $Match.Groups[2].Value }
@@ -8735,8 +9570,8 @@ function Get-LaunchConfigItemHelp {
         }
         "AutoTune" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "在成功接近滿 VRAM 的啟動後，學習並保存可重用的 GPU fitting 參數。" -EnglishText "Learns reusable GPU fitting values after successful near-full-VRAM launches."
-                Recommendation = Format-BilingualText -ChineseText "想讓 wrapper 記住穩定的自動化設定時就開啟；如果你偏好明確固定的 preset，就保持關閉。" -EnglishText "Use it when you want the wrapper to remember a stable automatic profile. Leave it off if you prefer explicit fixed presets."
+                Purpose = Format-BilingualText -ChineseText "正式啟動前先測 CTX 1024 與 30720，依 RAM／VRAM 差值推算接近上限的第三個 CTX，必要時局部校正，儲存為模型預設後再正常啟動。" -EnglishText "Probes CTX 1024 and 30720, predicts a near-limit third CTX from the RAM/VRAM delta, locally corrects if needed, saves the model default, then launches normally."
+                Recommendation = Format-BilingualText -ChineseText "第一次替模型找最大 CTX 時開啟；調校會載入模型多次，因此需要較長時間。" -EnglishText "Enable this when finding a model's maximum CTX for the first time. Tuning takes longer because the model is loaded multiple times."
             }
         }
         "Threads" {
@@ -9290,11 +10125,15 @@ function Get-LlamaServerArgsFromLaunchConfig {
     }
 
     if ($AutoLaunchTuning.PSObject.Properties["SmartVramPlan"] -and $AutoLaunchTuning.SmartVramPlan) {
+        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--device|-dev)(?:=|$)'))) {
+            $Arguments.Add("--device")
+            $Arguments.Add([string]$AutoLaunchTuning.SmartVramPlan.DeviceOrder)
+        }
         if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--split-mode|-sm)(?:=|$)'))) {
             $Arguments.Add("--split-mode")
             $Arguments.Add([string]$AutoLaunchTuning.SmartVramPlan.SplitMode)
         }
-        if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--tensor-split|-ts)(?:=|$)'))) {
+        if ((-not $AutoLaunchTuning.SmartVramPlan.UsesFitManagedSplit) -and -not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--tensor-split|-ts)(?:=|$)'))) {
             $Arguments.Add("--tensor-split")
             $Arguments.Add([string]$AutoLaunchTuning.SmartVramPlan.TensorSplit)
         }
@@ -9318,9 +10157,14 @@ function Get-LlamaServerArgsFromLaunchConfig {
         $Arguments.Add([string]$script:ManagedDefaultContextSize)
     }
 
-    if ($null -ne $AutoLaunchTuning.FitTargetMiB) {
+    $UsesFixedSmartSplit = $AutoLaunchTuning.PSObject.Properties['SmartVramPlan'] -and $AutoLaunchTuning.SmartVramPlan -and -not $AutoLaunchTuning.SmartVramPlan.UsesFitManagedSplit
+    if ($UsesFixedSmartSplit -and -not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--fit|-fit)(?:=|$)'))) {
+        $Arguments.Add("--fit")
+        $Arguments.Add("off")
+    }
+    elseif ($null -ne $AutoLaunchTuning.FitTargetMiB) {
         $Arguments.Add("--fit-target")
-        $Arguments.Add([string]$AutoLaunchTuning.FitTargetMiB)
+        $Arguments.Add($(if ($AutoLaunchTuning.PSObject.Properties['SmartVramPlan'] -and $AutoLaunchTuning.SmartVramPlan -and $AutoLaunchTuning.SmartVramPlan.UsesFitManagedSplit) { [string]$AutoLaunchTuning.SmartVramPlan.FitTarget } else { [string]$AutoLaunchTuning.FitTargetMiB }))
     }
     if ($null -ne $AutoLaunchTuning.CacheRamMiB) {
         $Arguments.Add("--cache-ram")
@@ -9689,6 +10533,7 @@ function Apply-LaunchSelection {
         [System.Collections.IDictionary]$Config
     )
 
+    $script:ActiveLaunchConfig = $Config
     $script:ModelPath = Resolve-ModelPath -Path $Config.ModelPath
     $script:Port = [int]$Config.Port
     $script:GpuLayers = [string]$Config.GpuLayers
@@ -9756,9 +10601,6 @@ function Stop-TrackedServer {
     }
 
     $TargetIds = New-Object System.Collections.Generic.List[int]
-    if ($LiveState -and $LiveState.watchdog_pid) {
-        $TargetIds.Add([int]$LiveState.watchdog_pid)
-    }
     if ($LiveState -and $LiveState.supervisor_pid) {
         $TargetIds.Add([int]$LiveState.supervisor_pid)
     }
@@ -10713,9 +11555,8 @@ function Stop-WorkspaceServerProcesses {
     }
     $WorkspaceServerProcesses = @(Get-WorkspaceServerProcesses)
     $WorkspaceSupervisorProcesses = @(Get-WorkspaceSupervisorProcesses)
-    $WorkspaceWatchdogProcesses = @(Get-WorkspaceWatchdogProcesses)
 
-    if (($WorkspaceServerProcesses.Count -eq 0) -and ($WorkspaceSupervisorProcesses.Count -eq 0) -and ($WorkspaceWatchdogProcesses.Count -eq 0)) {
+    if (($WorkspaceServerProcesses.Count -eq 0) -and ($WorkspaceSupervisorProcesses.Count -eq 0)) {
         Remove-RuntimeOwnershipArtifacts
         return [pscustomobject]@{
             HadRunningServer = $false
@@ -10725,7 +11566,6 @@ function Stop-WorkspaceServerProcesses {
     }
 
     $TargetIds = @(
-        @($WorkspaceWatchdogProcesses | ForEach-Object { [int]$_.ProcessId }) +
         @($WorkspaceSupervisorProcesses | ForEach-Object { [int]$_.ProcessId }) +
         @($WorkspaceServerProcesses | ForEach-Object { [int]$_.ProcessId }) |
             Select-Object -Unique
@@ -11258,6 +12098,18 @@ function Wait-ForBackgroundServerReadyWithProgress {
     while ($true) {
         $CandidateProcess = Get-BackgroundServerCandidate -BaselineProcessIds $BaselineProcessIds -ExpectedLaunchPid $ExpectedLaunchPid -TargetModelPath $TargetModelPath
         $ProgressInfo = Get-BackgroundStartupProgressInfo -LogPath $StdErrLog
+        $TerminalFailureLog = Get-LogTailText -Path $StdErrLog
+        if ($TerminalFailureLog -match '(?i)cudaMalloc failed:\s*out of memory|failed to allocate\s+CUDA\d+\s+buffer|GGML_ASSERT\(.+\) failed|failed to initialize the context|failed to create (?:MTP )?context with model|exiting due to model loading error') {
+            foreach ($FailedProcessId in @(
+                    $(if ($CandidateProcess) { [int]$CandidateProcess.ProcessId }),
+                    $(if ($Process) { [int]$Process.Id })
+                ) | Where-Object { $_ } | Select-Object -Unique) {
+                Stop-Process -Id $FailedProcessId -Force -ErrorAction SilentlyContinue
+            }
+            Write-BackgroundStartupProgress -ProgressInfo $ProgressInfo -Tick $Tick -Complete
+            Remove-TrackedPidFiles
+            throw (Format-BilingualText -ChineseText ("llama.cpp 回報不可恢復的模型載入錯誤：`n$TerminalFailureLog") -EnglishText ("llama.cpp reported a terminal model-load failure:`n$TerminalFailureLog"))
+        }
         $ShouldCheckReady = $ProgressInfo.HasServerListening -or ($Tick -eq 0) -or (($Tick % 5) -eq 0)
         $ServerReady = $false
 
@@ -11550,15 +12402,13 @@ function Test-TcpPort {
 }
 
 function Show-ServerStatus {
-    $GuardResult = Invoke-WorkspaceRuntimeGuard -Quiet
-    if ($GuardResult.RemainingIds.Count -gt 0) {
-        throw (Format-BilingualText -ChineseText ("無法清除非法執行中的程序：{0}" -f ($GuardResult.RemainingIds -join ', ')) -EnglishText ("Illegal runtime process(es) could not be cleared: {0}" -f ($GuardResult.RemainingIds -join ', ')))
-    }
+    # Status inspection must be read-only. An absent/stale owner file is a
+    # tracking problem to report or repair, never authorization to kill a live
+    # workspace server merely because the user opened the status screen.
 
-    if ($GuardResult.StoppedIds.Count -gt 0) {
-        Write-BilingualField -ChineseLabel "守護檢查" -EnglishLabel "Guard" -ChineseValue ("已清除非法執行中的程序：{0}" -f ($GuardResult.StoppedIds -join ', ')) -EnglishValue ("cleared illegal runtime process(es): {0}" -f ($GuardResult.StoppedIds -join ', ')) -ForegroundColor Yellow
-    }
-
+    $PreviousStatusCollector = $script:StatusCardCollector
+    $script:StatusCardCollector = New-Object System.Collections.Generic.List[object]
+    try {
     $TrackedProcess = Get-TrackedServerProcess
     $IsUntrackedWorkspaceServer = $false
     if (-not $TrackedProcess) {
@@ -11583,7 +12433,7 @@ function Show-ServerStatus {
         Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "Status" -ChineseValue $("運行中" + $(if ($IsUntrackedWorkspaceServer) { "（未追蹤）" } else { "" })) -EnglishValue $("running" + $(if ($IsUntrackedWorkspaceServer) { " (untracked)" } else { "" })) -ForegroundColor Green
         Write-BilingualField -ChineseLabel "程序編號" -EnglishLabel "PID" -ChineseValue ([string]$TrackedProcess.Id) -EnglishValue ([string]$TrackedProcess.Id)
         if ($IsUntrackedWorkspaceServer) {
-            Write-Host (Format-BilingualField -ChineseLabel "追蹤" -EnglishLabel "Track" -ChineseValue "PID 檔遺失；已發現工作目錄中的 llama-server.exe 程序。" -EnglishValue "PID file missing; discovered workspace llama-server.exe process.")
+            Write-BilingualField -ChineseLabel "追蹤" -EnglishLabel "Track" -ChineseValue "PID 檔遺失；已發現工作目錄中的 llama-server.exe 程序。" -EnglishValue "PID file missing; discovered workspace llama-server.exe process."
         }
         Write-BilingualField -ChineseLabel "網址" -EnglishLabel "URL" -ChineseValue $TrackedBaseUrl -EnglishValue $TrackedBaseUrl
         Write-BilingualField -ChineseLabel "連接埠" -EnglishLabel "Port" -ChineseValue ([string]$TrackedPort) -EnglishValue ([string]$TrackedPort)
@@ -11758,6 +12608,12 @@ function Show-ServerStatus {
 
     Write-BilingualField -ChineseLabel "狀態" -EnglishLabel "Status" -ChineseValue "已停止" -EnglishValue "stopped" -ForegroundColor Yellow
     Write-BilingualField -ChineseLabel "視覺" -EnglishLabel "Vision" -ChineseValue "目前沒有執行中的 llama.cpp 服務" -EnglishValue "no running llama.cpp server" -ForegroundColor DarkGray
+    }
+    finally {
+        $CapturedStatusFields = @($script:StatusCardCollector.ToArray())
+        $script:StatusCardCollector = $PreviousStatusCollector
+        Write-StatusCardDashboard -Fields $CapturedStatusFields
+    }
 }
 
 $PendingSwitchTimingContext = $null
@@ -11861,6 +12717,11 @@ try {
         }
     }
 
+    if ($AutoLaunchTuning.AutoTuneEnabled) {
+        $ProbeBaseArguments = @(Get-ServerArgs -AutoTuning $AutoLaunchTuning)
+        [void](Invoke-MaxContextAutoTune -BaseArguments $ProbeBaseArguments -ModelEntry $LaunchModelEntry -AutoTuning $AutoLaunchTuning)
+    }
+
     Write-Host (Format-BilingualText -ChineseText "正在啟動 llama.cpp 服務..." -EnglishText "Starting llama.cpp server...") -ForegroundColor Green
     Write-BilingualField -ChineseLabel "伺服器" -EnglishLabel "Server" -ChineseValue $ServerExe -EnglishValue $ServerExe
     Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue $ModelPath -EnglishValue $ModelPath
@@ -11911,7 +12772,7 @@ try {
     }
     if ($AutoLaunchTuning.PSObject.Properties["SmartVramPlan"] -and $AutoLaunchTuning.SmartVramPlan) {
         $Plan = $AutoLaunchTuning.SmartVramPlan
-        Write-BilingualField -ChineseLabel "顯存分配" -EnglishLabel "VRAM Split" -ChineseValue ("{0}，{1}（主 GPU 固定負擔約 {2} MiB：mmproj {3} + MTP {4}）" -f $AllocationStrategyLabelZh, $Plan.TensorSplit, $Plan.FixedPrimaryMiB, $Plan.MmprojMiB, $Plan.MtpMiB) -EnglishValue ("{0}, {1} (about {2} MiB fixed on primary GPU: mmproj {3} + MTP {4})" -f $AllocationStrategyLabelEn, $Plan.TensorSplit, $Plan.FixedPrimaryMiB, $Plan.MmprojMiB, $Plan.MtpMiB)
+        Write-BilingualField -ChineseLabel "顯存分配" -EnglishLabel "VRAM Split" -ChineseValue ("{0}，裝置 {1}，由 llama.cpp fit 動態分配（預估 {2}；逐卡保留 {3} MiB；主裝置固定負擔約 {4} MiB：mmproj {5} + MTP {6}）" -f $AllocationStrategyLabelZh, $Plan.DeviceOrder, $Plan.EstimatedTensorSplit, $Plan.FitTarget, $Plan.FixedPrimaryMiB, $Plan.MmprojMiB, $Plan.MtpMiB) -EnglishValue ("{0}, devices {1}, dynamically split by llama.cpp fit (estimate {2}; per-device reserve {3} MiB; about {4} MiB fixed on primary: mmproj {5} + MTP {6})" -f $AllocationStrategyLabelEn, $Plan.DeviceOrder, $Plan.EstimatedTensorSplit, $Plan.FitTarget, $Plan.FixedPrimaryMiB, $Plan.MmprojMiB, $Plan.MtpMiB)
     }
     else {
         Write-BilingualField -ChineseLabel "顯存分配" -EnglishLabel "VRAM Split" -ChineseValue $AllocationStrategyLabelZh -EnglishValue $AllocationStrategyLabelEn
@@ -11932,58 +12793,8 @@ try {
     Write-Host ""
 
     $ServerArgs = Get-ServerArgs -AutoTuning $AutoLaunchTuning
-    $LaunchSessionId = [guid]::NewGuid().ToString()
     $PowerShellHostPath = Get-CurrentHostExecutablePath
-    $EncodedServerArgs = ConvertTo-Base64Json -Value @($ServerArgs)
-    $WatchdogArgumentList = @(
-        "-NoLogo"
-        "-NoProfile"
-        "-ExecutionPolicy"
-        "Bypass"
-        "-File"
-        $WatchdogScriptPath
-        "-ProjectRoot"
-        $ScriptRoot
-        "-Mode"
-        "launch"
-        "-ServerExeCandidatesBase64"
-        (ConvertTo-Base64Json -Value @($ServerExeCandidates))
-        "-ServerExe"
-        $ServerExe
-        "-ServerArgsBase64"
-        $EncodedServerArgs
-        "-StdOutLog"
-        $StdOutLog
-        "-StdErrLog"
-        $StdErrLog
-        "-PidFile"
-        $PidFile
-        "-RuntimeOwnerStateFile"
-        $RuntimeOwnerStateFile
-        "-SupervisorPidFile"
-        $SupervisorPidFile
-        "-WatchdogPidFile"
-        $WatchdogPidFile
-        "-WatchdogLog"
-        $WatchdogLog
-        "-IntervalSec"
-        ([string]$WatchdogIntervalSec)
-        "-SessionId"
-        $LaunchSessionId
-        "-LaunchMode"
-        $(if ($Background) { "background" } else { "foreground" })
-        "-Port"
-        ([string]$Port)
-        "-ModelPath"
-        $ModelPath
-    )
-    if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
-        $WatchdogArgumentList += @(
-            "-MmprojPath"
-            $LaunchMmprojPath
-        )
-    }
-    $WatchdogArgumentString = ConvertTo-ArgumentString -Arguments $WatchdogArgumentList
+    $ServerArgumentString = ConvertTo-ArgumentString -Arguments $ServerArgs
 
     if ($Background) {
         $StartupCheckSec = [Math]::Min($BackgroundStartupCheckSec, [Math]::Max(10, $ReadyTimeoutSec))
@@ -11997,14 +12808,17 @@ try {
         $BackgroundAttemptCount = 0
         $LastBackgroundStartupError = $null
 
-        while ($BackgroundAttemptCount -lt 2) {
+        $MaxBackgroundAttempts = if ($AutoLaunchTuning.PSObject.Properties['SmartVramPlan'] -and $AutoLaunchTuning.SmartVramPlan -and $AutoLaunchTuning.SmartVramPlan.UsesFitManagedSplit) { 3 } else { 2 }
+        while ($BackgroundAttemptCount -lt $MaxBackgroundAttempts) {
             $BackgroundAttemptCount++
             Reset-BackgroundServerLogs
             $BackgroundProcess = Start-Process `
-                -FilePath $PowerShellHostPath `
-                -ArgumentList $WatchdogArgumentString `
+                -FilePath $ServerExe `
+                -ArgumentList $ServerArgumentString `
                 -WorkingDirectory $ScriptRoot `
                 -WindowStyle Hidden `
+                -RedirectStandardOutput $StdOutLog `
+                -RedirectStandardError $StdErrLog `
                 -PassThru
 
             try {
@@ -12021,13 +12835,65 @@ try {
                 if ($TrackedBackgroundPid) {
                     Set-Content -LiteralPath $PidFile -Value $TrackedBackgroundPid -Encoding ASCII
                 }
+                if ($StartupState -eq 'Ready' -and
+                    $AutoLaunchTuning.PSObject.Properties['SmartVramPlan'] -and
+                    $AutoLaunchTuning.SmartVramPlan -and
+                    $AutoLaunchTuning.SmartVramPlan.UsesFitManagedSplit -and
+                    [int]$AutoLaunchTuning.SmartVramPlan.BalanceRetryCount -lt 1 -and
+                    $BackgroundAttemptCount -lt $MaxBackgroundAttempts) {
+                    Start-Sleep -Milliseconds 500
+                    $BalanceAdjustment = Get-SmartVramBalanceAdjustment `
+                        -Plan $AutoLaunchTuning.SmartVramPlan `
+                        -AcceleratorInventory @(Get-AcceleratorInventory) `
+                        -ModelSizeMiB ([Math]::Max(1.0, (Get-Item -LiteralPath $ModelPath).Length / 1MB))
+                    $FittedLayers = Get-FittedGpuLayerCount -LogPath $StdErrLog
+                    if ($BalanceAdjustment -and $FittedLayers -and $FittedLayers.GpuLayers -gt 0) {
+                        foreach ($BalanceProcessId in @(
+                                $(if ($TrackedBackgroundPid) { [int]$TrackedBackgroundPid }),
+                                $(if ($BackgroundProcess) { [int]$BackgroundProcess.Id })
+                            ) | Where-Object { $_ } | Select-Object -Unique) {
+                            Stop-Process -Id $BalanceProcessId -Force -ErrorAction SilentlyContinue
+                        }
+                        $AutoLaunchTuning.SmartVramPlan.TensorSplit = [string]$BalanceAdjustment.TensorSplit
+                        $AutoLaunchTuning.SmartVramPlan.UsesFitManagedSplit = $false
+                        $AutoLaunchTuning.SmartVramPlan.BalanceRetryCount = [int]$AutoLaunchTuning.SmartVramPlan.BalanceRetryCount + 1
+                        $AutoLaunchTuning.SmartVramPlan.FittedGpuLayers = [int]$FittedLayers.GpuLayers
+                        $AutoLaunchTuning.UseManagedGpuLayers = $false
+                        $AutoLaunchTuning.EffectiveGpuLayers = [string]$FittedLayers.GpuLayers
+                        $ServerArgs = Get-ServerArgs -AutoTuning $AutoLaunchTuning
+                        $ServerArgumentString = ConvertTo-ArgumentString -Arguments $ServerArgs
+                        Write-Host (Format-BilingualText -ChineseText ("Smart VRAM：實測 {0} 比 {1} 少 {2} MiB；固定 GPU layers={3}，split {4} -> {5} 後重啟。" -f $BalanceAdjustment.LowDevice, $BalanceAdjustment.HighDevice, $BalanceAdjustment.DifferenceMiB, $FittedLayers.GpuLayers, $AutoLaunchTuning.SmartVramPlan.EstimatedTensorSplit, $BalanceAdjustment.TensorSplit) -EnglishText ("Smart VRAM: measured {0} with {2} MiB less free than {1}; fixing GPU layers={3} and restarting with split {4} -> {5}." -f $BalanceAdjustment.LowDevice, $BalanceAdjustment.HighDevice, $BalanceAdjustment.DifferenceMiB, $FittedLayers.GpuLayers, $AutoLaunchTuning.SmartVramPlan.EstimatedTensorSplit, $BalanceAdjustment.TensorSplit)) -ForegroundColor Cyan
+                        Remove-TrackedPidFiles
+                        Start-Sleep -Seconds 2
+                        continue
+                    }
+                }
                 $LastBackgroundStartupError = $null
                 break
             }
             catch {
                 $LastBackgroundStartupError = $_.Exception
                 $HasStartupLogs = Test-StartupLogsCaptured
-                $RetryBackgroundStart = ($BackgroundAttemptCount -lt 2) -and (-not $HasStartupLogs)
+                $FailureLog = Get-LogTailText -Path $StdErrLog
+                $SmartRetry = if ($BackgroundAttemptCount -lt $MaxBackgroundAttempts) {
+                    Get-SmartVramOomRetryAdjustment -Plan $AutoLaunchTuning.SmartVramPlan -FailureLog $FailureLog
+                }
+                else {
+                    $null
+                }
+                if ($SmartRetry) {
+                    $AutoLaunchTuning.SmartVramPlan.FitTargetsMiB = [int[]]$SmartRetry.FitTargetsMiB
+                    $AutoLaunchTuning.SmartVramPlan.FitTarget = [string]$SmartRetry.FitTarget
+                    $AutoLaunchTuning.SmartVramPlan.OomRetryCount = [int]$AutoLaunchTuning.SmartVramPlan.OomRetryCount + 1
+                    $ServerArgs = Get-ServerArgs -AutoTuning $AutoLaunchTuning
+                    $ServerArgumentString = ConvertTo-ArgumentString -Arguments $ServerArgs
+                    Write-Host (Format-BilingualText -ChineseText ("Smart VRAM：{0} OOM（缺口約 {1} MiB），將該卡保留量提高 {2} MiB 至 {3}，正在重試。" -f $SmartRetry.FailedDevice, $SmartRetry.RequiredMiB, $SmartRetry.IncreaseMiB, $SmartRetry.FitTarget) -EnglishText ("Smart VRAM: {0} OOM (about {1} MiB requested); raising that device's reserve by {2} MiB to {3} and retrying." -f $SmartRetry.FailedDevice, $SmartRetry.RequiredMiB, $SmartRetry.IncreaseMiB, $SmartRetry.FitTarget)) -ForegroundColor Yellow
+                    Remove-TrackedPidFiles
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+
+                $RetryBackgroundStart = ($BackgroundAttemptCount -lt $MaxBackgroundAttempts) -and (-not $HasStartupLogs)
                 if (-not $RetryBackgroundStart) {
                     throw
                 }
@@ -12042,27 +12908,9 @@ try {
             throw $LastBackgroundStartupError
         }
 
-        $AutoTuneSaveResult = $null
-
-        if ($AutoLaunchTuning.AutoTuneEnabled -and $StartupState -ne "Ready") {
-            $RemainingReadyWaitSec = [Math]::Max(1, $ReadyTimeoutSec - $StartupCheckSec)
-            Write-Host ((Format-BilingualText -ChineseText "自動調校" -EnglishText "AutoTune") + ": " + (Format-BilingualText -ChineseText "正在等待服務就緒後再評估學習到的設定檔..." -EnglishText "waiting for server readiness before evaluating the learned profile...")) -ForegroundColor Cyan
-            if (Wait-ForServerReady -ServerBaseUrl $BaseUrl -TimeoutSec $RemainingReadyWaitSec) {
-                $StartupState = "Ready"
-            }
-            else {
-                $AutoTuneSaveResult = [pscustomobject]@{
-                    Saved   = $false
-                    Message = Format-BilingualText -ChineseText ("因為服務未在 $ReadyTimeoutSec 秒內就緒，自動調校無法儲存設定檔。") -EnglishText ("Auto-tune could not save a profile because the server was not ready within $ReadyTimeoutSec seconds.")
-                    Profile = $null
-                }
-            }
-        }
-
-        if ($AutoLaunchTuning.AutoTuneEnabled -and $StartupState -eq "Ready" -and -not $AutoTuneSaveResult) {
-            $ObservedUsage = Get-ObservedGpuUsage -LogPath $StdErrLog -AcceleratorInventory $AutoLaunchTuning.AcceleratorInventory
-            $AutoTuneSaveResult = Save-AutoTuneProfile -AutoTuning $AutoLaunchTuning -ObservedUsage $ObservedUsage
-        }
+        $OwnedServerPid = if ($TrackedBackgroundPid) { [int]$TrackedBackgroundPid } else { [int]$BackgroundProcess.Id }
+        Write-RuntimeOwnerState -ServerPid $OwnedServerPid -ResolvedModelPath $ModelPath -ResolvedServerExe $ServerExe -ServerPort $Port
+        Set-Content -LiteralPath $PidFile -Value $OwnedServerPid -Encoding ASCII
 
         if ($SwitchTimingContext) {
             if ($StartupState -eq "Ready") {
@@ -12095,14 +12943,6 @@ try {
         Write-LaunchAuditRecord -ServerArgs $ServerArgs -AutoTuning $AutoLaunchTuning -LaunchMode "background" -LaunchedProcessId $AuditLaunchPid -StartupState $StartupState
         if ($AutoLaunchTuning.Source -eq "saved-profile") {
             Write-BilingualField -ChineseLabel "已儲存設定" -EnglishLabel "Saved" -ChineseValue ("已重用學習到的設定檔：$TuningProfileFile") -EnglishValue ("reused learned profile from $TuningProfileFile") -ForegroundColor Cyan
-        }
-        if ($AutoTuneSaveResult) {
-            if ($AutoTuneSaveResult.Saved) {
-                Write-Host ((Format-BilingualText -ChineseText "自動調校" -EnglishText "AutoTune") + ": " + $AutoTuneSaveResult.Message) -ForegroundColor Green
-            }
-            elseif (-not [string]::IsNullOrWhiteSpace($AutoTuneSaveResult.Message)) {
-                Write-Host ((Format-BilingualText -ChineseText "自動調校" -EnglishText "AutoTune") + ": " + $AutoTuneSaveResult.Message) -ForegroundColor Yellow
-            }
         }
         if (-not $NoBrowser) {
             if ($StartupState -eq "Ready") {
@@ -12167,7 +13007,7 @@ try {
     }
 
     Write-LaunchAuditRecord -ServerArgs $ServerArgs -AutoTuning $AutoLaunchTuning -LaunchMode "foreground" -StartupState "invoking"
-    & $PowerShellHostPath @WatchdogArgumentList
+    & $ServerExe @ServerArgs
     if ($LASTEXITCODE -ne 0) {
         throw (Format-BilingualText -ChineseText ("llama.cpp 已結束，結束碼為 $LASTEXITCODE。") -EnglishText ("llama.cpp exited with code $LASTEXITCODE."))
     }
