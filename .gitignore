@@ -3,6 +3,7 @@
 /.cache/
 /backup/
 /llama-latest/
+/tmp/
 
 # Runtime logs and PID files
 /logs/

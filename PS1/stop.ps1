@@ -18,12 +18,10 @@ $LegacyPidFile = Join-Path $ProjectRoot "llama-server.pid"
 $LegacyMmprojPidFile = Join-Path $ProjectRoot "logs\vision-server.pid"
 $RuntimeOwnerStateFile = Join-Path $ProjectRoot "logs\llama-runtime-owner.json"
 $SupervisorPidFile = Join-Path $ProjectRoot "logs\llama-supervisor.pid"
-$WatchdogPidFile = Join-Path $ProjectRoot "logs\llama-watchdog.pid"
 $PreferredServerExe = Join-Path $ProjectRoot "bin\llama-server.exe"
 $LegacyServerExe = Join-Path $ProjectRoot "llama-server.exe"
 $SupervisorScriptPath = Join-Path $ProjectRoot "PS1\llama_supervisor.ps1"
-$WatchdogScriptPath = Join-Path $ProjectRoot "PS1\llama_watchdog.ps1"
-$TrackedPidFiles = @($PidFile, $LegacyPidFile, $LegacyMmprojPidFile, $SupervisorPidFile, $WatchdogPidFile) | Select-Object -Unique
+$TrackedPidFiles = @($PidFile, $LegacyPidFile, $LegacyMmprojPidFile, $SupervisorPidFile) | Select-Object -Unique
 $TargetServerPaths = @($PreferredServerExe, $LegacyServerExe) | Where-Object { Test-Path -LiteralPath $_ }
 $TargetServerPatterns = @($TargetServerPaths | ForEach-Object { [regex]::Escape($_) })
 
@@ -180,8 +178,7 @@ function Get-ScriptProcesses {
 function Remove-RuntimeArtifactFiles {
     foreach ($RuntimeArtifact in @(
             $RuntimeOwnerStateFile,
-            $SupervisorPidFile,
-            $WatchdogPidFile
+            $SupervisorPidFile
         )) {
         if ((Test-Path -LiteralPath $RuntimeArtifact) -and $PSCmdlet.ShouldProcess($RuntimeArtifact, "Remove runtime artifact")) {
             Remove-Item -LiteralPath $RuntimeArtifact -Force -ErrorAction SilentlyContinue
@@ -191,7 +188,6 @@ function Remove-RuntimeArtifactFiles {
 
 function Stop-LlamaCppRuntime {
     $Processes = @(
-        @(Get-ScriptProcesses -ScriptPath $WatchdogScriptPath) +
         @(Get-ScriptProcesses -ScriptPath $SupervisorScriptPath) +
         @(Get-LlamaCppProcesses)
     )

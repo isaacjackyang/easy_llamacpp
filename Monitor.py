@@ -43,7 +43,7 @@ POWERSHELL_EXE = str(
 CMD_EXE = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
 HERMES_EXE = HERMES_HOME / "hermes-agent" / "venv" / "Scripts" / "hermes.exe"
 HERMES_GATEWAY_CMD = HERMES_HOME / "gateway-service" / "Hermes_Gateway.cmd"
-DEFAULT_CARD_ORDER = ["llama", "watchdog", "dashboard", "gateway", "hermes", "tts", "asr"]
+DEFAULT_CARD_ORDER = ["llama", "dashboard", "gateway", "hermes", "tts", "asr"]
 
 
 @dataclass
@@ -325,56 +325,6 @@ def check_llama(process_rows: list[dict[str, Any]], listener_rows: list[dict[str
     )
 
 
-def check_watchdog(process_rows: list[dict[str, Any]]) -> ServiceStatus:
-    owner = read_json_file(EASY_LOGS / "llama-runtime-owner.json") or {}
-    by_pid = process_by_pid(process_rows)
-    watchdog_pid = owner.get("watchdog_pid") if isinstance(owner, dict) else None
-    server_pid = owner.get("server_pid") if isinstance(owner, dict) else None
-    proc = by_pid.get(watchdog_pid) if isinstance(watchdog_pid, int) else None
-    runtime_status = str(owner.get("status") or "unknown") if isinstance(owner, dict) else "unknown"
-    restart_count = owner.get("restart_count", 0) if isinstance(owner, dict) else 0
-    last_restart_at = format_ts(owner.get("last_restart_at")) if isinstance(owner, dict) else "-"
-    last_exit_code = str(owner.get("last_exit_code", "-")) if isinstance(owner, dict) else "-"
-
-    if proc:
-        state = "ok"
-        summary_zh = "統一 watchdog 正在守護 llama.cpp，已啟用自動恢復"
-        summary_en = "Unified watchdog is supervising llama.cpp with auto-recovery enabled"
-    elif owner:
-        state = "warn"
-        summary_zh = f"watchdog 有狀態檔，但目前狀態是 {runtime_status}"
-        summary_en = f"Watchdog state exists but runtime state is {runtime_status}"
-    else:
-        state = "down"
-        summary_zh = "目前沒有統一 watchdog 在運行"
-        summary_en = "No unified watchdog is currently running"
-
-    compact = [
-        detail("PID", str(watchdog_pid or "-"), "PID"),
-        detail("追蹤 server", str(server_pid or "-"), "Tracked server", str(server_pid or "-")),
-        detail("狀態", runtime_status, "Status", runtime_status),
-    ]
-    details = compact + [
-        detail("自動重啟次數", str(restart_count), "Restart count", str(restart_count)),
-        detail("最近重啟", last_restart_at, "Last restart", last_restart_at),
-        detail("最近退出碼", last_exit_code, "Last exit code", last_exit_code),
-    ]
-    if proc:
-        details.append(detail("命令列", str(proc.get("CommandLine", "-")), "Command", str(proc.get("CommandLine", "-"))))
-
-    return ServiceStatus(
-        key="watchdog",
-        title_zh="llama 看門狗",
-        title_en="llama Watchdog",
-        state=state,
-        summary_zh=summary_zh,
-        summary_en=summary_en,
-        compact_details=compact,
-        details=details,
-        updated_at=iso_now(),
-    )
-
-
 def check_dashboard(listener_rows: list[dict[str, Any]]) -> ServiceStatus:
     by_port = listeners_by_port(listener_rows)
     port_row = by_port.get(9119)
@@ -594,7 +544,6 @@ def collect_snapshot() -> dict[str, Any]:
 
     services = [
         check_llama(process_rows, listener_rows),
-        check_watchdog(process_rows),
         check_dashboard(listener_rows),
         check_gateway(process_rows),
         check_hermes_main(process_rows),
@@ -711,26 +660,6 @@ def stop_llama() -> str:
     return bi("已要求停止 llama.cpp。", "Requested llama.cpp shutdown.")
 
 
-def start_watchdog() -> str:
-    script = PROJECT_ROOT / "start_watchdog.cmd"
-    if not script.exists():
-        raise RuntimeError(f"missing {script}")
-    code, output = run_hidden_cmd(script, cwd=PROJECT_ROOT, wait=True)
-    if code != 0:
-        raise RuntimeError(output or "failed to start watchdog")
-    return bi("已要求啟動統一 watchdog。", "Requested unified watchdog startup.")
-
-
-def stop_watchdog() -> str:
-    script = PROJECT_ROOT / "stop_watchdog.cmd"
-    if not script.exists():
-        raise RuntimeError(f"missing {script}")
-    code, output = run_hidden_cmd(script, cwd=PROJECT_ROOT, wait=True)
-    if code != 0:
-        raise RuntimeError(output or "failed to stop watchdog")
-    return bi("已要求停止統一 watchdog。", "Requested unified watchdog shutdown.")
-
-
 def start_dashboard() -> str:
     if not HERMES_EXE.exists():
         raise RuntimeError(f"missing {HERMES_EXE}")
@@ -823,7 +752,6 @@ def stop_worker(kind: str) -> str:
 
 ACTION_MAP: dict[str, dict[str, Any]] = {
     "llama": {"start": start_llama, "stop": stop_llama},
-    "watchdog": {"start": start_watchdog, "stop": stop_watchdog},
     "dashboard": {"start": start_dashboard, "stop": stop_dashboard},
     "gateway": {"start": start_gateway, "stop": stop_gateway},
     "hermes": {"start": start_hermes_main, "stop": stop_hermes_main},
