@@ -189,15 +189,45 @@ Start a local model with `Start.cmd`, then double-click or run:
 .\Translate_PDF.cmd
 ```
 
-終端選單可選 PDF、翻譯方向、單語／雙語輸出、本機模型與處理模式。預設的「穩定模式」會先用 BabelDOC venv 內的 RapidOCR 精確定位圖片文字框，再讓本機 llama.cpp 只翻譯字串，清除原字並以完整 RGB PNG 覆蓋重繪；RapidOCR 完全偵測不到文字時，才使用視覺模型框作 fallback。之後再使用逐段翻譯、Rich Text、OCR workaround 與增強 PDF 相容性。「快速模式」略過圖片文字，改用 LLM JSON batch；「手動調參」可自行選擇圖片重繪、batch、rich text、相容性、OCR workaround、表格與術語翻譯，以及 graphic/form/curve 處理。圖片結果依內容雜湊快取。`Translate_PDF.cmd` 啟動時會檢查目前 llama.cpp 的 `modalities.vision`，以及 BabelDOC venv 的 PyMuPDF、Pillow、OpenCV、NumPy、requests 與 RapidOCR。缺少 OCR 依賴時可執行 `install_ocr_request.cmd`；加上 `--check` 只檢查版本，不會更動套件。三種模式都維持 `QPS 1`。
-The terminal menu selects the PDF, language direction, mono/dual output, local model, and processing mode. Stable mode (the default) uses RapidOCR in the BabelDOC venv for precise raster-text boxes, asks local llama.cpp to translate strings only, and redraws with a full RGB PNG overlay. Vision-model boxes are a fallback only when RapidOCR detects no text. It then runs paragraph translation with Rich Text, the OCR workaround, and enhanced PDF compatibility. Fast mode skips image text and uses LLM JSON batching. Manual mode exposes image redrawing, batching, rich text, compatibility, OCR workaround, table and glossary translation, plus graphic/form/curve processing. Results are cached by content hash. At startup, `Translate_PDF.cmd` verifies llama.cpp `modalities.vision` and the BabelDOC venv imports for PyMuPDF, Pillow, OpenCV, NumPy, requests, and RapidOCR. Run `install_ocr_request.cmd` when OCR dependencies are missing, or add `--check` to verify versions without changing packages. All modes keep `QPS 1`.
+終端選單可選 PDF、翻譯方向、單語／雙語輸出、本機模型與處理模式。預設的「版面優先」會保留 BabelDOC Rich Text、關閉會隱含停用 Rich Text 的增強相容性，並由 OCR 自動判斷是否需要掃描補救；圖片內文字以 PP-OCRv6 定位、RapidOCR 回退，再由 llama.cpp 翻譯後重繪。「掃描文件」強制開啟 OCR workaround；「相容救援」會啟用 BabelDOC 增強相容性、明確停用 Rich Text，並保留原始圖片。只有啟用圖片重繪時，啟動檢查才會要求 llama.cpp 的 `modalities.vision` 與 OCR 依賴。舊的 `stable` 會相容映射到 `layout`，`fast` 仍保留給舊有非互動自動化。所有模式維持 `QPS 1`。
+The terminal menu selects the PDF, language direction, mono/dual output, local model, and processing mode. Raster text uses PP-OCRv6 as the primary detector with RapidOCR fallback, followed by llama.cpp translation and polygon-aware redrawing. The program health-checks and starts the local Paddle service automatically when image redrawing is active. Compatibility mode leaves raster images untouched. The legacy `stable` value maps to `layout`, while `fast` remains available for existing non-interactive automation. Every mode keeps `QPS 1`.
 
 也支援非互動呼叫：
 Non-interactive usage is also available:
 
 ```bat
-.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\paper.pdf" -TargetLanguage zh-TW -OutputMode both -ProcessingMode stable
+.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\paper.pdf" -TargetLanguage zh-TW -OutputMode both -ProcessingMode layout
+.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\scan.pdf" -TargetLanguage zh-TW -OutputMode both -ProcessingMode scan
+.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\problem.pdf" -TargetLanguage zh-TW -OutputMode both -ProcessingMode compatibility
 ```
+
+### 圖片與掃描 PDF 的 OCR 架構
+
+圖片重繪現在以本機 PaddleOCR PP-OCRv6 為主要偵測與辨識器，完整保留四點 polygon、文字方向與 confidence。Paddle 服務離線、模型初始化失敗或 GPU OOM 時會自動回退 RapidOCR；自動回退結果不寫入長期快取，所以下次執行仍會重試 Paddle。
+
+只有無文字、低信心或疑似表格頁面才啟用 PP-StructureV3。Unlimited-OCR 是選用的補漏閱讀器；它回傳的粗框只用於建立裁切候選，候選文字必須再由 PP-OCRv6 做局部辨識與精確 polygon 定位，才允許擦字及重繪。
+
+`Translate_PDF.cmd` 會先檢查 `/v1/health`。若本機 Paddle 尚未運行，程式會從同層的 `lazy_paddleocr` 專案自動啟動服務、等待 ready，並在工作結束時只停止自己啟動的實例。若服務啟動失敗，影像階段仍會自動回退 RapidOCR。也可以手動啟動服務以供多次翻譯共用：
+
+```bat
+F:\Documents\GitHub\lazy_paddleocr\Start-Agent-Server.cmd
+```
+
+預設架構可直接執行，不需要預先開啟 Paddle：
+
+```bat
+.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\scan.pdf" -ProcessingMode scan -OcrProvider auto -PaddleOcrBaseUrl "http://127.0.0.1:8765" -StructureAssist auto
+```
+
+預設從環境變數 `PADDLEOCR_PROJECT_ROOT` 或相鄰的 `lazy_paddleocr` 資料夾尋找服務。若偵測到完整的 `portable\LazyPaddleOCR` runtime 與 PP-OCRv6 模型快取，會優先使用 portable bundle，避免在專案根目錄建立第二份模型快取及重複下載。可用 `-PaddleOcrProjectRoot` 指定其他位置、`-PaddleOcrDevice cpu` 強制 CPU，或用 `-DisablePaddleAutoStart` 關閉自動啟動。
+
+Unlimited-OCR 必須使用與翻譯模型不同的服務埠（例如 `18082`），並明確提供 OpenAI-compatible `/v1` 端點與模型名稱：
+
+```bat
+.\Translate_PDF.cmd -NonInteractive -PdfPath "C:\Docs\scan.pdf" -ProcessingMode scan -UnlimitedOcrBaseUrl "http://127.0.0.1:18082/v1" -UnlimitedOcrModel "Unlimited-OCR"
+```
+
+Use `-OcrProvider rapid` to bypass Paddle deliberately, or `-StructureAssist off` to disable both structure and Unlimited assist. Unlimited-OCR is never called unless its endpoint and model are explicitly configured.
 
 ## 服務監看 GUI / Service Monitor GUI
 
@@ -1054,9 +1084,10 @@ Below is a practical Traditional Chinese reference for the most useful options.
 | `--webui`, `--no-webui` | 開關 | 控制內建 Web UI | 預設通常開啟 |
 | `--embedding` | 開關 | 只開 embedding 功能 | `--embedding` |
 | `--rerank`, `--reranking` | 開關 | 啟用 rerank endpoint | `--rerank` |
-| `--chat-template NAME` | 字串 | 指定聊天模板 | `chatml`, `llama3`, `deepseek` |
+| `--chat-template NAME` / `--chat-template-file PATH` | 字串 / 路徑 | 指定聊天模板；Tune And Launch 會列出 `chat template` 資料夾內的模板，留空時使用 GGUF metadata | `chatml`, `chat template\custom.jinja` |
 | `--reasoning-format FORMAT` | 列舉 | 控制 reasoning/thinking 欄位格式 | `none`, `deepseek`, `deepseek-legacy` |
 | `--reasoning-budget N` | 整數 | 控制 thinking 額度 | `-1`, `0` |
+| `--reasoning-preserve` / `--no-reasoning-preserve` | 開關 | 是否在完整多輪歷史中保留先前的 reasoning trace（需模板支援） | 預設開啟 |
 | `-to, --timeout N` | 整數 | HTTP 讀寫逾時秒數 | `600` |
 | `--list-devices` | 開關 | 列出可用裝置並退出 | `--list-devices` |
 | `--version` | 開關 | 顯示版本資訊 | `--version` |
@@ -1228,8 +1259,8 @@ On this dual `RTX 5070 Ti 16 GB` machine, the same `Q6_K_P` build runs out of me
 如果你是走 `Tune And Launch`，可以直接在矩陣裡切換 `MTP` 開或關，並設定 `SPEC_DRAFT_N_MAX`。Gemma 4 MTP 會依 Unsloth 範例預設為 `4`，其他 MTP 模型預設為 `2`。  
 If you launch through `Tune And Launch`, you can toggle `MTP` directly inside the matrix and set `SPEC_DRAFT_N_MAX` there as well. Gemma 4 MTP defaults to `4` following the Unsloth example, while other MTP models default to `2`.
 
-同一個矩陣現在也加入了 `Reasoning` 與 `Think Level`。`Reasoning` 會對應 `llama.cpp` 的 `--reasoning auto|on|off`；`Think Level` 會對應 `--reasoning-budget`，目前內建的級別是 `Low (1024)`、`Medium (4096)`、`High (8192)`、`Max (-1)`。  
-The same matrix now also includes `Reasoning` and `Think Level`. `Reasoning` maps to `llama.cpp` `--reasoning auto|on|off`; `Think Level` maps to `--reasoning-budget`, with built-in levels `Low (1024)`, `Medium (4096)`, `High (8192)`, and `Max (-1)`.
+同一個矩陣現在也加入了 `Reasoning`、`Think Level` 與預設開啟的 `Preserve Reasoning`。`Reasoning` 會對應 `llama.cpp` 的 `--reasoning auto|on|off`；`Think Level` 會對應 `--reasoning-budget`，目前內建的級別是 `Low (1024)`、`Medium (4096)`、`High (8192)`、`Max (-1)`；`Preserve Reasoning` 則對應 `--reasoning-preserve` / `--no-reasoning-preserve`。
+The same matrix now also includes `Reasoning`, `Think Level`, and `Preserve Reasoning`, which defaults to On. `Reasoning` maps to `llama.cpp` `--reasoning auto|on|off`; `Think Level` maps to `--reasoning-budget`, with built-in levels `Low (1024)`, `Medium (4096)`, `High (8192)`, and `Max (-1)`; `Preserve Reasoning` maps to `--reasoning-preserve` / `--no-reasoning-preserve`.
 
 所有支援 MTP 的模型都會自動補上：  
 For every supported MTP model, the launcher auto-adds:

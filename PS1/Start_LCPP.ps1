@@ -235,6 +235,7 @@ $PreferredBinRoot = Join-Path $ScriptRoot "bin"
 $LegacyBinRoot = $ScriptRoot
 $LogRoot = Join-Path $ScriptRoot "logs"
 $JsonRoot = Join-Path $ScriptRoot "json"
+$ChatTemplateRoot = Join-Path $ScriptRoot "chat template"
 $LlamaBinRoot = if (Test-Path -LiteralPath (Join-Path $PreferredBinRoot "llama-server.exe")) {
     $PreferredBinRoot
 }
@@ -2603,6 +2604,72 @@ function Sync-LaunchConfigReasoningFields {
     if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
         $Config.ThinkLevel = "Auto"
     }
+
+    if ($null -eq $Config.ReasoningPreserve) {
+        $Config.ReasoningPreserve = $true
+    }
+}
+
+function Get-ChatTemplateFiles {
+    $TemplateRoot = Join-Path $ScriptRoot "chat template"
+    if (-not (Test-Path -LiteralPath $TemplateRoot -PathType Container)) {
+        return @()
+    }
+
+    $AllowedExtensions = @(".jinja", ".j2", ".tmpl", ".txt")
+    return @(
+        Get-ChildItem -LiteralPath $TemplateRoot -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $AllowedExtensions -contains $_.Extension.ToLowerInvariant() } |
+            Sort-Object FullName |
+            ForEach-Object {
+                $RelativePath = $_.FullName.Substring($ScriptRoot.Length).TrimStart('\', '/')
+                [pscustomobject]@{
+                    Name         = $_.Name
+                    FullName     = $_.FullName
+                    RelativePath = $RelativePath
+                    SizeKiB      = [Math]::Round($_.Length / 1KB, 1)
+                }
+            }
+    )
+}
+
+function Select-ChatTemplateFile {
+    param(
+        [string]$CurrentValue
+    )
+
+    $Options = New-Object System.Collections.Generic.List[object]
+    $Options.Add([pscustomobject]@{
+        Name        = Format-BilingualText -ChineseText "使用 GGUF model metadata（預設）" -EnglishText "Use GGUF model metadata (default)"
+        Description = Format-BilingualText -ChineseText "不傳入自訂聊天模板。" -EnglishText "Do not pass a custom chat template."
+        Value       = [pscustomobject]@{ Selected = $true; Path = "" }
+    })
+
+    foreach ($Template in @(Get-ChatTemplateFiles)) {
+        $Options.Add([pscustomobject]@{
+            Name        = [string]$Template.Name
+            Description = ("{0} | {1} KiB" -f ([string]$Template.RelativePath), ([string]$Template.SizeKiB))
+            Value       = [pscustomobject]@{ Selected = $true; Path = [string]$Template.RelativePath }
+        })
+    }
+
+    $SelectedIndex = 0
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
+        $ResolvedCurrent = Resolve-ScriptRelativePath -Path $CurrentValue
+        for ($Index = 1; $Index -lt $Options.Count; $Index++) {
+            $ResolvedOption = Resolve-ScriptRelativePath -Path ([string]$Options[$Index].Value.Path)
+            if ([string]::Equals($ResolvedCurrent, $ResolvedOption, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $SelectedIndex = $Index
+                break
+            }
+        }
+    }
+
+    return Show-ListMenu `
+        -Title (Format-BilingualText -ChineseText "聊天模板" -EnglishText "Chat Template") `
+        -Subtitle (Format-BilingualText -ChineseText "選擇 chat template 資料夾裡的模板；Esc 保留目前設定。" -EnglishText "Choose a template from the chat template folder. Esc keeps the current setting.") `
+        -Items $Options.ToArray() `
+        -SelectedIndex $SelectedIndex
 }
 
 function Get-GpuProcessMemoryInfo {
@@ -4901,8 +4968,10 @@ function Convert-ForwardArgsToMenuConfig {
         TensorSplit     = ""
         Fit             = ""
         FlashAttention2 = "auto"
+        ChatTemplate    = ""
         ReasoningMode   = "auto"
         ThinkLevel      = "Auto"
+        ReasoningPreserve = $true
         MtpEnabled      = $null
         SpecDraftNMax   = ""
         Slots           = ""
@@ -4989,9 +5058,21 @@ function Convert-ForwardArgsToMenuConfig {
             '^(?:-rea|--reasoning)(?:=(.+))?$' {
                 $Config.ReasoningMode = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
+            '^--chat-template(?:=(.+))?$' {
+                $Config.ChatTemplate = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^--chat-template-file(?:=(.+))?$' {
+                $Config.ChatTemplate = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
             '^--reasoning-budget(?:=(.+))?$' {
                 $ReasoningBudget = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
                 $Config.ThinkLevel = Convert-ReasoningBudgetToThinkLevel -ReasoningBudget $ReasoningBudget
+            }
+            '^--reasoning-preserve$' {
+                $Config.ReasoningPreserve = $true
+            }
+            '^--no-reasoning-preserve$' {
+                $Config.ReasoningPreserve = $false
             }
             '^--spec-type(?:=(.+))?$' {
                 $SpecTypeValue = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
@@ -5117,6 +5198,18 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add($FlashAttention2)
     }
 
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ChatTemplate)) {
+        $ResolvedChatTemplate = Resolve-ScriptRelativePath -Path ([string]$Config.ChatTemplate)
+        if (Test-Path -LiteralPath $ResolvedChatTemplate -PathType Leaf) {
+            $Arguments.Add("--chat-template-file")
+            $Arguments.Add($ResolvedChatTemplate)
+        }
+        else {
+            $Arguments.Add("--chat-template")
+            $Arguments.Add([string]$Config.ChatTemplate)
+        }
+    }
+
     if (-not [string]::IsNullOrWhiteSpace([string]$Config.ReasoningMode) -and [string]$Config.ReasoningMode -ne "auto") {
         $Arguments.Add("--reasoning")
         $Arguments.Add([string]$Config.ReasoningMode)
@@ -5127,6 +5220,8 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add("--reasoning-budget")
         $Arguments.Add($ReasoningBudget)
     }
+
+    $Arguments.Add($(if ([bool]$Config.ReasoningPreserve) { "--reasoning-preserve" } else { "--no-reasoning-preserve" }))
 
     $ExtraArguments = @(Split-ArgumentLine -Line $Config.ExtraArgs)
     $ModelUsesMtpDefaults = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
@@ -5323,8 +5418,10 @@ function Get-SavedLaunchProfilePersistedKeys {
         "TensorSplit"
         "Fit"
         "FlashAttention2"
+        "ChatTemplate"
         "ReasoningMode"
         "ThinkLevel"
+        "ReasoningPreserve"
         "MtpEnabled"
         "SpecDraftNMax"
         "Slots"
@@ -6136,7 +6233,9 @@ function Format-SavedLaunchProfileSummary {
     $LaunchModeText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.LaunchMode)) { "Background Service" } else { [string]$Profile.config.LaunchMode }
     $GpuText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.GpuLayers)) { "auto" } else { [string]$Profile.config.GpuLayers }
     $ContextText = Get-SavedLaunchProfileContextText -Profile $Profile
+    $ChatTemplateText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ChatTemplate)) { "model default" } else { [string]$Profile.config.ChatTemplate }
     $ReasoningText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ReasoningMode)) { "auto" } else { [string]$Profile.config.ReasoningMode }
+    $PreserveReasoningText = if ($null -eq $Profile.config.ReasoningPreserve -or [bool]$Profile.config.ReasoningPreserve) { "on" } else { "off" }
     $MtpText = if ($null -eq $Profile.config.MtpEnabled) { "auto" } elseif ([bool]$Profile.config.MtpEnabled) { "on" } else { "off" }
     $SlotsText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.Slots)) { [string]$FixedLlamaServerParallelSlots } else { [string]$Profile.config.Slots }
     $UpdatedAtText = ""
@@ -6149,8 +6248,8 @@ function Format-SavedLaunchProfileSummary {
         }
     }
 
-    $ChineseText = "{0} | GPU {1} | CTX {2} | Slots {3} | 推理 {4} | MTP {5}{6}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })
-    $EnglishText = "{0} | GPU {1} | CTX {2} | slots {3} | reasoning {4} | MTP {5}{6}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" })
+    $ChineseText = "{0} | GPU {1} | CTX {2} | Slots {3} | 模板 {4} | 推理 {5} | 保存思考 {6} | MTP {7}{8}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ChatTemplateText, $ReasoningText, $PreserveReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })
+    $EnglishText = "{0} | GPU {1} | CTX {2} | slots {3} | template {4} | reasoning {5} | preserve {6} | MTP {7}{8}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ChatTemplateText, $ReasoningText, $PreserveReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" })
 
     if ($Language -eq "Chinese") {
         return $ChineseText
@@ -9201,8 +9300,10 @@ function New-LaunchConfig {
         TensorSplit       = [string]$ForwardConfig.TensorSplit
         Fit               = [string]$ForwardConfig.Fit
         FlashAttention2   = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.FlashAttention2)) { "auto" } else { [string]$ForwardConfig.FlashAttention2 }
+        ChatTemplate      = [string]$ForwardConfig.ChatTemplate
         ReasoningMode     = [string]$ForwardConfig.ReasoningMode
         ThinkLevel        = [string]$ForwardConfig.ThinkLevel
+        ReasoningPreserve = [bool]$ForwardConfig.ReasoningPreserve
         MtpEnabled        = $ForwardConfig.MtpEnabled
         SpecDraftNMax     = [string]$ForwardConfig.SpecDraftNMax
         Slots             = [string]$ForwardConfig.Slots
@@ -9237,8 +9338,10 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "Threads"; Label = "Threads"; Type = "number"; Hint = (Format-BilingualText -ChineseText "輸入 -1 或正整數" -EnglishText "-1 or positive integer") },
         [pscustomobject]@{ Key = "ThreadsBatch"; Label = (Format-BilingualText -ChineseText "批次執行緒" -EnglishText "Threads Batch"); Type = "number"; Hint = (Format-BilingualText -ChineseText "輸入 -1 或正整數" -EnglishText "-1 or positive integer") },
         [pscustomobject]@{ Key = "ReadyTimeoutSec"; Label = (Format-BilingualText -ChineseText "就緒逾時" -EnglishText "Ready Timeout"); Type = "number"; Hint = (Format-BilingualText -ChineseText "單位：秒" -EnglishText "seconds") },
+        [pscustomobject]@{ Key = "ChatTemplate"; Label = (Format-BilingualText -ChineseText "聊天模板" -EnglishText "Chat Template"); Type = "chatTemplate" },
         [pscustomobject]@{ Key = "ReasoningMode"; Label = (Format-BilingualText -ChineseText "推理模式" -EnglishText "Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "ThinkLevel"; Label = (Format-BilingualText -ChineseText "思考等級" -EnglishText "Think Level"); Type = "choice"; Choices = (Get-ThinkLevelChoices) },
+        [pscustomobject]@{ Key = "ReasoningPreserve"; Label = (Format-BilingualText -ChineseText "保存思考" -EnglishText "Preserve Reasoning"); Type = "bool" },
         [pscustomobject]@{ Key = "MtpEnabled"; Label = "MTP"; Type = "bool" },
         [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數；Gemma 4 MTP 預設 4，其他 MTP 預設 2" -EnglishText "positive integer; Gemma 4 MTP defaults to 4, other MTP defaults to 2") },
         [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
@@ -9293,8 +9396,10 @@ function Get-LaunchConfigDefaultText {
         "AutoTune" { return "off" }
         "Threads" { return "auto -> $([Math]::Max(1, $LogicalThreads - 2))" }
         "ThreadsBatch" { return "auto -> $LogicalThreads" }
+        "ChatTemplate" { return "GGUF model metadata" }
         "ReasoningMode" { return "auto" }
         "ThinkLevel" { return "Auto (no explicit budget)" }
+        "ReasoningPreserve" { return "on" }
         "MtpEnabled" { return $(if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for supported MTP GGUF" } else { "off" }) }
         "SpecDraftNMax" { return Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
@@ -9359,6 +9464,19 @@ function Get-LaunchConfigValueText {
             })
         }
         "ReasoningMode" { return ([string]$Config.ReasoningMode).ToUpperInvariant() }
+        "ChatTemplate" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.ChatTemplate)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            $ResolvedTemplate = Resolve-ScriptRelativePath -Path ([string]$Config.ChatTemplate)
+            if (Test-Path -LiteralPath $ResolvedTemplate -PathType Leaf) {
+                return [System.IO.Path]::GetFileName($ResolvedTemplate)
+            }
+
+            return [string]$Config.ChatTemplate
+        }
+        "ReasoningPreserve" { return $(if ($Config.ReasoningPreserve) { "On" } else { "Off" }) }
         "ThinkLevel" {
             if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
                 return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
@@ -9604,6 +9722,18 @@ function Get-LaunchConfigItemHelp {
                 Recommendation = Format-BilingualText -ChineseText "較難的任務建議先用 `Medium (4096)`。在乎延遲時用 `Low (1024)`，要更深的推理可用 `High (8192)`，只有能接受很長 thinking 時才用 `Max (-1)`。" -EnglishText "Start with Medium (4096) for harder tasks. Use Low (1024) when latency matters, High (8192) for deeper problems, and Max (-1) only if you accept potentially long reasoning."
             }
         }
+        "ChatTemplate" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "列出專案 `chat template` 資料夾內的模板。選檔時對應 llama.cpp 的 `--chat-template-file`；選預設則使用 GGUF metadata。" -EnglishText "Lists templates in the project's chat template folder. Selecting a file maps to llama.cpp --chat-template-file; selecting the default uses GGUF metadata."
+                Recommendation = Format-BilingualText -ChineseText "一般保持 GGUF 預設最安全。只有模型模板缺失、錯誤，或你明確知道下載模板與目前模型相容時才覆寫。" -EnglishText "The GGUF default is safest. Override it only when the model template is missing or wrong, or when the downloaded template is known to match the current model."
+            }
+        }
+        "ReasoningPreserve" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 `--reasoning-preserve`，讓先前 assistant 訊息的推理 trace 保留在完整對話歷史中，而不只保留最後一則。" -EnglishText "Maps to llama.cpp --reasoning-preserve so reasoning traces from earlier assistant messages remain in the full conversation history, not only the latest message."
+                Recommendation = Format-BilingualText -ChineseText "需要多輪延續推理時保持 On；只有在模板不相容或想減少歷史內容時才關閉。此功能只對支援 `supports_preserve_reasoning` 的模板生效。" -EnglishText "Keep this On for multi-turn reasoning continuity. Disable it only for incompatible templates or to reduce retained history. It takes effect only for templates supporting supports_preserve_reasoning."
+            }
+        }
         "MtpEnabled" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "切換 speculative MTP 啟動。開啟後，launcher 會送出 `--spec-type draft-mtp` 與相關預設。" -EnglishText "Toggles speculative MTP startup. When enabled, the launcher emits --spec-type draft-mtp and related defaults."
@@ -9829,6 +9959,12 @@ function Edit-LaunchConfigItem {
         }
         "visionModel" {
             Edit-VisionModelSelection -Config $Config -IndexPath $IndexPath
+        }
+        "chatTemplate" {
+            $Selection = Select-ChatTemplateFile -CurrentValue ([string]$Config.ChatTemplate)
+            if ($Selection -and $Selection.Selected) {
+                $Config.ChatTemplate = [string]$Selection.Path
+            }
         }
         "choice" {
             $Choices = @($Item.Choices)
@@ -10150,6 +10286,10 @@ function Get-LlamaServerArgsFromLaunchConfig {
             Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-ctv|--cache-type-v)(?:=|$)') -Flag "--cache-type-v" -Value "q8_0"
             Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
         }
+    }
+
+    if (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--chat-template-file(?:=|$)')) {
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
     }
 
     if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
@@ -10928,8 +11068,10 @@ function Get-TrackedServerLaunchSettings {
             SplitMode        = ""
             TensorSplit      = ""
             FlashAttention2  = ""
+            ChatTemplate     = ""
             ReasoningMode    = ""
             ReasoningBudget  = ""
+            ReasoningPreserve = $null
             SpecType         = ""
             SpecDraftNMax    = ""
             Temperature      = ""
@@ -11023,11 +11165,23 @@ function Get-TrackedServerLaunchSettings {
                 '^--no-flash-attn$' {
                     $Settings.FlashAttention2 = "off"
                 }
+                '^--chat-template(?:=(.+))?$' {
+                    $Settings.ChatTemplate = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--chat-template-file(?:=(.+))?$' {
+                    $Settings.ChatTemplate = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
                 '^(?:-rea|--reasoning)(?:=(.+))?$' {
                     $Settings.ReasoningMode = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
                 }
                 '^--reasoning-budget(?:=(.+))?$' {
                     $Settings.ReasoningBudget = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--reasoning-preserve$' {
+                    $Settings.ReasoningPreserve = $true
+                }
+                '^--no-reasoning-preserve$' {
+                    $Settings.ReasoningPreserve = $false
                 }
                 '^--spec-type(?:=(.+))?$' {
                     $Settings.SpecType = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
@@ -12495,11 +12649,18 @@ function Show-ServerStatus {
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.TensorSplit)) {
                 Write-BilingualField -ChineseLabel "Tensor 分配" -EnglishLabel "Tensor" -ChineseValue ("{0}，tensor 分布（--tensor-split）" -f $TrackedSettings.TensorSplit) -EnglishValue ("{0} tensor distribution (--tensor-split)" -f $TrackedSettings.TensorSplit)
             }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ChatTemplate)) {
+                $ChatTemplateFlag = if (Test-Path -LiteralPath ([string]$TrackedSettings.ChatTemplate) -PathType Leaf) { "--chat-template-file" } else { "--chat-template" }
+                Write-BilingualField -ChineseLabel "聊天模板" -EnglishLabel "Template" -ChineseValue ("{0}（{1}）" -f $TrackedSettings.ChatTemplate, $ChatTemplateFlag) -EnglishValue ("{0} ({1})" -f $TrackedSettings.ChatTemplate, $ChatTemplateFlag)
+            }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ReasoningMode)) {
                 Write-BilingualField -ChineseLabel "推理模式" -EnglishLabel "Think" -ChineseValue ("{0}，推理模式（--reasoning）" -f $TrackedSettings.ReasoningMode) -EnglishValue ("{0} reasoning mode (--reasoning)" -f $TrackedSettings.ReasoningMode)
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ReasoningBudget)) {
                 Write-BilingualField -ChineseLabel "思考預算" -EnglishLabel "Budget" -ChineseValue ("{0}，思考 token 預算（--reasoning-budget）" -f $TrackedSettings.ReasoningBudget) -EnglishValue ("{0} thinking token budget (--reasoning-budget)" -f $TrackedSettings.ReasoningBudget)
+            }
+            if ($null -ne $TrackedSettings.ReasoningPreserve) {
+                Write-BilingualField -ChineseLabel "保存思考" -EnglishLabel "Preserve" -ChineseValue $(if ($TrackedSettings.ReasoningPreserve) { "開啟（--reasoning-preserve）" } else { "關閉（--no-reasoning-preserve）" }) -EnglishValue $(if ($TrackedSettings.ReasoningPreserve) { "on (--reasoning-preserve)" } else { "off (--no-reasoning-preserve)" })
             }
             $MtpStatusText = if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecType)) { [string]$TrackedSettings.SpecType } else { "off / server default" }
             $MtpColor = if ($MtpStatusText -match '(^|,)draft-mtp(,|$)') { "Green" } else { "Yellow" }
