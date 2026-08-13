@@ -33,6 +33,12 @@ split unset so llama.cpp can fit dynamically, then raises the failed device's re
 retries when startup reports a CUDA allocation failure.
 auto leaves distribution to llama.cpp. manual uses explicit --split-mode/--tensor-split values.
 
+.PARAMETER LoadMode
+Value passed to --load-mode.
+Allowed values are none, mmap, mlock, mmap+mlock, and dio.
+Default is mmap. This replaces the deprecated --mmap/--no-mmap, --mlock,
+and --direct-io/--no-direct-io flags used by older llama.cpp builds.
+
 .PARAMETER Threads
 Value passed to --threads.
 Use a positive integer to set it manually.
@@ -107,7 +113,7 @@ Useful for scheduled tasks, shortcuts, or automation.
 .PARAMETER LlamaArgs
 Any remaining arguments are forwarded directly to llama-server.exe.
 Use this to access llama.cpp options that are not explicitly wrapped by this script.
-Do not pass managed options such as --model, --port, --gpu-layers, --threads, or --threads-batch here.
+Do not pass managed options such as --model, --port, --gpu-layers, --load-mode, --threads, or --threads-batch here.
 
 .EXAMPLE
 .\PS1\Start_LCPP.ps1
@@ -182,6 +188,8 @@ param(
     [string]$GpuLayers = "auto",
     [ValidateSet("smart", "auto", "manual")]
     [string]$VramAllocationStrategy = "smart",
+    [ValidateSet("none", "mmap", "mlock", "mmap+mlock", "dio")]
+    [string]$LoadMode = "mmap",
     [int]$Threads = -1,
     [int]$ThreadsBatch = -1,
     [string]$ModelPath = $null,
@@ -305,6 +313,7 @@ $script:ActiveLaunchConfig = $null
 $script:AutoTuneTensorSplitOverride = $null
 $script:BackgroundStartupProgressLineLength = 0
 $script:BackgroundStartupProgressLastText = $null
+$script:BackgroundStartupProgressLastState = $null
 $script:StatusCardCollector = $null
 $script:SelectedVisionModelEntry = $null
 $script:SelectedVisionModelPath = $null
@@ -827,6 +836,19 @@ function Get-ServerArgs {
     foreach ($Argument in $LlamaArgs) {
         $CombinedArgs += $Argument
     }
+
+    Add-DefaultLlamaArgument `
+        -TargetArguments $Arguments `
+        -UserArguments $CombinedArgs `
+        -Patterns @(
+            '^(?:-lm|--load-mode)(?:=|$)'
+            '^--mlock$'
+            '^--mmap$'
+            '^--no-mmap$'
+            '^(?:-dio|--direct-io|-ndio|--no-direct-io)$'
+        ) `
+        -Flag "--load-mode" `
+        -Value $LoadMode
 
     if ($AutoTuning -and $AutoTuning.PSObject.Properties["SmartVramPlan"] -and $AutoTuning.SmartVramPlan) {
         if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--device|-dev)(?:=|$)'))) {
@@ -2543,6 +2565,13 @@ function Sync-LaunchConfigMtpFields {
         [System.Collections.IDictionary]$Config
     )
 
+    if (-not $Config.Contains("SpecType") -or [string]::IsNullOrWhiteSpace([string]$Config.SpecType)) {
+        $Config.SpecType = "auto"
+    }
+    if (-not $Config.Contains("SpecDraftModel") -or $null -eq $Config.SpecDraftModel) {
+        $Config.SpecDraftModel = ""
+    }
+
     $IsMtpCapableModel = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     if ($null -eq $Config.MtpEnabled) {
         $Config.MtpEnabled = $IsMtpCapableModel
@@ -2551,6 +2580,77 @@ function Sync-LaunchConfigMtpFields {
     if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) {
         $Config.SpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     }
+
+    if (-not $Config.Contains("SpecDraftGpuLayers") -or [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftGpuLayers)) {
+        $Config.SpecDraftGpuLayers = "auto"
+    }
+
+    foreach ($Key in @("SpecDraftDevice", "SpecDraftCacheTypeK", "SpecDraftCacheTypeV")) {
+        if (-not $Config.Contains($Key) -or $null -eq $Config[$Key]) {
+            $Config[$Key] = ""
+        }
+    }
+}
+
+function Sync-LaunchConfigLoadModeFields {
+    param(
+        [System.Collections.IDictionary]$Config
+    )
+
+    $ValidModes = @("none", "mmap", "mlock", "mmap+mlock", "dio")
+    $ResolvedMode = if ($Config.Contains("LoadMode") -and $ValidModes -contains ([string]$Config.LoadMode).Trim().ToLowerInvariant()) {
+        ([string]$Config.LoadMode).Trim().ToLowerInvariant()
+    }
+    else {
+        "mmap"
+    }
+
+    $ExtraArguments = if ($Config.Contains("ExtraArgs")) {
+        @(Split-ArgumentLine -Line ([string]$Config.ExtraArgs))
+    }
+    else {
+        @()
+    }
+    $Remaining = New-Object System.Collections.Generic.List[string]
+
+    for ($Index = 0; $Index -lt $ExtraArguments.Count; $Index++) {
+        $Argument = [string]$ExtraArguments[$Index]
+        if ($Argument -match '^(?:-lm|--load-mode)(?:=(.+))?$') {
+            $HasInlineValue = -not [string]::IsNullOrEmpty([string]$Matches[1])
+            $Candidate = if ($HasInlineValue) {
+                [string]$Matches[1]
+            }
+            elseif (($Index + 1) -lt $ExtraArguments.Count) {
+                [string]$ExtraArguments[++$Index]
+            }
+            else {
+                ""
+            }
+            $NormalizedCandidate = $Candidate.Trim().ToLowerInvariant()
+            if ($ValidModes -contains $NormalizedCandidate) {
+                $ResolvedMode = $NormalizedCandidate
+            }
+            else {
+                $Remaining.Add($Argument)
+                if (-not $HasInlineValue -and -not [string]::IsNullOrWhiteSpace($Candidate)) {
+                    $Remaining.Add($Candidate)
+                }
+            }
+            continue
+        }
+
+        switch -Regex ($Argument) {
+            '^--mlock$' { $ResolvedMode = "mlock"; continue }
+            '^--mmap$' { $ResolvedMode = "mmap"; continue }
+            '^--no-mmap$' { $ResolvedMode = "none"; continue }
+            '^(?:-dio|--direct-io)$' { $ResolvedMode = "dio"; continue }
+            '^(?:-ndio|--no-direct-io)$' { $ResolvedMode = "none"; continue }
+            default { $Remaining.Add($Argument) }
+        }
+    }
+
+    $Config.LoadMode = $ResolvedMode
+    $Config.ExtraArgs = ConvertTo-ArgumentString -Arguments $Remaining.ToArray()
 }
 
 function Get-ThinkLevelChoices {
@@ -2605,8 +2705,13 @@ function Sync-LaunchConfigReasoningFields {
         $Config.ThinkLevel = "Auto"
     }
 
-    if ($null -eq $Config.ReasoningPreserve) {
-        $Config.ReasoningPreserve = $true
+    # Leave this unset by default: llama.cpp then follows the chat template's
+    # own supports_preserve_reasoning policy and no preserve flag is emitted.
+    if ($null -eq $Config.ReasoningPreserve -or [string]::IsNullOrWhiteSpace([string]$Config.ReasoningPreserve)) {
+        $Config.ReasoningPreserve = "auto"
+    }
+    elseif ($Config.ReasoningPreserve -is [bool]) {
+        $Config.ReasoningPreserve = if ([bool]$Config.ReasoningPreserve) { "on" } else { "off" }
     }
 }
 
@@ -4552,6 +4657,19 @@ function Test-IsMtpCapableModel {
     return ($CombinedText -match '(?i)(?:^|[^a-z0-9])mtp(?:[^a-z0-9]|$)')
 }
 
+function Test-UsesBuiltInMtpDraft {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath
+    )
+
+    # Gemma 4 QAT is a target + sidecar layout, despite being MTP-capable.
+    if (Test-IsGemma4QatMtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath) {
+        return $false
+    }
+    return (Test-IsMtpCapableModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)
+}
+
 function Get-MtpDefaultSpecDraftNMax {
     param(
         $ModelEntry,
@@ -4562,7 +4680,7 @@ function Get-MtpDefaultSpecDraftNMax {
         return "4"
     }
 
-    return "2"
+    return "3"
 }
 
 function Resolve-Gemma4MtpDraftModelPath {
@@ -4615,6 +4733,50 @@ function Resolve-Gemma4MtpDraftModelPath {
     }
 
     return [string]$Candidates[0].FullName
+}
+
+function Get-LocalSpeculativeDraft {
+    param([string]$ResolvedModelPath)
+
+    if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) { return $null }
+    # A target GGUF that already declares MTP owns its draft context internally.
+    # Do not accidentally pair it with an unrelated MTP file from the same
+    # model library directory; an external draft is only valid when chosen
+    # explicitly by the user.
+    if (Test-UsesBuiltInMtpDraft -ModelEntry $null -ResolvedModelPath $ResolvedModelPath) { return $null }
+    try {
+        $ModelFile = Get-Item -LiteralPath $ResolvedModelPath -ErrorAction Stop
+        $Candidates = @(
+            Get-ChildItem -LiteralPath $ModelFile.DirectoryName -File -Filter '*.gguf' -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -ne $ModelFile.FullName -and $_.Name -notmatch '(?i)mmproj' }
+        )
+    }
+    catch { return $null }
+
+    $Matches = @(
+        foreach ($Candidate in $Candidates) {
+            $Type = if ($Candidate.Name -match '(?i)dflash') { 'draft-dflash' }
+                    elseif ($Candidate.Name -match '(?i)dspark') { 'draft-dspark' }
+                    elseif ($Candidate.Name -match '(?i)eagle(?:[-_. ]?3)?') { 'draft-eagle3' }
+                    elseif ($Candidate.Name -match '(?i)(?:^|[-_. ])mtp(?:[-_. ]|$)') { 'draft-mtp' }
+                    else { $null }
+            if ($Type) {
+                [pscustomobject]@{
+                    Type = $Type
+                    Path = [string]$Candidate.FullName
+                    # Prefer a candidate whose name shares more of the target stem.
+                    NameDistance = [Math]::Abs($Candidate.BaseName.Length - $ModelFile.BaseName.Length)
+                }
+            }
+        }
+    )
+    if ($Matches.Count -eq 0) { return $null }
+
+    # Native MTP targets already carry their drafter.  For sidecars, prefer the
+    # model-specific name match, then DFlash/DSpark/EAGLE before a generic MTP.
+    return @($Matches | Sort-Object @{ Expression = { $_.NameDistance } }, @{ Expression = {
+        switch ($_.Type) { 'draft-dflash' { 0 }; 'draft-dspark' { 1 }; 'draft-eagle3' { 2 }; default { 3 } }
+    } }, Path)[0]
 }
 
 function Add-Gemma4MtpDraftModelDefault {
@@ -4967,13 +5129,20 @@ function Convert-ForwardArgsToMenuConfig {
         SplitMode       = ""
         TensorSplit     = ""
         Fit             = ""
+        LoadMode        = "mmap"
         FlashAttention2 = "auto"
         ChatTemplate    = ""
         ReasoningMode   = "auto"
         ThinkLevel      = "Auto"
-        ReasoningPreserve = $true
+        ReasoningPreserve = "auto"
+        SpecType         = "auto"
+        SpecDraftModel   = ""
         MtpEnabled      = $null
         SpecDraftNMax   = ""
+        SpecDraftGpuLayers = "auto"
+        SpecDraftDevice = ""
+        SpecDraftCacheTypeK = ""
+        SpecDraftCacheTypeV = ""
         Slots           = ""
         ExtraArgs       = ""
     }
@@ -5030,6 +5199,24 @@ function Convert-ForwardArgsToMenuConfig {
             '^--fit(?:=(.+))?$' {
                 $Config.Fit = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
+            '^(?:-lm|--load-mode)(?:=(.+))?$' {
+                $Config.LoadMode = if ($Matches[1]) { ([string]$Matches[1]).Trim().ToLowerInvariant() } else { ([string]$Arguments[++$Index]).Trim().ToLowerInvariant() }
+            }
+            '^--mlock$' {
+                $Config.LoadMode = "mlock"
+            }
+            '^--mmap$' {
+                $Config.LoadMode = "mmap"
+            }
+            '^--no-mmap$' {
+                $Config.LoadMode = "none"
+            }
+            '^(?:-dio|--direct-io)$' {
+                $Config.LoadMode = "dio"
+            }
+            '^(?:-ndio|--no-direct-io)$' {
+                $Config.LoadMode = "none"
+            }
             '^(?:-fa|--flash-attn)(?:=(.+))?$' {
                 $FlashAttnValue = if ($Matches[1]) {
                     [string]$Matches[1]
@@ -5069,13 +5256,14 @@ function Convert-ForwardArgsToMenuConfig {
                 $Config.ThinkLevel = Convert-ReasoningBudgetToThinkLevel -ReasoningBudget $ReasoningBudget
             }
             '^--reasoning-preserve$' {
-                $Config.ReasoningPreserve = $true
+                $Config.ReasoningPreserve = "on"
             }
             '^--no-reasoning-preserve$' {
-                $Config.ReasoningPreserve = $false
+                $Config.ReasoningPreserve = "off"
             }
             '^--spec-type(?:=(.+))?$' {
                 $SpecTypeValue = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+                $Config.SpecType = $SpecTypeValue
                 $SpecTypes = @(
                     [string]$SpecTypeValue -split ',' |
                         ForEach-Object { $_.Trim().ToLowerInvariant() } |
@@ -5088,8 +5276,23 @@ function Convert-ForwardArgsToMenuConfig {
                     $Config.MtpEnabled = $false
                 }
             }
+            '^(?:--spec-draft-model|-md|--model-draft)(?:=(.+))?$' {
+                $Config.SpecDraftModel = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
             '^--spec-draft-n-max(?:=(.+))?$' {
                 $Config.SpecDraftNMax = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--spec-draft-ngl|--gpu-layers-draft|--n-gpu-layers-draft|-ngld)(?:=(.+))?$' {
+                $Config.SpecDraftGpuLayers = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--spec-draft-device|--device-draft|-devd)(?:=(.+))?$' {
+                $Config.SpecDraftDevice = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--spec-draft-type-k|--cache-type-k-draft|-ctkd)(?:=(.+))?$' {
+                $Config.SpecDraftCacheTypeK = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--spec-draft-type-v|--cache-type-v-draft|-ctvd)(?:=(.+))?$' {
+                $Config.SpecDraftCacheTypeV = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
             '^(?:--parallel|-np)(?:=(.+))?$' {
                 $Config.Slots = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
@@ -5192,6 +5395,15 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add([string]$Config.Fit)
     }
 
+    $EffectiveLoadMode = if ($Config.Contains("LoadMode") -and @("none", "mmap", "mlock", "mmap+mlock", "dio") -contains ([string]$Config.LoadMode).Trim().ToLowerInvariant()) {
+        ([string]$Config.LoadMode).Trim().ToLowerInvariant()
+    }
+    else {
+        "mmap"
+    }
+    $Arguments.Add("--load-mode")
+    $Arguments.Add($EffectiveLoadMode)
+
     $FlashAttention2 = if ([string]::IsNullOrWhiteSpace([string]$Config.FlashAttention2)) { "auto" } else { ([string]$Config.FlashAttention2).Trim().ToLowerInvariant() }
     if ($FlashAttention2 -eq "on" -or $FlashAttention2 -eq "off") {
         $Arguments.Add("--flash-attn")
@@ -5221,18 +5433,75 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add($ReasoningBudget)
     }
 
-    $Arguments.Add($(if ([bool]$Config.ReasoningPreserve) { "--reasoning-preserve" } else { "--no-reasoning-preserve" }))
+    $ReasoningPreserve = ([string]$Config.ReasoningPreserve).Trim().ToLowerInvariant()
+    if ($ReasoningPreserve -eq "on") {
+        $Arguments.Add("--reasoning-preserve")
+    }
+    elseif ($ReasoningPreserve -eq "off") {
+        $Arguments.Add("--no-reasoning-preserve")
+    }
 
     $ExtraArguments = @(Split-ArgumentLine -Line $Config.ExtraArgs)
     $ModelUsesMtpDefaults = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
-    if ([bool]$Config.MtpEnabled) {
+    $SelectedSpecType = ([string]$Config.SpecType).Trim().ToLowerInvariant()
+    $IsBuiltInMtp = Test-UsesBuiltInMtpDraft -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    $AutoDraft = if ($SelectedSpecType -eq "auto" -and [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftModel)) { Get-LocalSpeculativeDraft -ResolvedModelPath ([string]$Config.ModelPath) } else { $null }
+    # Older buggy auto-generated profiles may have retained a sidecar path.
+    # In Auto mode, a native MTP target must ignore it and use its built-in MTP.
+    $EffectiveDraftModel = if ($SelectedSpecType -eq "auto" -and $IsBuiltInMtp) { "" } else { [string]$Config.SpecDraftModel }
+    if ($AutoDraft) {
+        $SelectedSpecType = [string]$AutoDraft.Type
+        $EffectiveDraftModel = [string]$AutoDraft.Path
+    }
+    if ($SelectedSpecType -ne "" -and $SelectedSpecType -ne "auto") {
+        $Arguments.Add("--spec-type")
+        $Arguments.Add($SelectedSpecType)
+        if (-not [string]::IsNullOrWhiteSpace($EffectiveDraftModel)) {
+            $Arguments.Add("--spec-draft-model")
+            $Arguments.Add((Resolve-ModelPath -Path $EffectiveDraftModel))
+        }
+        if ($SelectedSpecType -match '^draft-') {
+            $Arguments.Add("--spec-draft-n-max")
+            $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { if ($SelectedSpecType -eq "draft-mtp") { Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) } else { "3" } } else { [string]$Config.SpecDraftNMax }))
+            $Arguments.Add("--spec-draft-ngl")
+            $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftGpuLayers)) { "auto" } else { [string]$Config.SpecDraftGpuLayers }))
+            if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftDevice)) {
+                $Arguments.Add("--spec-draft-device")
+                $Arguments.Add([string]$Config.SpecDraftDevice)
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeK)) {
+                $Arguments.Add("--spec-draft-type-k")
+                $Arguments.Add([string]$Config.SpecDraftCacheTypeK)
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeV)) {
+                $Arguments.Add("--spec-draft-type-v")
+                $Arguments.Add([string]$Config.SpecDraftCacheTypeV)
+            }
+        }
+    }
+
+    if (($SelectedSpecType -eq "" -or $SelectedSpecType -eq "auto") -and [bool]$Config.MtpEnabled) {
         $Arguments.Add("--spec-type")
         $Arguments.Add("draft-mtp")
         $Arguments.Add("--spec-draft-n-max")
         $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) } else { [string]$Config.SpecDraftNMax }))
+        $Arguments.Add("--spec-draft-ngl")
+        $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftGpuLayers)) { "auto" } else { [string]$Config.SpecDraftGpuLayers }))
+        if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftDevice)) {
+            $Arguments.Add("--spec-draft-device")
+            $Arguments.Add([string]$Config.SpecDraftDevice)
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeK)) {
+            $Arguments.Add("--spec-draft-type-k")
+            $Arguments.Add([string]$Config.SpecDraftCacheTypeK)
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeV)) {
+            $Arguments.Add("--spec-draft-type-v")
+            $Arguments.Add([string]$Config.SpecDraftCacheTypeV)
+        }
         Add-Gemma4MtpDraftModelDefault -TargetArguments $Arguments -UserArguments $ExtraArguments -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     }
-    elseif ($ModelUsesMtpDefaults) {
+    elseif (($SelectedSpecType -eq "" -or $SelectedSpecType -eq "auto") -and $ModelUsesMtpDefaults) {
         $Arguments.Add("--spec-type")
         $Arguments.Add("none")
     }
@@ -5417,13 +5686,20 @@ function Get-SavedLaunchProfilePersistedKeys {
         "SplitMode"
         "TensorSplit"
         "Fit"
+        "LoadMode"
         "FlashAttention2"
         "ChatTemplate"
         "ReasoningMode"
         "ThinkLevel"
         "ReasoningPreserve"
+        "SpecType"
+        "SpecDraftModel"
         "MtpEnabled"
         "SpecDraftNMax"
+        "SpecDraftGpuLayers"
+        "SpecDraftDevice"
+        "SpecDraftCacheTypeK"
+        "SpecDraftCacheTypeV"
         "Slots"
         "ExtraArgs"
     )
@@ -5701,7 +5977,7 @@ function Test-AutoTuneContextCandidate {
                     $LastProgressAt = Get-Date
                 }
                 $TerminalLog = Get-Content -LiteralPath $ProbeErr -Tail 40 -ErrorAction SilentlyContinue | Out-String
-                if ($TerminalLog -match '(?i)failed to initialize the context|failed to create (?:MTP )?context with model|exiting due to model loading error|GGML_ASSERT\(.+\) failed') {
+                if (Test-TerminalModelLoadFailure -LogText $TerminalLog) {
                     Stop-Process -Id $ProbeProcess.Id -Force -ErrorAction SilentlyContinue
                     return [pscustomobject]@{ Passed = $false; ContextSize = $ContextSize; RamFreeMiB = $null; GpuFreeMiB = $null; GpuDevices = @(); FailureReason = 'terminal model-load failure' }
                 }
@@ -6192,6 +6468,7 @@ function Apply-SavedLaunchProfileToConfig {
     Sync-LaunchConfigGpuFields -Config $Config
     Sync-LaunchConfigReasoningFields -Config $Config
     Sync-LaunchConfigMtpFields -Config $Config
+    Sync-LaunchConfigLoadModeFields -Config $Config
     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $IndexPath
 }
 
@@ -9299,13 +9576,20 @@ function New-LaunchConfig {
         SplitMode         = [string]$ForwardConfig.SplitMode
         TensorSplit       = [string]$ForwardConfig.TensorSplit
         Fit               = [string]$ForwardConfig.Fit
+        LoadMode          = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.LoadMode)) { "mmap" } else { [string]$ForwardConfig.LoadMode }
         FlashAttention2   = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.FlashAttention2)) { "auto" } else { [string]$ForwardConfig.FlashAttention2 }
         ChatTemplate      = [string]$ForwardConfig.ChatTemplate
         ReasoningMode     = [string]$ForwardConfig.ReasoningMode
         ThinkLevel        = [string]$ForwardConfig.ThinkLevel
-        ReasoningPreserve = [bool]$ForwardConfig.ReasoningPreserve
+        ReasoningPreserve = [string]$ForwardConfig.ReasoningPreserve
+        SpecType          = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.SpecType)) { "auto" } else { [string]$ForwardConfig.SpecType }
+        SpecDraftModel    = [string]$ForwardConfig.SpecDraftModel
         MtpEnabled        = $ForwardConfig.MtpEnabled
         SpecDraftNMax     = [string]$ForwardConfig.SpecDraftNMax
+        SpecDraftGpuLayers = [string]$ForwardConfig.SpecDraftGpuLayers
+        SpecDraftDevice   = [string]$ForwardConfig.SpecDraftDevice
+        SpecDraftCacheTypeK = [string]$ForwardConfig.SpecDraftCacheTypeK
+        SpecDraftCacheTypeV = [string]$ForwardConfig.SpecDraftCacheTypeV
         Slots             = [string]$ForwardConfig.Slots
         ExtraArgs         = [string]$ForwardConfig.ExtraArgs
     }
@@ -9313,6 +9597,7 @@ function New-LaunchConfig {
     Sync-LaunchConfigGpuFields -Config $Config
     Sync-LaunchConfigReasoningFields -Config $Config
     Sync-LaunchConfigMtpFields -Config $Config
+    Sync-LaunchConfigLoadModeFields -Config $Config
     Sync-LaunchConfigVisionSelection -Config $Config -IndexPath $ModelIndexPath
     if ($ApplyTuneDefault) {
         $TuneDefault = Get-SavedLaunchDefaultForModel -ModelPath ([string]$Config.ModelPath)
@@ -9341,9 +9626,14 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "ChatTemplate"; Label = (Format-BilingualText -ChineseText "聊天模板" -EnglishText "Chat Template"); Type = "chatTemplate" },
         [pscustomobject]@{ Key = "ReasoningMode"; Label = (Format-BilingualText -ChineseText "推理模式" -EnglishText "Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "ThinkLevel"; Label = (Format-BilingualText -ChineseText "思考等級" -EnglishText "Think Level"); Type = "choice"; Choices = (Get-ThinkLevelChoices) },
-        [pscustomobject]@{ Key = "ReasoningPreserve"; Label = (Format-BilingualText -ChineseText "保存思考" -EnglishText "Preserve Reasoning"); Type = "bool" },
-        [pscustomobject]@{ Key = "MtpEnabled"; Label = "MTP"; Type = "bool" },
-        [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數；Gemma 4 MTP 預設 4，其他 MTP 預設 2" -EnglishText "positive integer; Gemma 4 MTP defaults to 4, other MTP defaults to 2") },
+        [pscustomobject]@{ Key = "ReasoningPreserve"; Label = (Format-BilingualText -ChineseText "保留思考" -EnglishText "Preserve Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
+        [pscustomobject]@{ Key = "SpecType"; Label = (Format-BilingualText -ChineseText "推測解碼" -EnglishText "Speculative Decode"); Type = "choice"; Choices = @("auto", "none", "draft-mtp", "draft-simple", "draft-eagle3", "draft-dflash", "draft-dspark", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache") },
+        [pscustomobject]@{ Key = "SpecDraftModel"; Label = (Format-BilingualText -ChineseText "草稿模型" -EnglishText "Draft Model"); Type = "text"; Hint = (Format-BilingualText -ChineseText "DFlash、DSpark、EAGLE 或 simple draft 對應的 GGUF；留空讓 llama.cpp/MTP 自動處理" -EnglishText "Matching GGUF for DFlash, DSpark, EAGLE, or simple draft; blank keeps llama.cpp/MTP auto-discovery") },
+        [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數；Gemma 4 MTP 預設 4，其他 MTP 預設 3" -EnglishText "positive integer; Gemma 4 MTP defaults to 4, other MTP defaults to 3") },
+        [pscustomobject]@{ Key = "SpecDraftGpuLayers"; Label = (Format-BilingualText -ChineseText "草稿 GPU Layers" -EnglishText "Draft GPU Layers"); Type = "text"; Hint = (Format-BilingualText -ChineseText "auto、all 或非負整數" -EnglishText "auto, all, or non-negative integer") },
+        [pscustomobject]@{ Key = "SpecDraftDevice"; Label = (Format-BilingualText -ChineseText "草稿裝置" -EnglishText "Draft Device"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 CUDA0" -EnglishText "blank uses auto; example: CUDA0") },
+        [pscustomobject]@{ Key = "SpecDraftCacheTypeK"; Label = (Format-BilingualText -ChineseText "草稿 K 快取" -EnglishText "Draft K Cache"); Type = "choice"; Choices = @("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") },
+        [pscustomobject]@{ Key = "SpecDraftCacheTypeV"; Label = (Format-BilingualText -ChineseText "草稿 V 快取" -EnglishText "Draft V Cache"); Type = "choice"; Choices = @("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") },
         [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
         [pscustomobject]@{ Key = "MaxOutputTokens"; Label = (Format-BilingualText -ChineseText "最大輸出長度" -EnglishText "Max Output Length"); Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數，或 -1 代表不限" -EnglishText "positive integer, or -1 for unlimited") },
         [pscustomobject]@{ Key = "Slots"; Label = "Slots"; Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空使用 1；多請求才調高" -EnglishText "blank uses 1; raise only for concurrent requests") },
@@ -9360,6 +9650,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "SplitMode"; Label = (Format-BilingualText -ChineseText "分割模式" -EnglishText "Split Mode"); Type = "choice"; Choices = @("", "layer", "row", "none") },
         [pscustomobject]@{ Key = "TensorSplit"; Label = (Format-BilingualText -ChineseText "張量分配" -EnglishText "Tensor Split"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 3,2" -EnglishText "blank uses auto; example: 3,2") },
         [pscustomobject]@{ Key = "Fit"; Label = "Fit"; Type = "choice"; Choices = @("", "on", "off") },
+        [pscustomobject]@{ Key = "LoadMode"; Label = (Format-BilingualText -ChineseText "模型載入模式" -EnglishText "Load Mode"); Type = "choice"; Choices = @("mmap", "mmap+mlock", "mlock", "dio", "none") },
         [pscustomobject]@{ Key = "FlashAttention2"; Label = "Flash Attention 2"; Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "ExtraArgs"; Label = (Format-BilingualText -ChineseText "額外參數" -EnglishText "Extra Args"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空代表不加額外參數" -EnglishText "blank means no extra args") },
         [pscustomobject]@{ Key = "ApplyAutoTune"; Label = (Format-BilingualText -ChineseText "套用自動調校學習值" -EnglishText "Apply Auto Tune Learned Values"); Type = "actionAutoTuneApply" },
@@ -9399,9 +9690,15 @@ function Get-LaunchConfigDefaultText {
         "ChatTemplate" { return "GGUF model metadata" }
         "ReasoningMode" { return "auto" }
         "ThinkLevel" { return "Auto (no explicit budget)" }
-        "ReasoningPreserve" { return "on" }
+        "ReasoningPreserve" { return "template default (no flag)" }
+        "SpecType" { return "auto -> MTP only when the model supports it" }
+        "SpecDraftModel" { return "none / auto-discover" }
         "MtpEnabled" { return $(if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { "on for supported MTP GGUF" } else { "off" }) }
         "SpecDraftNMax" { return Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) }
+        "SpecDraftGpuLayers" { return "auto" }
+        "SpecDraftDevice" { return "auto" }
+        "SpecDraftCacheTypeK" { return "server default -> f16" }
+        "SpecDraftCacheTypeV" { return "server default -> f16" }
         "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
         "MaxOutputTokens" { return [string]$script:ManagedDefaultMaxOutputTokens }
         "Slots" { return ("{0} active request slot" -f $FixedLlamaServerParallelSlots) }
@@ -9416,6 +9713,7 @@ function Get-LaunchConfigDefaultText {
         "SplitMode" { return "llama.cpp default" }
         "TensorSplit" { return "auto" }
         "Fit" { return "llama.cpp default" }
+        "LoadMode" { return "mmap" }
         "FlashAttention2" {
             if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) {
                 return "auto -> on for supported MTP GGUF"
@@ -9476,7 +9774,28 @@ function Get-LaunchConfigValueText {
 
             return [string]$Config.ChatTemplate
         }
-        "ReasoningPreserve" { return $(if ($Config.ReasoningPreserve) { "On" } else { "Off" }) }
+        "ReasoningPreserve" {
+            $Mode = ([string]$Config.ReasoningPreserve).Trim().ToLowerInvariant()
+            return $(switch ($Mode) { "on" { "On (--reasoning-preserve)" } "off" { "Off (--no-reasoning-preserve)" } default { "Template default (no flag)" } })
+        }
+        "SpecType" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.SpecType) -or [string]$Config.SpecType -eq "auto") {
+                $AutoDraft = Get-LocalSpeculativeDraft -ResolvedModelPath ([string]$Config.ModelPath)
+                if ($AutoDraft) { return ("Auto -> {0}" -f $AutoDraft.Type) }
+                if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { return "Auto -> draft-mtp (built-in)" }
+                return "Auto (no local draft found)"
+            }
+            return [string]$Config.SpecType
+        }
+        "SpecDraftModel" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftModel)) {
+                $AutoDraft = Get-LocalSpeculativeDraft -ResolvedModelPath ([string]$Config.ModelPath)
+                if ($AutoDraft) { return ("Auto -> {0}" -f [System.IO.Path]::GetFileName([string]$AutoDraft.Path)) }
+                if (Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)) { return "Built-in MTP (no sidecar)" }
+                return "Auto / none"
+            }
+            return [System.IO.Path]::GetFileName([string]$Config.SpecDraftModel)
+        }
         "ThinkLevel" {
             if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
                 return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
@@ -9527,6 +9846,34 @@ function Get-LaunchConfigValueText {
             }
 
             return [string]$Config.SpecDraftNMax
+        }
+        "SpecDraftGpuLayers" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftGpuLayers)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.SpecDraftGpuLayers
+        }
+        "SpecDraftDevice" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftDevice)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.SpecDraftDevice
+        }
+        "SpecDraftCacheTypeK" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeK)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.SpecDraftCacheTypeK
+        }
+        "SpecDraftCacheTypeV" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeV)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.SpecDraftCacheTypeV
         }
         "MaxOutputTokens" {
             if ([string]$Config.MaxOutputTokens -eq "-1") {
@@ -9730,8 +10077,20 @@ function Get-LaunchConfigItemHelp {
         }
         "ReasoningPreserve" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 `--reasoning-preserve`，讓先前 assistant 訊息的推理 trace 保留在完整對話歷史中，而不只保留最後一則。" -EnglishText "Maps to llama.cpp --reasoning-preserve so reasoning traces from earlier assistant messages remain in the full conversation history, not only the latest message."
-                Recommendation = Format-BilingualText -ChineseText "需要多輪延續推理時保持 On；只有在模板不相容或想減少歷史內容時才關閉。此功能只對支援 `supports_preserve_reasoning` 的模板生效。" -EnglishText "Keep this On for multi-turn reasoning continuity. Disable it only for incompatible templates or to reduce retained history. It takes effect only for templates supporting supports_preserve_reasoning."
+                Purpose = Format-BilingualText -ChineseText "控制是否傳送 llama.cpp 的 `--reasoning-preserve` 旗標。Auto 不傳任何旗標，交給聊天模板預設處理。" -EnglishText "Controls whether llama.cpp receives --reasoning-preserve. Auto emits no flag and defers to the chat template default."
+                Recommendation = Format-BilingualText -ChineseText "預設保持 Auto，不新增任何思考保留參數。只有需要跨多輪保留 trace 時才選 On；模板不相容或希望減少歷史內容時選 Off。" -EnglishText "Keep Auto by default so no preservation argument is added. Choose On only to retain traces across turns, or Off for incompatible templates or a smaller history."
+            }
+        }
+        "SpecType" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "選擇 llama.cpp 的 `--spec-type`。除了 MTP，也可選 DFlash、DSpark、EAGLE3、simple draft 或 n-gram 類型。" -EnglishText "Selects llama.cpp --spec-type, including MTP, DFlash, DSpark, EAGLE3, simple draft, and n-gram modes."
+                Recommendation = Format-BilingualText -ChineseText "預設 Auto；只會對可辨識的 MTP 模型沿用既有自動設定。DFlash、DSpark 與 EAGLE3 必須搭配正確草稿 GGUF，先單獨測速與穩定性。" -EnglishText "Keep Auto; it only retains existing automatic behavior for recognized MTP models. DFlash, DSpark, and EAGLE3 require the matching draft GGUF, so benchmark and validate each independently."
+            }
+        }
+        "SpecDraftModel" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "指定 `--spec-draft-model` 的草稿 GGUF，供 DFlash、DSpark、EAGLE3 或 draft-simple 使用。" -EnglishText "Sets --spec-draft-model for a DFlash, DSpark, EAGLE3, or draft-simple GGUF."
+                Recommendation = Format-BilingualText -ChineseText "只有手動選了需要草稿模型的推測類型時才填；MTP 可保留空白，讓既有 sidecar 偵測邏輯運作。" -EnglishText "Fill this only when you selected a draft-model-based speculative type. Leave it blank for MTP so the existing sidecar discovery logic remains active."
             }
         }
         "MtpEnabled" {
@@ -9743,7 +10102,31 @@ function Get-LaunchConfigItemHelp {
         "SpecDraftNMax" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定 llama.cpp 的 `--spec-draft-n-max`，也就是每一步 speculative drafting 最多要草擬多少 token。" -EnglishText "Sets llama.cpp --spec-draft-n-max, the maximum number of speculative draft tokens per step."
-                Recommendation = if ($IsGemma4QatMtpModel) { (Format-BilingualText -ChineseText "Gemma 4 MTP 依 Unsloth 範例先用 `4`。如果遇到穩定性或延遲問題，再降到 `2` 比較。" -EnglishText "For Gemma 4 MTP, start with 4 as shown in the Unsloth example. Drop to 2 only when comparing stability or latency.") } else { (Format-BilingualText -ChineseText "先從 `2` 開始。只有在你已經實測目前 MTP 模型穩定，而且更深 drafting 確實有收益時，才往上加。" -EnglishText "Start with 2. Increase only after measuring that your chosen MTP model stays stable and actually benefits from deeper drafting.") }
+                Recommendation = if ($IsGemma4QatMtpModel) { (Format-BilingualText -ChineseText "Gemma 4 MTP 先用 `4`。如果遇到穩定性或延遲問題，再降到 `2` 比較。" -EnglishText "For Gemma 4 MTP, start with 4. Drop to 2 when comparing stability or latency.") } else { (Format-BilingualText -ChineseText "先用 llama.cpp 的目前預設 `3`，再與較保守的 `2` 做相同提示詞 A/B 測試；只保留實測較快且 acceptance rate 穩定的值。" -EnglishText "Start with llama.cpp's current default of 3, then A/B it against the conservative value 2 using identical prompts. Keep only the value that is measurably faster with a stable acceptance rate.") }
+            }
+        }
+        "SpecDraftGpuLayers" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-ngl` 單獨控制 draft/MTP 模型放進 GPU 的層數。" -EnglishText "Uses --spec-draft-ngl to control draft/MTP GPU layers independently from the target model."
+                Recommendation = Format-BilingualText -ChineseText "一般保持 `auto`。只有在新版 fit 仍分配不理想，或你正在做受控 VRAM 測試時，才改成明確層數或 `all`。" -EnglishText "Keep auto normally. Use an exact number or all only for controlled VRAM testing or when fit still produces a poor placement."
+            }
+        }
+        "SpecDraftDevice" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-device` 把 draft/MTP context 指定到獨立裝置。" -EnglishText "Uses --spec-draft-device to pin the draft/MTP context to specific accelerators."
+                Recommendation = Format-BilingualText -ChineseText "先留空讓 llama.cpp 自動處理。雙 5070 Ti 只有在逐卡 VRAM 或同步成本測試顯示明確收益時，才固定成例如 `CUDA0`。" -EnglishText "Leave blank first. On dual 5070 Ti, pin to CUDA0 only when per-device VRAM and synchronization tests show a clear benefit."
+            }
+        }
+        "SpecDraftCacheTypeK" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-type-k` 單獨設定 draft context 的 K cache 格式。" -EnglishText "Uses --spec-draft-type-k to set the draft context K-cache format independently."
+                Recommendation = Format-BilingualText -ChineseText "留空使用目前的 `f16` 預設。只有 VRAM 不足時才先試 `q8_0`，並重新量測 acceptance rate 與生成速度。" -EnglishText "Leave blank for the current f16 default. Try q8_0 only when VRAM is tight, then remeasure acceptance rate and generation speed."
+            }
+        }
+        "SpecDraftCacheTypeV" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-type-v` 單獨設定 draft context 的 V cache 格式。" -EnglishText "Uses --spec-draft-type-v to set the draft context V-cache format independently."
+                Recommendation = Format-BilingualText -ChineseText "留空使用目前的 `f16` 預設。需要省 VRAM 時與 K cache 一起先試 `q8_0`，不要同時再改 tensor split 或 batch。" -EnglishText "Leave blank for the current f16 default. When saving VRAM, test q8_0 alongside K cache without also changing tensor split or batch."
             }
         }
         "ContextSize" {
@@ -9840,6 +10223,12 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "在你想覆蓋預設行為時，直接控制 llama.cpp 的 fit 行為。" -EnglishText "Directly controls llama.cpp fit behavior when you want to override its default."
                 Recommendation = Format-BilingualText -ChineseText "一般由 wrapper 管理時保持留空。只有在你刻意比較 fit 行為時，才手動設成 `on` 或 `off`。" -EnglishText "Leave blank for normal wrapper-managed launches. Use on or off only when comparing fit behavior deliberately."
+            }
+        }
+        "LoadMode" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "使用新版 `--load-mode` 統一控制模型載入；它取代已 deprecated 的 `--mmap`、`--no-mmap`、`--mlock` 與 DirectIO 旗標。" -EnglishText "Uses the unified --load-mode option, replacing the deprecated mmap, mlock, and DirectIO flags."
+                Recommendation = Format-BilingualText -ChineseText "Windows 一般保持 `mmap`。RAM 很充足且要避免換頁時可測 `mmap+mlock`；`dio` 與 `none` 只在受控載入效能或 pageout 測試時使用。" -EnglishText "Keep mmap for normal Windows use. Test mmap+mlock when RAM is plentiful and paging must be avoided; reserve dio and none for controlled loading/pageout tests."
             }
         }
         "FlashAttention2" {
@@ -10048,6 +10437,9 @@ function Edit-LaunchConfigItem {
                 if (-not [double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$ParsedPresencePenalty)) {
                     throw "Presence Penalty must be blank or a number."
                 }
+            }
+            if ($Item.Key -eq "SpecDraftGpuLayers" -and $Value -notmatch '^(?:auto|all|\d+)$') {
+                throw "Draft GPU Layers must be auto, all, or a non-negative integer."
             }
             $Config[$Item.Key] = $Value
         }
@@ -10403,6 +10795,26 @@ function Show-LaunchConfigProfileExport {
     Read-Host | Out-Null
 }
 
+function Get-LaunchConfigCardLines {
+    param(
+        $Item,
+        [System.Collections.IDictionary]$Config,
+        [int]$Width,
+        [bool]$Selected
+    )
+
+    $InnerWidth = [Math]::Max(20, $Width - 2)
+    $Label = Get-FitText -Text ([string]$Item.Label) -Width $InnerWidth
+    $Value = Get-FitText -Text (Get-LaunchConfigValueText -Config $Config -Item $Item) -Width $InnerWidth
+    $Marker = if ($Selected) { ">" } else { " " }
+    $LabelAndValue = Get-FitText -Text ("{0}{1}: {2}" -f $Marker, $Label, $Value) -Width $InnerWidth
+    return @(
+        ("+" + ("-" * $InnerWidth) + "+"),
+        ("|" + (Add-StatusCardPadding -Text $LabelAndValue -Width $InnerWidth) + "|"),
+        ("+" + ("-" * $InnerWidth) + "+")
+    )
+}
+
 function Show-LaunchConfigGrid {
     param(
         [System.Collections.IDictionary]$Config,
@@ -10411,13 +10823,26 @@ function Show-LaunchConfigGrid {
 
     $Items = Get-LaunchConfigItems
     $SelectedIndex = 0
+    # Keep the original one-screen set of settings, but split it into exactly
+    # two compact card pages so selection redraws stay within the terminal.
+    $CardsPerPage = [Math]::Ceiling($Items.Count / 2)
+    $PageIndex = 0
 
     while ($true) {
-        Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle (Format-BilingualText -ChineseText "使用方向鍵移動，按 Enter 或 Space 編輯目前欄位。" -EnglishText "Use arrow keys to move. Press Enter or Space to edit the selected cell.")
+        $PageCount = [Math]::Ceiling($Items.Count / $CardsPerPage)
+        $PageIndex = [Math]::Max(0, [Math]::Min($PageIndex, $PageCount - 1))
+        $PageStart = $PageIndex * $CardsPerPage
+        $PageEnd = [Math]::Min($Items.Count - 1, $PageStart + $CardsPerPage - 1)
+        $VisibleItems = @($Items[$PageStart..$PageEnd])
+        $SelectedIndex = [Math]::Max(0, [Math]::Min($SelectedIndex, $VisibleItems.Count - 1))
+
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle ((Format-BilingualText -ChineseText "方向鍵移動，Enter 或 Space 編輯；Tab／PgUp／PgDn 切換卡片頁。" -EnglishText "Arrow keys move; Enter or Space edits; Tab/PgUp/PgDn changes card pages.") + "  [$($PageIndex + 1)/$PageCount]")
         $Width = Get-ConsoleWidth
         $ColumnGap = 2
         $MinTwoColumnCellWidth = 28
-        $MaxTwoColumnCellWidth = 50
+        # Prefer readable model and draft names over an artificially narrow
+        # grid; on wide terminals each of the two cards can now use 72 columns.
+        $MaxTwoColumnCellWidth = 72
         $ColumnCount = if (($Width - $ColumnGap) -ge ($MinTwoColumnCellWidth * 2)) { 2 } else { 1 }
         if ($ColumnCount -eq 2) {
             $CellWidth = [Math]::Max($MinTwoColumnCellWidth, [Math]::Min($MaxTwoColumnCellWidth, [Math]::Floor(($Width - $ColumnGap) / 2)))
@@ -10425,48 +10850,37 @@ function Show-LaunchConfigGrid {
         else {
             $CellWidth = [Math]::Max(24, $Width - 2)
         }
-        $RowCount = [Math]::Ceiling($Items.Count / $ColumnCount)
-        $SelectedItem = $Items[$SelectedIndex]
+        $RowCount = [Math]::Ceiling($VisibleItems.Count / $ColumnCount)
+        $SelectedItem = $VisibleItems[$SelectedIndex]
         $SelectedHelp = Get-LaunchConfigItemHelp -Config $Config -Item $SelectedItem
 
         for ($Row = 0; $Row -lt $RowCount; $Row++) {
+            $Cards = @()
             for ($Column = 0; $Column -lt $ColumnCount; $Column++) {
                 $ItemIndex = ($Row * $ColumnCount) + $Column
-                if ($ItemIndex -ge $Items.Count) {
-                    continue
+                if ($ItemIndex -lt $VisibleItems.Count) {
+                    $Cards += [pscustomobject]@{ Lines = Get-LaunchConfigCardLines -Item $VisibleItems[$ItemIndex] -Config $Config -Width $CellWidth -Selected ($ItemIndex -eq $SelectedIndex); Selected = ($ItemIndex -eq $SelectedIndex) }
                 }
-
-                $Item = $Items[$ItemIndex]
-                $CellText = "{0}: {1}" -f $Item.Label, (Get-LaunchConfigValueText -Config $Config -Item $Item)
-                $DisplayText = " " + (Get-FitText -Text $CellText -Width ($CellWidth - 1)).PadRight($CellWidth - 1)
-                $IsSelected = $ItemIndex -eq $SelectedIndex
-                $Foreground = if ($IsSelected) { "Black" } else { "Gray" }
-                $Background = if ($IsSelected) { "DarkCyan" } else { "Black" }
-                Write-Host $DisplayText -NoNewline -ForegroundColor $Foreground -BackgroundColor $Background
-                if ($Column -lt ($ColumnCount - 1)) {
-                    Write-Host (" " * $ColumnGap) -NoNewline
+                else {
+                    $Cards += $null
                 }
             }
-            Write-Host ""
+            for ($LineIndex = 0; $LineIndex -lt 3; $LineIndex++) {
+                for ($Column = 0; $Column -lt $ColumnCount; $Column++) {
+                    $Card = $Cards[$Column]
+                    $Line = if ($null -eq $Card) { " " * $CellWidth } else { $Card.Lines[$LineIndex] }
+                    $Foreground = if ($null -ne $Card -and $Card.Selected) { "Black" } else { "Gray" }
+                    $Background = if ($null -ne $Card -and $Card.Selected) { "DarkCyan" } else { "Black" }
+                    Write-Host $Line -NoNewline -ForegroundColor $Foreground -BackgroundColor $Background
+                    if ($Column -lt ($ColumnCount - 1)) { Write-Host (" " * $ColumnGap) -NoNewline }
+                }
+                Write-Host ""
+            }
         }
 
         Write-Host ""
-        Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "模型" -EnglishText "Model"), $Config.ModelName) -ForegroundColor Cyan
-        Write-ModelCapabilitiesLine -CapabilityText $Config.ModelCapabilities
-        Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "模型路徑" -EnglishText "Model Path"), (Get-FitText -Text $Config.ModelPath -Width ([Math]::Max(40, $Width - 20))))
-        if ([string]::IsNullOrWhiteSpace([string]$Config.VisionMmprojPath)) {
-            Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "視覺模型" -EnglishText "Vision Model"), $(if ([string]$Config.VisionSelectionMode -eq "disabled") { Format-BilingualText -ChineseText "已停用" -EnglishText "disabled" } else { "(none)" })) -ForegroundColor DarkGray
-        }
-        else {
-            Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "視覺模型" -EnglishText "Vision Model"), $Config.VisionModelName) -ForegroundColor Cyan
-            Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "Mmproj 路徑" -EnglishText "Mmproj Path"), (Get-FitText -Text $Config.VisionMmprojPath -Width ([Math]::Max(40, $Width - 20))))
-        }
-        Write-Host ""
         Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "目前選取" -EnglishText "Selected"), $SelectedItem.Label) -ForegroundColor Cyan
-        Write-WrappedInfoLine -Prefix ((Format-BilingualText -ChineseText "功能" -EnglishText "What it does") + " : ") -Text $SelectedHelp.Purpose
-        Write-WrappedInfoLine -Prefix ((Format-BilingualText -ChineseText "建議" -EnglishText "Recommended") + " : ") -Text $SelectedHelp.Recommendation
-        Write-Host ""
-        Write-Host (Format-BilingualText -ChineseText "Esc 返回主選單，開始啟動會用目前設定直接啟動。" -EnglishText "Esc returns to the main menu. Start Launch begins with the current settings.") -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "Enter／Space 編輯；Tab／PgUp／PgDn 切換頁；Esc 返回。" -EnglishText "Enter/Space edits; Tab/PgUp/PgDn changes pages; Esc returns.") -ForegroundColor Yellow
 
         $Key = Read-ConsoleKey
         switch ($Key.VirtualKeyCode) {
@@ -10476,7 +10890,7 @@ function Show-LaunchConfigGrid {
                 }
             }
             39 {
-                if ($ColumnCount -eq 2 -and ($SelectedIndex % 2) -eq 0 -and ($SelectedIndex + 1) -lt $Items.Count) {
+                if ($ColumnCount -eq 2 -and ($SelectedIndex % 2) -eq 0 -and ($SelectedIndex + 1) -lt $VisibleItems.Count) {
                     $SelectedIndex++
                 }
             }
@@ -10486,12 +10900,24 @@ function Show-LaunchConfigGrid {
                 }
             }
             40 {
-                if (($SelectedIndex + $ColumnCount) -lt $Items.Count) {
+                if (($SelectedIndex + $ColumnCount) -lt $VisibleItems.Count) {
                     $SelectedIndex += $ColumnCount
                 }
             }
+            9 {
+                $PageIndex = ($PageIndex + 1) % $PageCount
+                $SelectedIndex = 0
+            }
+            33 {
+                $PageIndex = if ($PageIndex -le 0) { $PageCount - 1 } else { $PageIndex - 1 }
+                $SelectedIndex = 0
+            }
+            34 {
+                $PageIndex = if ($PageIndex -ge ($PageCount - 1)) { 0 } else { $PageIndex + 1 }
+                $SelectedIndex = 0
+            }
             13 {
-                $SelectedItem = $Items[$SelectedIndex]
+                $SelectedItem = $VisibleItems[$SelectedIndex]
                 if ($SelectedItem.Type -eq "actionAutoTuneApply") {
                     try {
                         $ApplyResult = Apply-AutoTuneLearnedValuesToConfig -Config $Config
@@ -10569,7 +10995,7 @@ function Show-LaunchConfigGrid {
                 }
             }
             32 {
-                $SelectedItem = $Items[$SelectedIndex]
+                $SelectedItem = $VisibleItems[$SelectedIndex]
                 if ($SelectedItem.Type -eq "actionAutoTuneApply") {
                     try {
                         $ApplyResult = Apply-AutoTuneLearnedValuesToConfig -Config $Config
@@ -11067,6 +11493,7 @@ function Get-TrackedServerLaunchSettings {
             Device           = ""
             SplitMode        = ""
             TensorSplit      = ""
+            LoadMode         = ""
             FlashAttention2  = ""
             ChatTemplate     = ""
             ReasoningMode    = ""
@@ -11074,6 +11501,10 @@ function Get-TrackedServerLaunchSettings {
             ReasoningPreserve = $null
             SpecType         = ""
             SpecDraftNMax    = ""
+            SpecDraftGpuLayers = ""
+            SpecDraftDevice  = ""
+            SpecDraftCacheTypeK = ""
+            SpecDraftCacheTypeV = ""
             Temperature      = ""
             TopK             = ""
             TopP             = ""
@@ -11137,6 +11568,24 @@ function Get-TrackedServerLaunchSettings {
                 '^--tensor-split(?:=(.+))?$' {
                     $Settings.TensorSplit = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
                 }
+                '^(?:-lm|--load-mode)(?:=(.+))?$' {
+                    $Settings.LoadMode = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--mlock$' {
+                    $Settings.LoadMode = "mlock"
+                }
+                '^--mmap$' {
+                    $Settings.LoadMode = "mmap"
+                }
+                '^--no-mmap$' {
+                    $Settings.LoadMode = "none"
+                }
+                '^(?:-dio|--direct-io)$' {
+                    $Settings.LoadMode = "dio"
+                }
+                '^(?:-ndio|--no-direct-io)$' {
+                    $Settings.LoadMode = "none"
+                }
                 '^(?:-fa|--flash-attn)(?:=(.+))?$' {
                     $FlashAttnValue = if ($Matches[1]) {
                         [string]$Matches[1]
@@ -11188,6 +11637,18 @@ function Get-TrackedServerLaunchSettings {
                 }
                 '^--spec-draft-n-max(?:=(.+))?$' {
                     $Settings.SpecDraftNMax = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^(?:--spec-draft-ngl|--gpu-layers-draft|--n-gpu-layers-draft|-ngld)(?:=(.+))?$' {
+                    $Settings.SpecDraftGpuLayers = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^(?:--spec-draft-device|--device-draft|-devd)(?:=(.+))?$' {
+                    $Settings.SpecDraftDevice = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^(?:--spec-draft-type-k|--cache-type-k-draft|-ctkd)(?:=(.+))?$' {
+                    $Settings.SpecDraftCacheTypeK = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^(?:--spec-draft-type-v|--cache-type-v-draft|-ctvd)(?:=(.+))?$' {
+                    $Settings.SpecDraftCacheTypeV = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
                 }
                 '^--temp(?:erature)?(?:=(.+))?$' {
                     $Settings.Temperature = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
@@ -12147,6 +12608,11 @@ function Write-BackgroundStartupProgress {
         [switch]$Complete
     )
 
+    $StageState = ((Get-BackgroundStartupStageSegments -ProgressInfo $ProgressInfo | ForEach-Object { $_.Text }) -join " | ")
+    if (-not $Complete -and $StageState -eq $script:BackgroundStartupProgressLastState) {
+        return
+    }
+    $script:BackgroundStartupProgressLastState = $StageState
     $Text = Format-BackgroundStartupProgressLine -ProgressInfo $ProgressInfo -Tick $Tick -Ready:$Ready
     if (-not (Test-InteractiveConsole)) {
         Write-BackgroundStartupProgressLine -Text $Text -Complete:$Complete
@@ -12196,6 +12662,7 @@ function Write-BackgroundStartupProgress {
         Write-Host ""
         $script:BackgroundStartupProgressLineLength = 0
         $script:BackgroundStartupProgressLastText = $null
+        $script:BackgroundStartupProgressLastState = $null
     }
 }
 
@@ -12225,7 +12692,29 @@ function Write-BackgroundStartupProgressLine {
         Write-Host ""
         $script:BackgroundStartupProgressLineLength = 0
         $script:BackgroundStartupProgressLastText = $null
+        $script:BackgroundStartupProgressLastState = $null
     }
+}
+
+function Test-TerminalModelLoadFailure {
+    param([AllowNull()][string]$LogText)
+
+    if ([string]::IsNullOrWhiteSpace($LogText)) {
+        return $false
+    }
+
+    # llama.cpp deliberately attempts a context without ctx_other while measuring
+    # memory for assisted speculative models.  Gemma 4 MTP (and DFlash) reports
+    # that probe through the error logger, but explicitly marks it as normal and
+    # continues startup.  Do not kill the server merely because this probe is in
+    # the rolling log tail; subsequent real context failures still match below.
+    $FilteredLog = [regex]::Replace(
+        $LogText,
+        '(?im)^.*failed to initialize the context:.*requires ctx_other to be set \(this warning is normal during memory fitting\).*(?:\r?\n|$)',
+        ''
+    )
+
+    return ($FilteredLog -match '(?i)cudaMalloc failed:\s*out of memory|failed to allocate\s+CUDA\d+\s+buffer|GGML_ASSERT\(.+\) failed|failed to initialize the context|failed to create (?:MTP )?context with model|exiting due to model loading error')
 }
 
 function Wait-ForBackgroundServerReadyWithProgress {
@@ -12253,7 +12742,7 @@ function Wait-ForBackgroundServerReadyWithProgress {
         $CandidateProcess = Get-BackgroundServerCandidate -BaselineProcessIds $BaselineProcessIds -ExpectedLaunchPid $ExpectedLaunchPid -TargetModelPath $TargetModelPath
         $ProgressInfo = Get-BackgroundStartupProgressInfo -LogPath $StdErrLog
         $TerminalFailureLog = Get-LogTailText -Path $StdErrLog
-        if ($TerminalFailureLog -match '(?i)cudaMalloc failed:\s*out of memory|failed to allocate\s+CUDA\d+\s+buffer|GGML_ASSERT\(.+\) failed|failed to initialize the context|failed to create (?:MTP )?context with model|exiting due to model loading error') {
+        if (Test-TerminalModelLoadFailure -LogText $TerminalFailureLog) {
             foreach ($FailedProcessId in @(
                     $(if ($CandidateProcess) { [int]$CandidateProcess.ProcessId }),
                     $(if ($Process) { [int]$Process.Id })
@@ -12649,6 +13138,8 @@ function Show-ServerStatus {
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.TensorSplit)) {
                 Write-BilingualField -ChineseLabel "Tensor 分配" -EnglishLabel "Tensor" -ChineseValue ("{0}，tensor 分布（--tensor-split）" -f $TrackedSettings.TensorSplit) -EnglishValue ("{0} tensor distribution (--tensor-split)" -f $TrackedSettings.TensorSplit)
             }
+            $LoadModeValue = Format-TrackedServerSettingValue -Value $TrackedSettings.LoadMode -WhenMissing 'server default (mmap)'
+            Write-BilingualField -ChineseLabel "載入模式" -EnglishLabel "Load Mode" -ChineseValue ("{0}（--load-mode）" -f $LoadModeValue) -EnglishValue ("{0} (--load-mode)" -f $LoadModeValue)
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ChatTemplate)) {
                 $ChatTemplateFlag = if (Test-Path -LiteralPath ([string]$TrackedSettings.ChatTemplate) -PathType Leaf) { "--chat-template-file" } else { "--chat-template" }
                 Write-BilingualField -ChineseLabel "聊天模板" -EnglishLabel "Template" -ChineseValue ("{0}（{1}）" -f $TrackedSettings.ChatTemplate, $ChatTemplateFlag) -EnglishValue ("{0} ({1})" -f $TrackedSettings.ChatTemplate, $ChatTemplateFlag)
@@ -12667,6 +13158,16 @@ function Show-ServerStatus {
             Write-BilingualField -ChineseLabel "MTP" -EnglishLabel "MTP" -ChineseValue ("{0}，推測式解碼模式（--spec-type）" -f $MtpStatusText) -EnglishValue ("{0} speculative decoding mode (--spec-type)" -f $MtpStatusText) -ForegroundColor $MtpColor
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftNMax)) {
                 Write-BilingualField -ChineseLabel "草稿 Token 上限" -EnglishLabel "Draft" -ChineseValue ("{0}，最大推測 token 數（--spec-draft-n-max）" -f $TrackedSettings.SpecDraftNMax) -EnglishValue ("{0} max speculative tokens (--spec-draft-n-max)" -f $TrackedSettings.SpecDraftNMax)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftGpuLayers)) {
+                Write-BilingualField -ChineseLabel "草稿 GPU 層" -EnglishLabel "Draft GPU" -ChineseValue ("{0}（--spec-draft-ngl）" -f $TrackedSettings.SpecDraftGpuLayers) -EnglishValue ("{0} (--spec-draft-ngl)" -f $TrackedSettings.SpecDraftGpuLayers)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftDevice)) {
+                Write-BilingualField -ChineseLabel "草稿裝置" -EnglishLabel "Draft Device" -ChineseValue ("{0}（--spec-draft-device）" -f $TrackedSettings.SpecDraftDevice) -EnglishValue ("{0} (--spec-draft-device)" -f $TrackedSettings.SpecDraftDevice)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftCacheTypeK) -or -not [string]::IsNullOrWhiteSpace($TrackedSettings.SpecDraftCacheTypeV)) {
+                $DraftCacheSummary = "K={0}, V={1}" -f (Format-TrackedServerSettingValue -Value $TrackedSettings.SpecDraftCacheTypeK -WhenMissing 'f16'), (Format-TrackedServerSettingValue -Value $TrackedSettings.SpecDraftCacheTypeV -WhenMissing 'f16')
+                Write-BilingualField -ChineseLabel "草稿 KV 快取" -EnglishLabel "Draft KV" -ChineseValue $DraftCacheSummary -EnglishValue $DraftCacheSummary
             }
             $FlashAttention2Value = Format-TrackedServerSettingValue -Value $TrackedSettings.FlashAttention2 -WhenMissing 'server default'
             $FlashAttention2Color = if ($FlashAttention2Value -match '^(on|true|1)$') { "Green" } elseif ($FlashAttention2Value -match '^(off|false|0)$') { "Yellow" } else { "Cyan" }
@@ -12884,6 +13385,9 @@ try {
     }
 
     Write-Host (Format-BilingualText -ChineseText "正在啟動 llama.cpp 服務..." -EnglishText "Starting llama.cpp server...") -ForegroundColor Green
+    # Reuse the status-dashboard renderer so launch metadata stays readable
+    # instead of wrapping each bilingual path and argument line independently.
+    $script:StatusCardCollector = New-Object System.Collections.Generic.List[object]
     Write-BilingualField -ChineseLabel "伺服器" -EnglishLabel "Server" -ChineseValue $ServerExe -EnglishValue $ServerExe
     Write-BilingualField -ChineseLabel "模型" -EnglishLabel "Model" -ChineseValue $ModelPath -EnglishValue $ModelPath
     if (-not [string]::IsNullOrWhiteSpace($LaunchMmprojPath)) {
@@ -12951,6 +13455,9 @@ try {
         Write-BilingualField -ChineseLabel "額外參數" -EnglishLabel "Extra" -ChineseValue ($LlamaArgs -join ' ') -EnglishValue ($LlamaArgs -join ' ')
     }
     Write-BilingualField -ChineseLabel "開啟網址" -EnglishLabel "Open" -ChineseValue "$BaseUrl$OpenPath" -EnglishValue "$BaseUrl$OpenPath"
+    $LaunchSummaryCards = @($script:StatusCardCollector.ToArray())
+    $script:StatusCardCollector = $null
+    Write-StatusCardDashboard -Fields $LaunchSummaryCards
     Write-Host ""
 
     $ServerArgs = Get-ServerArgs -AutoTuning $AutoLaunchTuning
