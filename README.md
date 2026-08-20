@@ -403,6 +403,7 @@ Note: the following options should still be set through the wrapper script param
 - `--model`
 - `--port`
 - `--gpu-layers`
+- `--load-mode`
 - `--threads`
 - `--threads-batch`
 
@@ -430,6 +431,15 @@ Purpose: Passed to `--gpu-layers`. Allowed values are `auto`, `all`, or a non-ne
 .\PS1\Start_LCPP.ps1 -GpuLayers auto
 .\PS1\Start_LCPP.ps1 -GpuLayers all
 .\PS1\Start_LCPP.ps1 -GpuLayers 99
+```
+
+### `-LoadMode <string>`
+
+Purpose: Passed to the unified llama.cpp `--load-mode` option. Allowed values are `mmap`, `mmap+mlock`, `mlock`, `dio`, and `none`; the launcher default is `mmap`. This replaces the deprecated `--mmap` / `--no-mmap`, `--mlock`, and `--direct-io` flags. Saved profiles that still contain those old flags in `ExtraArgs` are migrated with llama.cpp's last-argument-wins behavior.
+
+```powershell
+.\PS1\Start_LCPP.ps1 -LoadMode mmap
+.\PS1\Start_LCPP.ps1 -LoadMode "mmap+mlock"
 ```
 
 ### `-ExtremeMode`
@@ -833,6 +843,20 @@ These files are created under the project's `logs\` and `json\` folders.
 第一次執行 `Start.cmd` 或 `.\PS1\Start_LCPP.ps1` 時，腳本就會先初始化這三個 JSON。若當下已能掃到模型，`json/model-index.json` 會直接寫入模型清單；若還沒有可用模型，則會先建立空的初始檔。  
 On the first `Start.cmd` or `.\PS1\Start_LCPP.ps1` run, the launcher initializes all three JSON files up front. If models are already discoverable, `json/model-index.json` is populated immediately; otherwise an empty starter file is created first.
 
+## b10199 相容更新 / b10199 Compatibility Update
+
+截至 2026-07-31，這個 launcher 以官方 [`b10199`](https://github.com/ggml-org/llama.cpp/releases/tag/b10199) 參數介面為準；官方 Windows release 同時提供 CUDA 12.4 與 CUDA 13.3 套件。本機安裝器仍會備份既有 `bin\` 後才換版。
+
+The launcher now targets the official `b10199` parameter surface. The Windows release provides both CUDA 12.4 and CUDA 13.3 packages, and the bundled installer backs up the current `bin\` before replacement.
+
+Important compatibility points:
+
+- Use `--spec-type draft-mtp` with `--spec-draft-n-max`; removed legacy names such as `--draft-n` are not emitted.
+- The speculative subsystem also recognizes `draft-eagle3`, `draft-dflash`, `draft-dspark`, and n-gram modes. They remain advanced raw options because each method needs a matching draft model and its own benchmark.
+- Use `--load-mode` instead of the deprecated mmap/mlock/DirectIO flags. The interactive launcher stores only the new form.
+- `llama-server` can start experimental MCP stdio servers through `--mcp-servers-config <path>` or `--mcp-servers-json <json>`. Keep this in `Extra Args`, use only trusted MCP definitions, and keep the server bound to localhost unless you have deliberately secured it.
+- Do not stack MTP, n-gram, tensor-split changes, KV-cache changes, and batch changes in the first comparison. Change one factor at a time and record prompt eval speed, generation speed, draft acceptance, per-GPU VRAM, and long-output stability.
+
 ## llama.cpp 指令速查表 / llama.cpp Command Quick Reference
 
 以下內容以繁體中文為主，整理目前這台機器最常用的 `llama.cpp` 指令。  
@@ -841,7 +865,7 @@ The following section is a Traditional Chinese focused quick reference for the `
 目前這台環境的重點：  
 Current environment highlights:
 
-- `llama.cpp` 版本：`8281 (0cec84f99)`
+- `llama.cpp` 版本：`b10199`
 - GPU：`NVIDIA GeForce RTX 5070 Ti`
 - VRAM：`16 GB`
 
@@ -1036,6 +1060,7 @@ If you launch through [Start_LCPP.ps1](C:/Users/USER/llama%20win%20cuda%2013/PS1
 - `--model`
 - `--port`
 - `--gpu-layers`
+- `--load-mode`
 - `--threads`
 - `--threads-batch`
 
@@ -1069,8 +1094,8 @@ Below is a practical Traditional Chinese reference for the most useful options.
 | `-fitc, --fit-ctx N` | 整數 | `--fit` 可調整時的最小 context | `4096` |
 | `-ctk, --cache-type-k TYPE` | 列舉 | 設定 KV cache 的 K 型別 | `f16`, `q8_0`, `q4_0` |
 | `-ctv, --cache-type-v TYPE` | 列舉 | 設定 KV cache 的 V 型別 | `f16`, `q8_0`, `q4_0` |
-| `--mmap`, `--no-mmap` | 開關 | 控制是否 memory-map 模型 | 預設通常開啟 |
-| `--mlock` | 開關 | 盡量把模型留在 RAM，不讓系統換出 | 視 RAM 是否足夠 |
+| `-lm, --load-mode MODE` | 選項 | 統一控制模型載入模式 | `mmap`, `mmap+mlock`, `mlock`, `dio`, `none` |
+| `--mmap`, `--no-mmap`, `--mlock`, `--direct-io` | 開關 | 已 deprecated 的相容旗標；改用 `--load-mode` | 僅供舊命令相容 |
 | `-np, --parallel N` | 整數 | server slot 數量，可同時處理多請求；本 launcher 管理的 primary server 固定使用 `1` | `1` |
 | `-cb, --cont-batching` | 開關 | 啟用 continuous batching | 預設通常開啟 |
 | `--threads-http N` | 整數 | HTTP request 處理執行緒數 | `-1`, `4` |
@@ -1256,8 +1281,9 @@ On this dual `RTX 5070 Ti 16 GB` machine, the same `Q6_K_P` build runs out of me
 現在 `Start_LCPP.ps1` 會自動辨識支援 MTP 的 GGUF。除了原本檔名、`id` 或 `path` 含有 `Qwen3.6` 與 `MTP` 的模型，也支援新版 `llama.cpp` 的 Gemma 4 QAT/MTP 形式：主模型是 `qat.gguf`、旁邊另有 `mtp.gguf` drafter，或直接選到完整單檔 `mtp.gguf`。  
 `Start_LCPP.ps1` now auto-detects MTP-capable GGUFs. In addition to the existing `Qwen3.6` + `MTP` filename, `id`, or `path` detection, it supports the newer `llama.cpp` Gemma 4 QAT/MTP layout: a `qat.gguf` target with a neighboring `mtp.gguf` drafter, or a complete single-file `mtp.gguf`.
 
-如果你是走 `Tune And Launch`，可以直接在矩陣裡切換 `MTP` 開或關，並設定 `SPEC_DRAFT_N_MAX`。Gemma 4 MTP 會依 Unsloth 範例預設為 `4`，其他 MTP 模型預設為 `2`。  
-If you launch through `Tune And Launch`, you can toggle `MTP` directly inside the matrix and set `SPEC_DRAFT_N_MAX` there as well. Gemma 4 MTP defaults to `4` following the Unsloth example, while other MTP models default to `2`.
+如果你是走 `Tune And Launch`，可以直接在矩陣裡切換 `MTP` 開或關，並設定 `SPEC_DRAFT_N_MAX`、draft GPU layers、draft device 與 draft K/V cache。Gemma 4 MTP 預設為 `4`，其他 MTP 模型跟隨目前 llama.cpp 預設 `3`；建議再與較保守的 `2` 做相同提示詞 A/B 測試。
+
+If you launch through `Tune And Launch`, you can toggle `MTP` and independently set `SPEC_DRAFT_N_MAX`, draft GPU layers, draft device, and draft K/V cache. Gemma 4 MTP defaults to `4`; other MTP models follow the current llama.cpp default of `3`, which should be A/B tested against the conservative value `2`.
 
 同一個矩陣現在也加入了 `Reasoning`、`Think Level` 與預設開啟的 `Preserve Reasoning`。`Reasoning` 會對應 `llama.cpp` 的 `--reasoning auto|on|off`；`Think Level` 會對應 `--reasoning-budget`，目前內建的級別是 `Low (1024)`、`Medium (4096)`、`High (8192)`、`Max (-1)`；`Preserve Reasoning` 則對應 `--reasoning-preserve` / `--no-reasoning-preserve`。
 The same matrix now also includes `Reasoning`, `Think Level`, and `Preserve Reasoning`, which defaults to On. `Reasoning` maps to `llama.cpp` `--reasoning auto|on|off`; `Think Level` maps to `--reasoning-budget`, with built-in levels `Low (1024)`, `Medium (4096)`, `High (8192)`, and `Max (-1)`; `Preserve Reasoning` maps to `--reasoning-preserve` / `--no-reasoning-preserve`.
@@ -1266,8 +1292,17 @@ The same matrix now also includes `Reasoning`, `Think Level`, and `Preserve Reas
 For every supported MTP model, the launcher auto-adds:
 
 - `--spec-type draft-mtp`
-- `--spec-draft-n-max 4` for Gemma 4 MTP, otherwise `2`
+- `--spec-draft-n-max 4` for Gemma 4 MTP, otherwise `3`
+- `--spec-draft-ngl auto`
 - `--flash-attn on`
+
+The tuning matrix also exposes these optional b10199 draft-context controls without forcing non-default values:
+
+- `--spec-draft-device`
+- `--spec-draft-type-k`
+- `--spec-draft-type-v`
+
+Keep the device and draft K/V fields blank for the server defaults. Change one factor at a time and compare generation throughput, draft acceptance, per-GPU VRAM, and long-output stability.
 
 Gemma 4 QAT/MTP 若主模型旁邊有 `mtp*.gguf` sidecar，launcher 也會自動補上 `--spec-draft-model <sidecar>`，例如 `mtp-gemma-4-12B-it.gguf`。  
 For Gemma 4 QAT/MTP layouts with a neighboring `mtp*.gguf` sidecar, the launcher also auto-adds `--spec-draft-model <sidecar>`, for example `mtp-gemma-4-12B-it.gguf`.
