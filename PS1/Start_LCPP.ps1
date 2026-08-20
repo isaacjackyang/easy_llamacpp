@@ -2705,6 +2705,12 @@ function Sync-LaunchConfigReasoningFields {
         $Config.ThinkLevel = "Auto"
     }
 
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ReasoningEffort)) {
+        # "default" intentionally emits no flag, preserving the template's
+        # native reasoning-effort behaviour.
+        $Config.ReasoningEffort = "default"
+    }
+
     # Leave this unset by default: llama.cpp then follows the chat template's
     # own supports_preserve_reasoning policy and no preserve flag is emitted.
     if ($null -eq $Config.ReasoningPreserve -or [string]::IsNullOrWhiteSpace([string]$Config.ReasoningPreserve)) {
@@ -5134,6 +5140,7 @@ function Convert-ForwardArgsToMenuConfig {
         ChatTemplate    = ""
         ReasoningMode   = "auto"
         ThinkLevel      = "Auto"
+        ReasoningEffort = "default"
         ReasoningPreserve = "auto"
         SpecType         = "auto"
         SpecDraftModel   = ""
@@ -5254,6 +5261,9 @@ function Convert-ForwardArgsToMenuConfig {
             '^--reasoning-budget(?:=(.+))?$' {
                 $ReasoningBudget = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
                 $Config.ThinkLevel = Convert-ReasoningBudgetToThinkLevel -ReasoningBudget $ReasoningBudget
+            }
+            '^--reasoning-effort(?:=(.+))?$' {
+                $Config.ReasoningEffort = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
             '^--reasoning-preserve$' {
                 $Config.ReasoningPreserve = "on"
@@ -5431,6 +5441,12 @@ function Convert-MenuConfigToForwardArgs {
     if (-not [string]::IsNullOrWhiteSpace($ReasoningBudget) -and [string]$Config.ReasoningMode -ne "off") {
         $Arguments.Add("--reasoning-budget")
         $Arguments.Add($ReasoningBudget)
+    }
+
+    $ReasoningEffort = ([string]$Config.ReasoningEffort).Trim().ToLowerInvariant()
+    if ($ReasoningEffort -ne "" -and $ReasoningEffort -ne "default" -and [string]$Config.ReasoningMode -ne "off") {
+        $Arguments.Add("--reasoning-effort")
+        $Arguments.Add($ReasoningEffort)
     }
 
     $ReasoningPreserve = ([string]$Config.ReasoningPreserve).Trim().ToLowerInvariant()
@@ -5691,6 +5707,7 @@ function Get-SavedLaunchProfilePersistedKeys {
         "ChatTemplate"
         "ReasoningMode"
         "ThinkLevel"
+        "ReasoningEffort"
         "ReasoningPreserve"
         "SpecType"
         "SpecDraftModel"
@@ -9581,6 +9598,7 @@ function New-LaunchConfig {
         ChatTemplate      = [string]$ForwardConfig.ChatTemplate
         ReasoningMode     = [string]$ForwardConfig.ReasoningMode
         ThinkLevel        = [string]$ForwardConfig.ThinkLevel
+        ReasoningEffort   = [string]$ForwardConfig.ReasoningEffort
         ReasoningPreserve = [string]$ForwardConfig.ReasoningPreserve
         SpecType          = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.SpecType)) { "auto" } else { [string]$ForwardConfig.SpecType }
         SpecDraftModel    = [string]$ForwardConfig.SpecDraftModel
@@ -9626,6 +9644,7 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "ChatTemplate"; Label = (Format-BilingualText -ChineseText "聊天模板" -EnglishText "Chat Template"); Type = "chatTemplate" },
         [pscustomobject]@{ Key = "ReasoningMode"; Label = (Format-BilingualText -ChineseText "推理模式" -EnglishText "Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "ThinkLevel"; Label = (Format-BilingualText -ChineseText "思考等級" -EnglishText "Think Level"); Type = "choice"; Choices = (Get-ThinkLevelChoices) },
+        [pscustomobject]@{ Key = "ReasoningEffort"; Label = (Format-BilingualText -ChineseText "推理強度" -EnglishText "Reasoning Effort"); Type = "choice"; Choices = @("default", "minimal", "low", "medium", "high", "xhigh", "max") },
         [pscustomobject]@{ Key = "ReasoningPreserve"; Label = (Format-BilingualText -ChineseText "保留思考" -EnglishText "Preserve Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "SpecType"; Label = (Format-BilingualText -ChineseText "推測解碼" -EnglishText "Speculative Decode"); Type = "choice"; Choices = @("auto", "none", "draft-mtp", "draft-simple", "draft-eagle3", "draft-dflash", "draft-dspark", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache") },
         [pscustomobject]@{ Key = "SpecDraftModel"; Label = (Format-BilingualText -ChineseText "草稿模型" -EnglishText "Draft Model"); Type = "text"; Hint = (Format-BilingualText -ChineseText "DFlash、DSpark、EAGLE 或 simple draft 對應的 GGUF；留空讓 llama.cpp/MTP 自動處理" -EnglishText "Matching GGUF for DFlash, DSpark, EAGLE, or simple draft; blank keeps llama.cpp/MTP auto-discovery") },
@@ -9690,6 +9709,7 @@ function Get-LaunchConfigDefaultText {
         "ChatTemplate" { return "GGUF model metadata" }
         "ReasoningMode" { return "auto" }
         "ThinkLevel" { return "Auto (no explicit budget)" }
+        "ReasoningEffort" { return "default (template default; no explicit flag)" }
         "ReasoningPreserve" { return "template default (no flag)" }
         "SpecType" { return "auto -> MTP only when the model supports it" }
         "SpecDraftModel" { return "none / auto-discover" }
@@ -9802,6 +9822,13 @@ function Get-LaunchConfigValueText {
             }
 
             return [string]$Config.ThinkLevel
+        }
+        "ReasoningEffort" {
+            if ([string]::IsNullOrWhiteSpace([string]$Config.ReasoningEffort)) {
+                return Get-LaunchConfigDefaultText -Config $Config -Key $Item.Key
+            }
+
+            return [string]$Config.ReasoningEffort
         }
         "MtpEnabled" { return $(if ($Config.MtpEnabled) { "On" } else { "Off" }) }
         "RepeatingLayers" {
@@ -10067,6 +10094,12 @@ function Get-LaunchConfigItemHelp {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 `--reasoning-budget`。等級越高，模型在被強制結束 thinking 之前可用的思考 token 越多。" -EnglishText "Maps to llama.cpp --reasoning-budget. Higher levels allow more thinking tokens before the model is forced to stop thinking."
                 Recommendation = Format-BilingualText -ChineseText "較難的任務建議先用 `Medium (4096)`。在乎延遲時用 `Low (1024)`，要更深的推理可用 `High (8192)`，只有能接受很長 thinking 時才用 `Max (-1)`。" -EnglishText "Start with Medium (4096) for harder tasks. Use Low (1024) when latency matters, High (8192) for deeper problems, and Max (-1) only if you accept potentially long reasoning."
+            }
+        }
+        "ReasoningEffort" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 `--reasoning-effort`，把思考策略等級傳給支援此欄位的聊天模板；它不等同於 token 預算。" -EnglishText "Maps to llama.cpp --reasoning-effort and passes a thinking-strategy level to chat templates that support it; it is separate from the token budget."
+                Recommendation = Format-BilingualText -ChineseText "預設維持 `default`，不傳旗標並沿用模板設定。只有已驗證模板支援時，才依任務選 low、medium、high 或 xhigh；Reasoning 設為 Off 時不會送出此參數。" -EnglishText "Keep default so no flag is sent and the template controls the setting. Use low, medium, high, or xhigh only after verifying template support; no effort flag is sent when Reasoning is Off."
             }
         }
         "ChatTemplate" {
@@ -10808,11 +10841,9 @@ function Get-LaunchConfigCardLines {
     $Value = Get-FitText -Text (Get-LaunchConfigValueText -Config $Config -Item $Item) -Width $InnerWidth
     $Marker = if ($Selected) { ">" } else { " " }
     $LabelAndValue = Get-FitText -Text ("{0}{1}: {2}" -f $Marker, $Label, $Value) -Width $InnerWidth
-    return @(
-        ("+" + ("-" * $InnerWidth) + "+"),
-        ("|" + (Add-StatusCardPadding -Text $LabelAndValue -Width $InnerWidth) + "|"),
-        ("+" + ("-" * $InnerWidth) + "+")
-    )
+    # Grid borders are rendered by Show-LaunchConfigGrid so neighbouring cards
+    # share their vertical and horizontal lines instead of drawing duplicates.
+    return (Add-StatusCardPadding -Text $LabelAndValue -Width $InnerWidth)
 }
 
 function Show-LaunchConfigGrid {
@@ -10838,7 +10869,7 @@ function Show-LaunchConfigGrid {
 
         Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle ((Format-BilingualText -ChineseText "方向鍵移動，Enter 或 Space 編輯；Tab／PgUp／PgDn 切換卡片頁。" -EnglishText "Arrow keys move; Enter or Space edits; Tab/PgUp/PgDn changes card pages.") + "  [$($PageIndex + 1)/$PageCount]")
         $Width = Get-ConsoleWidth
-        $ColumnGap = 2
+        $ColumnGap = 0
         $MinTwoColumnCellWidth = 28
         # Prefer readable model and draft names over an artificially narrow
         # grid; on wide terminals each of the two cards can now use 72 columns.
@@ -10853,6 +10884,7 @@ function Show-LaunchConfigGrid {
         $RowCount = [Math]::Ceiling($VisibleItems.Count / $ColumnCount)
         $SelectedItem = $VisibleItems[$SelectedIndex]
         $SelectedHelp = Get-LaunchConfigItemHelp -Config $Config -Item $SelectedItem
+        $CellInnerWidth = $CellWidth - 2
 
         for ($Row = 0; $Row -lt $RowCount; $Row++) {
             $Cards = @()
@@ -10865,17 +10897,34 @@ function Show-LaunchConfigGrid {
                     $Cards += $null
                 }
             }
-            for ($LineIndex = 0; $LineIndex -lt 3; $LineIndex++) {
+
+            # Draw one top border followed by one shared separator per row.
+            # This saves a terminal line for every adjacent row and avoids
+            # double-thick borders between cards.
+            if ($Row -eq 0) {
                 for ($Column = 0; $Column -lt $ColumnCount; $Column++) {
-                    $Card = $Cards[$Column]
-                    $Line = if ($null -eq $Card) { " " * $CellWidth } else { $Card.Lines[$LineIndex] }
-                    $Foreground = if ($null -ne $Card -and $Card.Selected) { "Black" } else { "Gray" }
-                    $Background = if ($null -ne $Card -and $Card.Selected) { "DarkCyan" } else { "Black" }
-                    Write-Host $Line -NoNewline -ForegroundColor $Foreground -BackgroundColor $Background
-                    if ($Column -lt ($ColumnCount - 1)) { Write-Host (" " * $ColumnGap) -NoNewline }
+                    $Prefix = if ($Column -eq 0) { "+" } else { "" }
+                    Write-Host ($Prefix + ("-" * $CellInnerWidth) + "+") -NoNewline -ForegroundColor Gray
                 }
                 Write-Host ""
             }
+
+            Write-Host "|" -NoNewline -ForegroundColor Gray
+            for ($Column = 0; $Column -lt $ColumnCount; $Column++) {
+                $Card = $Cards[$Column]
+                $Line = if ($null -eq $Card) { " " * $CellInnerWidth } else { [string]$Card.Lines }
+                $Foreground = if ($null -ne $Card -and $Card.Selected) { "Black" } else { "Gray" }
+                $Background = if ($null -ne $Card -and $Card.Selected) { "DarkCyan" } else { "Black" }
+                Write-Host $Line -NoNewline -ForegroundColor $Foreground -BackgroundColor $Background
+                Write-Host "|" -NoNewline -ForegroundColor Gray
+            }
+            Write-Host ""
+
+            for ($Column = 0; $Column -lt $ColumnCount; $Column++) {
+                $Prefix = if ($Column -eq 0) { "+" } else { "" }
+                Write-Host ($Prefix + ("-" * $CellInnerWidth) + "+") -NoNewline -ForegroundColor Gray
+            }
+            Write-Host ""
         }
 
         Write-Host ""
@@ -11498,6 +11547,7 @@ function Get-TrackedServerLaunchSettings {
             ChatTemplate     = ""
             ReasoningMode    = ""
             ReasoningBudget  = ""
+            ReasoningEffort  = ""
             ReasoningPreserve = $null
             SpecType         = ""
             SpecDraftNMax    = ""
@@ -11625,6 +11675,9 @@ function Get-TrackedServerLaunchSettings {
                 }
                 '^--reasoning-budget(?:=(.+))?$' {
                     $Settings.ReasoningBudget = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
+                }
+                '^--reasoning-effort(?:=(.+))?$' {
+                    $Settings.ReasoningEffort = if ($Matches[1]) { $Matches[1] } elseif (($Index + 1) -lt $Arguments.Count) { $Arguments[++$Index] } else { "" }
                 }
                 '^--reasoning-preserve$' {
                     $Settings.ReasoningPreserve = $true
@@ -13149,6 +13202,9 @@ function Show-ServerStatus {
             }
             if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ReasoningBudget)) {
                 Write-BilingualField -ChineseLabel "思考預算" -EnglishLabel "Budget" -ChineseValue ("{0}，思考 token 預算（--reasoning-budget）" -f $TrackedSettings.ReasoningBudget) -EnglishValue ("{0} thinking token budget (--reasoning-budget)" -f $TrackedSettings.ReasoningBudget)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TrackedSettings.ReasoningEffort)) {
+                Write-BilingualField -ChineseLabel "推理強度" -EnglishLabel "Effort" -ChineseValue ("{0}，模板推理強度（--reasoning-effort）" -f $TrackedSettings.ReasoningEffort) -EnglishValue ("{0} template reasoning effort (--reasoning-effort)" -f $TrackedSettings.ReasoningEffort)
             }
             if ($null -ne $TrackedSettings.ReasoningPreserve) {
                 Write-BilingualField -ChineseLabel "保存思考" -EnglishLabel "Preserve" -ChineseValue $(if ($TrackedSettings.ReasoningPreserve) { "開啟（--reasoning-preserve）" } else { "關閉（--no-reasoning-preserve）" }) -EnglishValue $(if ($TrackedSettings.ReasoningPreserve) { "on (--reasoning-preserve)" } else { "off (--no-reasoning-preserve)" })
