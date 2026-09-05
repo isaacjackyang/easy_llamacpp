@@ -19,10 +19,25 @@ $LegacyMmprojPidFile = Join-Path $ProjectRoot "logs\vision-server.pid"
 $RuntimeOwnerStateFile = Join-Path $ProjectRoot "logs\llama-runtime-owner.json"
 $SupervisorPidFile = Join-Path $ProjectRoot "logs\llama-supervisor.pid"
 $PreferredServerExe = Join-Path $ProjectRoot "bin\llama-server.exe"
+$FastServerExe = Join-Path $ProjectRoot "bin_fast\llama-server.exe"
 $LegacyServerExe = Join-Path $ProjectRoot "llama-server.exe"
 $SupervisorScriptPath = Join-Path $ProjectRoot "PS1\llama_supervisor.ps1"
 $TrackedPidFiles = @($PidFile, $LegacyPidFile, $LegacyMmprojPidFile, $SupervisorPidFile) | Select-Object -Unique
-$TargetServerPaths = @($PreferredServerExe, $LegacyServerExe) | Where-Object { Test-Path -LiteralPath $_ }
+$RuntimeOwnerServerExe = $null
+if (Test-Path -LiteralPath $RuntimeOwnerStateFile -PathType Leaf) {
+    try {
+        $RuntimeOwnerState = Get-Content -LiteralPath $RuntimeOwnerStateFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($RuntimeOwnerState.server_exe) {
+            $RuntimeOwnerServerExe = [string]$RuntimeOwnerState.server_exe
+        }
+    }
+    catch {
+        $RuntimeOwnerServerExe = $null
+    }
+}
+$TargetServerPaths = @($PreferredServerExe, $FastServerExe, $LegacyServerExe, $RuntimeOwnerServerExe) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
+    Select-Object -Unique
 $TargetServerPatterns = @($TargetServerPaths | ForEach-Object { [regex]::Escape($_) })
 
 function Write-Info {

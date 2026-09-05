@@ -42,10 +42,16 @@ bin\
   cublas*.dll
   cudart*.dll
   ...
+bin_fast\
+  llama-server.exe
+  ...
 ```
 
 `Start_LCPP.ps1` 會優先使用 `bin\llama-server.exe`。  
 `Start_LCPP.ps1` prefers `bin\llama-server.exe`.
+
+`Tune And Launch` 的 `llama.cpp Bin 路徑 / llama.cpp Bin Path` 欄位可為每個儲存設定選擇 `Standard (bin)`、`FastMTP (bin_fast)`、專案內其他含 `llama-server.exe` 的 `bin*` 目錄，或自訂目錄。匯出的一鍵啟動檔也會保留這個選擇。命令列可直接使用 `-LlamaBinDirectory bin-mtp-3gpu`。
+The `llama.cpp Bin Path` field in `Tune And Launch` can select `Standard (bin)`, `FastMTP (bin_fast)`, any other project `bin*` directory containing `llama-server.exe`, or a custom directory per saved profile. Exported one-shot launchers preserve that choice. Use `-LlamaBinDirectory bin-mtp-3gpu` for command-line launches.
 
 如果 `bin\` 不存在，但根目錄仍有舊版 `llama-server.exe`，腳本也能相容使用。  
 If `bin\` does not exist but a legacy `llama-server.exe` is still beside the script, the launcher can still use it for compatibility.
@@ -1111,6 +1117,7 @@ Below is a practical Traditional Chinese reference for the most useful options.
 | `--rerank`, `--reranking` | 開關 | 啟用 rerank endpoint | `--rerank` |
 | `--chat-template NAME` / `--chat-template-file PATH` | 字串 / 路徑 | 指定聊天模板；Tune And Launch 會列出 `chat template` 資料夾內的模板，留空時使用 GGUF metadata | `chatml`, `chat template\custom.jinja` |
 | `--reasoning-format FORMAT` | 列舉 | 控制 reasoning/thinking 欄位格式 | `none`, `deepseek`, `deepseek-legacy` |
+| `--reasoning-effort LEVEL` | 列舉 | 把思考策略等級傳給支援的聊天模板；Tune And Launch 可直接選擇 | `default`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `--reasoning-budget N` | 整數 | 控制 thinking 額度 | `-1`, `0` |
 | `--reasoning-preserve` / `--no-reasoning-preserve` | 開關 | 是否在完整多輪歷史中保留先前的 reasoning trace（需模板支援） | 預設開啟 |
 | `-to, --timeout N` | 整數 | HTTP 讀寫逾時秒數 | `600` |
@@ -1285,8 +1292,11 @@ On this dual `RTX 5070 Ti 16 GB` machine, the same `Q6_K_P` build runs out of me
 
 If you launch through `Tune And Launch`, you can toggle `MTP` and independently set `SPEC_DRAFT_N_MAX`, draft GPU layers, draft device, and draft K/V cache. Gemma 4 MTP defaults to `4`; other MTP models follow the current llama.cpp default of `3`, which should be A/B tested against the conservative value `2`.
 
-同一個矩陣現在也加入了 `Reasoning`、`Think Level` 與預設開啟的 `Preserve Reasoning`。`Reasoning` 會對應 `llama.cpp` 的 `--reasoning auto|on|off`；`Think Level` 會對應 `--reasoning-budget`，目前內建的級別是 `Low (1024)`、`Medium (4096)`、`High (8192)`、`Max (-1)`；`Preserve Reasoning` 則對應 `--reasoning-preserve` / `--no-reasoning-preserve`。
-The same matrix now also includes `Reasoning`, `Think Level`, and `Preserve Reasoning`, which defaults to On. `Reasoning` maps to `llama.cpp` `--reasoning auto|on|off`; `Think Level` maps to `--reasoning-budget`, with built-in levels `Low (1024)`, `Medium (4096)`, `High (8192)`, and `Max (-1)`; `Preserve Reasoning` maps to `--reasoning-preserve` / `--no-reasoning-preserve`.
+同一個矩陣現在也加入了 `Reasoning`、`Thinking Level`、`Think Token Budget` 與 `Preserve Reasoning`。`Reasoning` 對應 `--reasoning auto|on|off`；`Thinking Level` 對應 `--reasoning-effort`，可選 `default`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。切換等級時會自動套用建議的 `Think Token Budget`：`default→Auto`、`minimal/low→Low (1024)`、`medium→Medium (4096)`、`high/xhigh→High (8192)`、`max→Max (-1)`；套用後仍可單獨修改預算。`Preserve Reasoning` 可選 auto/on/off，分別代表不傳旗標、`--reasoning-preserve`、`--no-reasoning-preserve`。
+The same matrix now includes `Reasoning`, `Thinking Level`, `Think Token Budget`, and `Preserve Reasoning`. `Reasoning` maps to `--reasoning auto|on|off`; `Thinking Level` maps to `--reasoning-effort` with `default`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Changing the level automatically applies its recommended `Think Token Budget`: `default→Auto`, `minimal/low→Low (1024)`, `medium→Medium (4096)`, `high/xhigh→High (8192)`, and `max→Max (-1)`; the budget remains independently editable afterwards. `Preserve Reasoning` offers auto/on/off, which emit no flag, `--reasoning-preserve`, and `--no-reasoning-preserve`, respectively.
+
+調校矩陣會在卡片下方顯示目前值、全部可選值、目前所選值的個別意義、欄位用途與建議；切換 choice 後，選項意義會立即更新。每頁卡片數會依終端高度自動調整，讓詳細說明保留足夠空間。
+Below the tuning cards, the matrix shows the current value, all available choices, the meaning of the selected choice, field purpose, and recommendation. The option explanation updates immediately when a choice changes. The number of cards per page adapts to terminal height so the detailed help remains visible.
 
 所有支援 MTP 的模型都會自動補上：  
 For every supported MTP model, the launcher auto-adds:
@@ -1306,6 +1316,9 @@ Keep the device and draft K/V fields blank for the server defaults. Change one f
 
 Gemma 4 QAT/MTP 若主模型旁邊有 `mtp*.gguf` sidecar，launcher 也會自動補上 `--spec-draft-model <sidecar>`，例如 `mtp-gemma-4-12B-it.gguf`。  
 For Gemma 4 QAT/MTP layouts with a neighboring `mtp*.gguf` sidecar, the launcher also auto-adds `--spec-draft-model <sidecar>`, for example `mtp-gemma-4-12B-it.gguf`.
+
+特殊 FastMTP 版可在矩陣中選擇 `FastMTP (bin_fast)`，將 `Speculative Decode` 設成 `draft-mtp`，並明確指定相符的 `Draft Model`。即使主 GGUF 也帶有內嵌 MTP metadata，明確選取的外接 sidecar 仍會保留；留空時則繼續使用安全的內嵌 MTP 預設。
+For a specialized FastMTP build, select `FastMTP (bin_fast)`, choose `draft-mtp`, and explicitly set the matching `Draft Model`. An explicitly selected external sidecar is preserved even when the target GGUF also carries embedded MTP metadata; leaving it blank keeps the safer embedded-MTP default.
 
 Qwen3.6 MTP 另外保留原本的專屬預設：  
 Qwen3.6 MTP also keeps its previous model-specific defaults:

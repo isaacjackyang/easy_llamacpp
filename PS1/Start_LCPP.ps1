@@ -54,6 +54,11 @@ Path to the GGUF model file.
 Accepts either an absolute path or a path relative to the launcher root.
 When omitted, the launcher uses the default_model_id entry from json\model-index.json.
 
+.PARAMETER LlamaBinDirectory
+Optional directory containing llama-server.exe and the matching llama.cpp DLLs.
+Accepts either an absolute path or a path relative to the launcher root.
+When omitted, the launcher keeps using the default bin subfolder.
+
 .PARAMETER VisionMmprojPath
 Optional path to the vision mmproj GGUF file.
 Use this when you want a direct launch or bypass run to pin a specific projector.
@@ -193,6 +198,7 @@ param(
     [int]$Threads = -1,
     [int]$ThreadsBatch = -1,
     [string]$ModelPath = $null,
+    [string]$LlamaBinDirectory = $null,
     [string]$VisionMmprojPath = $null,
     [switch]$DisableVision,
     [string]$ModelIndexPath = ".\json\model-index.json",
@@ -239,38 +245,82 @@ else {
     $LauncherScriptHome
 }
 $Ps1Root = $LauncherScriptHome
-$PreferredBinRoot = Join-Path $ScriptRoot "bin"
+$DefaultBinRoot = Join-Path $ScriptRoot "bin"
+$FastBinRoot = Join-Path $ScriptRoot "bin_fast"
 $LegacyBinRoot = $ScriptRoot
 $LogRoot = Join-Path $ScriptRoot "logs"
 $JsonRoot = Join-Path $ScriptRoot "json"
 $ChatTemplateRoot = Join-Path $ScriptRoot "chat template"
-$LlamaBinRoot = if (Test-Path -LiteralPath (Join-Path $PreferredBinRoot "llama-server.exe")) {
-    $PreferredBinRoot
-}
-elseif (Test-Path -LiteralPath (Join-Path $LegacyBinRoot "llama-server.exe")) {
-    $LegacyBinRoot
-}
-else {
-    $PreferredBinRoot
-}
-$ServerExe = Join-Path $LlamaBinRoot "llama-server.exe"
-$BenchExe = Join-Path $LlamaBinRoot "llama-bench.exe"
-$BatchedBenchExe = Join-Path $LlamaBinRoot "llama-batched-bench.exe"
+$DefaultServerExe = Join-Path $DefaultBinRoot "llama-server.exe"
+$DefaultBenchExe = Join-Path $DefaultBinRoot "llama-bench.exe"
+$DefaultBatchedBenchExe = Join-Path $DefaultBinRoot "llama-batched-bench.exe"
+$FastServerExe = Join-Path $FastBinRoot "llama-server.exe"
+$FastBenchExe = Join-Path $FastBinRoot "llama-bench.exe"
+$FastBatchedBenchExe = Join-Path $FastBinRoot "llama-batched-bench.exe"
 $LegacyServerExe = Join-Path $LegacyBinRoot "llama-server.exe"
 $LegacyBenchExe = Join-Path $LegacyBinRoot "llama-bench.exe"
 $LegacyBatchedBenchExe = Join-Path $LegacyBinRoot "llama-batched-bench.exe"
-$ServerExeCandidates = @(
-    $ServerExe
-    $LegacyServerExe
-) | Select-Object -Unique
-$BenchExeCandidates = @(
-    $BenchExe
-    $LegacyBenchExe
-) | Select-Object -Unique
-$BatchedBenchExeCandidates = @(
-    $BatchedBenchExe
-    $LegacyBatchedBenchExe
-) | Select-Object -Unique
+
+function Resolve-LlamaBinDirectoryPath {
+    param([AllowNull()][string]$Directory)
+
+    if ([string]::IsNullOrWhiteSpace($Directory)) {
+        return $DefaultBinRoot
+    }
+    if ([System.IO.Path]::IsPathRooted($Directory)) {
+        return [System.IO.Path]::GetFullPath($Directory)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $ScriptRoot $Directory))
+}
+function ConvertTo-LlamaBinConfigValue {
+    param([AllowNull()][string]$Directory)
+
+    $ResolvedDirectory = Resolve-LlamaBinDirectoryPath -Directory $Directory
+    if ([string]::Equals($ResolvedDirectory, $DefaultBinRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return "bin"
+    }
+    if ([string]::Equals($ResolvedDirectory, $FastBinRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return "bin_fast"
+    }
+
+    return $ResolvedDirectory
+}
+
+function Resolve-LlamaServerExecutablePath {
+    param([AllowNull()][string]$Directory)
+
+    $ResolvedDirectory = Resolve-LlamaBinDirectoryPath -Directory $Directory
+    $Candidate = Join-Path $ResolvedDirectory "llama-server.exe"
+    if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
+        return $Candidate
+    }
+    if ([string]::Equals($ResolvedDirectory, $DefaultBinRoot, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $LegacyServerExe -PathType Leaf)) {
+        return $LegacyServerExe
+    }
+
+    return $Candidate
+}
+
+function Set-LlamaBinaryDirectory {
+    param([AllowNull()][string]$Directory)
+
+    $ResolvedPreferredRoot = Resolve-LlamaBinDirectoryPath -Directory $Directory
+    $ResolvedServerExe = Resolve-LlamaServerExecutablePath -Directory $ResolvedPreferredRoot
+    $ResolvedBinRoot = Split-Path -Parent $ResolvedServerExe
+
+    $script:LlamaBinDirectory = ConvertTo-LlamaBinConfigValue -Directory $ResolvedPreferredRoot
+    $script:PreferredBinRoot = $ResolvedPreferredRoot
+    $script:LlamaBinRoot = $ResolvedBinRoot
+    $script:ServerExe = $ResolvedServerExe
+    $script:BenchExe = Join-Path $ResolvedBinRoot "llama-bench.exe"
+    $script:BatchedBenchExe = Join-Path $ResolvedBinRoot "llama-batched-bench.exe"
+    $script:ServerExeCandidates = @($script:ServerExe, $DefaultServerExe, $FastServerExe, $LegacyServerExe) | Select-Object -Unique
+    $script:BenchExeCandidates = @($script:BenchExe, $DefaultBenchExe, $FastBenchExe, $LegacyBenchExe) | Select-Object -Unique
+    $script:BatchedBenchExeCandidates = @($script:BatchedBenchExe, $DefaultBatchedBenchExe, $FastBatchedBenchExe, $LegacyBatchedBenchExe) | Select-Object -Unique
+}
+
+Set-LlamaBinaryDirectory -Directory $LlamaBinDirectory
 $LegacyPidFile = Join-Path $ScriptRoot "llama-server.pid"
 $LegacyStdOutLog = Join-Path $ScriptRoot "llama-server.stdout.log"
 $LegacyStdErrLog = Join-Path $ScriptRoot "llama-server.stderr.log"
@@ -300,6 +350,7 @@ $script:ModelFileSizeBytesCache = @{}
 $script:ModelFileSizeLabelCache = @{}
 $script:ModelRepeatingLayerCountCache = @{}
 $script:ModelTrainingContextCache = @{}
+$script:EmbeddedMtpHeadCache = @{}
 $script:MmprojPathCache = @{}
 $script:LaunchModelEntry = $null
 $script:LaunchMmprojPath = $null
@@ -829,12 +880,39 @@ function Get-ServerArgs {
     $Arguments.Add("--threads-batch")
     $Arguments.Add([string]$ThreadsBatch)
 
+    # Direct/bypass launches receive raw trailing llama.cpp arguments instead
+    # of a menu config.  Treat speculative options as managed here too: an old
+    # shortcut must not pair an unrelated model with its previous MTP draft.
+    $RequestedSpecType = Get-LlamaArgumentValue -Arguments $LlamaArgs -Patterns @('^--spec-type(?:=(.+))?$')
+    $RequestedMtpDepth = Get-LlamaArgumentValue -Arguments $LlamaArgs -Patterns @('^--spec-draft-n-max(?:=(.+))?$')
+    $RequestedMtpDraftModel = Get-LlamaArgumentValue -Arguments $LlamaArgs -Patterns @('^(?:--spec-draft-model|-md|--model-draft)(?:=(.+))?$')
+    $RequestedMtpDraftGpuLayers = Get-LlamaArgumentValue -Arguments $LlamaArgs -Patterns @('^(?:--spec-draft-ngl|--gpu-layers-draft|--n-gpu-layers-draft|-ngld)(?:=(.+))?$')
+    $RequestedMtpDraftDevice = Get-LlamaArgumentValue -Arguments $LlamaArgs -Patterns @('^(?:--spec-draft-device|--device-draft|-devd)(?:=(.+))?$')
+    $RequestedMtpDraftCacheTypeK = Get-LlamaArgumentValue -Arguments $LlamaArgs -Patterns @('^(?:--spec-draft-type-k|--cache-type-k-draft|-ctkd)(?:=(.+))?$')
+    $RequestedMtpDraftCacheTypeV = Get-LlamaArgumentValue -Arguments $LlamaArgs -Patterns @('^(?:--spec-draft-type-v|--cache-type-v-draft|-ctvd)(?:=(.+))?$')
+    $SanitizedLlamaArgs = @(Remove-LlamaArgumentsByPatterns -Arguments $LlamaArgs -Patterns @(
+            '^--spec-type(?:=|$)',
+            '^(?:--spec-draft-model|-md|--model-draft)(?:=|$)',
+            '^--spec-draft-n-max(?:=|$)',
+            '^(?:--spec-draft-ngl|--gpu-layers-draft|--n-gpu-layers-draft|-ngld)(?:=|$)',
+            '^(?:--spec-draft-device|--device-draft|-devd)(?:=|$)',
+            '^(?:--spec-draft-type-k|--cache-type-k-draft|-ctkd)(?:=|$)',
+            '^(?:--spec-draft-type-v|--cache-type-v-draft|-ctvd)(?:=|$)'
+        ))
+
     $CombinedArgs = @()
     foreach ($Argument in $script:ModelGenerationArgs) {
         $CombinedArgs += $Argument
     }
-    foreach ($Argument in $LlamaArgs) {
+    foreach ($Argument in $SanitizedLlamaArgs) {
         $CombinedArgs += $Argument
+    }
+    $UnfilteredCombinedArgs = @()
+    foreach ($Argument in $script:ModelGenerationArgs) {
+        $UnfilteredCombinedArgs += $Argument
+    }
+    foreach ($Argument in $LlamaArgs) {
+        $UnfilteredCombinedArgs += $Argument
     }
 
     Add-DefaultLlamaArgument `
@@ -863,18 +941,42 @@ function Get-ServerArgs {
             $Arguments.Add("--tensor-split")
             $Arguments.Add([string]$AutoTuning.SmartVramPlan.TensorSplit)
         }
-        if ($AutoTuning.SmartVramPlan.UsesFitManagedSplit -and -not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:-lv|--verbosity|--verbose)(?:=|$)'))) {
-            # Smart balancing needs the fitted GPU-layer count that llama.cpp
-            # only prints at verbose level. The final fixed launch omits this.
-            $Arguments.Add("-lv")
-            $Arguments.Add("4")
-        }
     }
 
-    if (Test-MtpDefaultsEnabled -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath -Arguments $CombinedArgs) {
+    $ExplicitExternalMtpRequested = (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftModel)) -and (@(
+            ([string]$RequestedSpecType) -split ',' |
+                ForEach-Object { $_.Trim().ToLowerInvariant() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        ) -contains 'draft-mtp')
+    if ($ExplicitExternalMtpRequested -or (Test-MtpDefaultsEnabled -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath -Arguments $UnfilteredCombinedArgs)) {
         $MtpDefaultSpecDraftNMax = Get-MtpDefaultSpecDraftNMax -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-type(?:=|$)') -Flag "--spec-type" -Value "draft-mtp"
-        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value $MtpDefaultSpecDraftNMax
+        $EffectiveMtpDepth = if ([string]::IsNullOrWhiteSpace($RequestedMtpDepth)) { $MtpDefaultSpecDraftNMax } else { $RequestedMtpDepth }
+        Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--spec-draft-n-max(?:=|$)') -Flag "--spec-draft-n-max" -Value $EffectiveMtpDepth
+        if (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftModel)) {
+            $ResolvedMtpDraftModel = Resolve-ModelPath -Path $RequestedMtpDraftModel
+            if (-not (Test-Path -LiteralPath $ResolvedMtpDraftModel -PathType Leaf)) {
+                throw (Format-BilingualText -ChineseText ("找不到 MTP draft 模型：{0}" -f $ResolvedMtpDraftModel) -EnglishText ("Cannot find the MTP draft model: {0}" -f $ResolvedMtpDraftModel))
+            }
+            $Arguments.Add("--spec-draft-model")
+            $Arguments.Add($ResolvedMtpDraftModel)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftGpuLayers)) {
+            $Arguments.Add("--spec-draft-ngl")
+            $Arguments.Add($RequestedMtpDraftGpuLayers)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftDevice)) {
+            $Arguments.Add("--spec-draft-device")
+            $Arguments.Add($RequestedMtpDraftDevice)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftCacheTypeK)) {
+            $Arguments.Add("--spec-draft-type-k")
+            $Arguments.Add($RequestedMtpDraftCacheTypeK)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftCacheTypeV)) {
+            $Arguments.Add("--spec-draft-type-v")
+            $Arguments.Add($RequestedMtpDraftCacheTypeV)
+        }
         Add-Gemma4MtpDraftModelDefault -TargetArguments $Arguments -UserArguments $CombinedArgs -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^(?:-fa|--flash-attn)(?:=|$)') -Flag "--flash-attn" -Value "on"
         if (Test-IsQwen36MtpModel -ModelEntry $script:LaunchModelEntry -ResolvedModelPath $ModelPath) {
@@ -915,7 +1017,7 @@ function Get-ServerArgs {
         $Arguments.Add($Argument)
     }
 
-    foreach ($Argument in $LlamaArgs) {
+    foreach ($Argument in $SanitizedLlamaArgs) {
         $Arguments.Add($Argument)
     }
 
@@ -1370,11 +1472,13 @@ function Get-SmartVramAllocationPlan {
     }
 
     $MtpMiB = 0.0
-    if (Test-MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $Arguments) {
-        # The in-model MTP draft context is concentrated on the primary CUDA device.
+    if (Test-UsesMtpSpeculativeDecoding -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $Arguments) {
+        # Both native MTP and an explicitly selected external draft-mtp model
+        # create their draft context on the primary CUDA device.  Keep the
+        # reserve independent of how the target GGUF advertises MTP.
         # 6.5 KiB/token closely tracks current Qwen 3.x MTP builds; keep a floor for shorter contexts.
         $MtpMiB = [Math]::Ceiling([Math]::Max(512.0, ([double]$ParsedContextSize * 6.5 / 1024.0)))
-        $DraftModelPath = Resolve-Gemma4MtpDraftModelPath -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+        $DraftModelPath = Resolve-MtpDraftModelPath -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $Arguments
         if (-not [string]::IsNullOrWhiteSpace($DraftModelPath) -and (Test-Path -LiteralPath $DraftModelPath -PathType Leaf)) {
             $MtpMiB += [Math]::Ceiling(((Get-Item -LiteralPath $DraftModelPath).Length / 1MB) * 1.12 + 64.0)
         }
@@ -1518,7 +1622,12 @@ function Get-AutoLaunchTuning {
                     $FitTargetMiB = 128
                 }
                 elseif ($AcceleratorInfo.TotalMiB -le 20480 -or $AcceleratorInfo.FreeMiB -le 16384) {
-                    $FitTargetMiB = 256
+                    # A 256 MiB margin frequently survives llama.cpp's fit
+                    # estimate but fails later when CUDA, KV, vision, or
+                    # warm-up workspaces are allocated. The resulting retry
+                    # reloads the entire model, which is far more expensive
+                    # than keeping another 512 MiB free on the first attempt.
+                    $FitTargetMiB = 768
                 }
                 else {
                     $FitTargetMiB = 512
@@ -1531,7 +1640,7 @@ function Get-AutoLaunchTuning {
                 $FitTargetMiB = 256
             }
             elseif ($AcceleratorInfo.TotalMiB -le 20480 -or $AcceleratorInfo.FreeMiB -le 16384) {
-                $FitTargetMiB = 512
+                $FitTargetMiB = 1024
             }
             else {
                 $FitTargetMiB = 1024
@@ -2663,6 +2772,34 @@ function Get-ThinkLevelChoices {
     )
 }
 
+function Get-ReasoningEffortChoices {
+    return @(
+        "default"
+        "minimal"
+        "low"
+        "medium"
+        "high"
+        "xhigh"
+        "max"
+    )
+}
+
+function Get-RecommendedThinkLevelForReasoningEffort {
+    param(
+        [string]$ReasoningEffort
+    )
+
+    switch (([string]$ReasoningEffort).Trim().ToLowerInvariant()) {
+        "minimal" { return "Low (1024)" }
+        "low" { return "Low (1024)" }
+        "medium" { return "Medium (4096)" }
+        "high" { return "High (8192)" }
+        "xhigh" { return "High (8192)" }
+        "max" { return "Max (-1)" }
+        default { return "Auto" }
+    }
+}
+
 function Convert-ReasoningBudgetToThinkLevel {
     param(
         [string]$ReasoningBudget
@@ -2701,14 +2838,18 @@ function Sync-LaunchConfigReasoningFields {
         $Config.ReasoningMode = "auto"
     }
 
-    if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
-        $Config.ThinkLevel = "Auto"
-    }
-
-    if ([string]::IsNullOrWhiteSpace([string]$Config.ReasoningEffort)) {
+    $ReasoningEffort = ([string]$Config.ReasoningEffort).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($ReasoningEffort) -or (Get-ReasoningEffortChoices) -notcontains $ReasoningEffort) {
         # "default" intentionally emits no flag, preserving the template's
         # native reasoning-effort behaviour.
         $Config.ReasoningEffort = "default"
+    }
+    else {
+        $Config.ReasoningEffort = $ReasoningEffort
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ThinkLevel)) {
+        $Config.ThinkLevel = Get-RecommendedThinkLevelForReasoningEffort -ReasoningEffort ([string]$Config.ReasoningEffort)
     }
 
     # Leave this unset by default: llama.cpp then follows the chat template's
@@ -3430,7 +3571,7 @@ function Test-ModelSupportsVision {
 
     $Normalized = $SearchText.ToLowerInvariant()
     $NormalizedArchitecture = if ($Architecture) { $Architecture.ToLowerInvariant() } else { "" }
-    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen3vl|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
+    $VisionPattern = '(?<![a-z0-9])(vision|vlm|qwen3vl|qwen[\-_ ]?3\.8|qwen[\-_ ]?2(?:\.5)?[\-_ ]?vl|qwen[\-_ ]?vl|qvq|llava(?:[\-_ ]?(?:next|onevision))?|bakllava|internvl|pixtral|paligemma|minicpm(?:[\-_ ]?v)?|gemma[\-_ ]?3|mllama|llama[\-_ ]?3\.2[\-_ ]?vision|phi[\-_ ]?(?:3\.5|4)[\-_ ]?(?:vision|multimodal)|glm[\-_ ]?4(?:[\._-]1)?v|cogvlm|smolvlm|molmo|moondream|janus|omni|multimodal|multi[\-_ ]modal|image)(?![a-z0-9])'
     $ArchitectureVisionPattern = '^(qwen2vl|mllama|gemma3|minicpmv|llava|llava_next|pixtral|internvl|paligemma|glm4v|cogvlm|smolvlm|molmo|moondream|janus)$'
 
     return ($Normalized -match $VisionPattern) -or ($NormalizedArchitecture -match $ArchitectureVisionPattern)
@@ -4645,6 +4786,63 @@ function Test-IsGemma4QatMtpModel {
     return ($IsGemma4 -and $HasMtpOrQatSignal)
 }
 
+function Test-HasEmbeddedMtpHead {
+    param(
+        [string]$ResolvedModelPath
+    )
+
+    $ResolvedPath = Resolve-ModelPath -Path $ResolvedModelPath
+    if ([string]::IsNullOrWhiteSpace($ResolvedPath) -or -not (Test-Path -LiteralPath $ResolvedPath -PathType Leaf)) {
+        return $false
+    }
+
+    if ($script:EmbeddedMtpHeadCache.ContainsKey($ResolvedPath)) {
+        return [bool]$script:EmbeddedMtpHeadCache[$ResolvedPath]
+    }
+
+    $HasEmbeddedMtpHead = $false
+    try {
+        $Stream = [System.IO.File]::Open($ResolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $Reader = New-Object System.IO.BinaryReader($Stream)
+            $Magic = [System.Text.Encoding]::ASCII.GetString($Reader.ReadBytes(4))
+            if ($Magic -ne "GGUF") {
+                throw "Unsupported model format."
+            }
+
+            $Version = $Reader.ReadUInt32()
+            if ($Version -lt 2 -or $Version -gt 3) {
+                throw "Unsupported GGUF version: $Version"
+            }
+
+            $null = $Reader.ReadUInt64()
+            $MetadataCount = $Reader.ReadUInt64()
+            for ($Index = 0; $Index -lt [int]$MetadataCount; $Index++) {
+                $Key = Read-GgufString -Reader $Reader
+                $Type = $Reader.ReadUInt32()
+                if ($Key -match '(^|\.)nextn_predict_layers$') {
+                    $Value = Read-GgufScalarValue -Reader $Reader -Type $Type
+                    $HasEmbeddedMtpHead = $Value -is [ValueType] -and [int64]$Value -gt 0
+                    break
+                }
+                Skip-GgufValue -Reader $Reader -Type $Type
+            }
+        }
+        finally {
+            if ($Reader) {
+                $Reader.Close()
+            }
+            $Stream.Close()
+        }
+    }
+    catch {
+        $HasEmbeddedMtpHead = $false
+    }
+
+    $script:EmbeddedMtpHeadCache[$ResolvedPath] = $HasEmbeddedMtpHead
+    return $HasEmbeddedMtpHead
+}
+
 function Test-IsMtpCapableModel {
     param(
         $ModelEntry,
@@ -4656,6 +4854,14 @@ function Test-IsMtpCapableModel {
     }
 
     if (Test-IsGemma4QatMtpModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath) {
+        return $true
+    }
+
+    # Qwen3.8 target filenames do not necessarily include "MTP", even though
+    # their GGUF metadata declares the embedded NextN draft head.  Prefer the
+    # file's declaration over filename heuristics so an old FastMTP sidecar is
+    # never passed to a stock llama.cpp build by accident.
+    if (Test-HasEmbeddedMtpHead -ResolvedModelPath $ResolvedModelPath) {
         return $true
     }
 
@@ -4745,11 +4951,11 @@ function Get-LocalSpeculativeDraft {
     param([string]$ResolvedModelPath)
 
     if ([string]::IsNullOrWhiteSpace($ResolvedModelPath)) { return $null }
-    # A target GGUF that already declares MTP owns its draft context internally.
-    # Do not accidentally pair it with an unrelated MTP file from the same
-    # model library directory; an external draft is only valid when chosen
-    # explicitly by the user.
-    if (Test-UsesBuiltInMtpDraft -ModelEntry $null -ResolvedModelPath $ResolvedModelPath) { return $null }
+    # An embedded MTP head is a valid fallback, but publishers can also ship a
+    # newer or separately quantized MTP sidecar beside that target.  Continue
+    # scanning for unambiguous sidecar names while avoiding another full model
+    # whose ordinary filename merely contains "MTP".
+    $UsesBuiltInMtpDraft = Test-UsesBuiltInMtpDraft -ModelEntry $null -ResolvedModelPath $ResolvedModelPath
     try {
         $ModelFile = Get-Item -LiteralPath $ResolvedModelPath -ErrorAction Stop
         $Candidates = @(
@@ -4764,7 +4970,8 @@ function Get-LocalSpeculativeDraft {
             $Type = if ($Candidate.Name -match '(?i)dflash') { 'draft-dflash' }
                     elseif ($Candidate.Name -match '(?i)dspark') { 'draft-dspark' }
                     elseif ($Candidate.Name -match '(?i)eagle(?:[-_. ]?3)?') { 'draft-eagle3' }
-                    elseif ($Candidate.Name -match '(?i)(?:^|[-_. ])mtp(?:[-_. ]|$)') { 'draft-mtp' }
+                    elseif ($Candidate.Name -match '(?i)^mtp(?:[-_. ]|$)') { 'draft-mtp' }
+                    elseif (-not $UsesBuiltInMtpDraft -and $Candidate.Name -match '(?i)(?:^|[-_. ])mtp(?:[-_. ]|$)') { 'draft-mtp' }
                     else { $null }
             if ($Type) {
                 [pscustomobject]@{
@@ -4778,8 +4985,16 @@ function Get-LocalSpeculativeDraft {
     )
     if ($Matches.Count -eq 0) { return $null }
 
-    # Native MTP targets already carry their drafter.  For sidecars, prefer the
-    # model-specific name match, then DFlash/DSpark/EAGLE before a generic MTP.
+    # When the target advertises MTP, an explicitly named local MTP sidecar is
+    # its closest semantic match and must outrank unrelated DFlash/DSpark/EAGLE
+    # files in the same model directory.  For non-MTP targets, retain the
+    # model-name-distance preference used by the general sidecar discovery.
+    if ($UsesBuiltInMtpDraft) {
+        return @($Matches | Sort-Object @{ Expression = {
+            switch ($_.Type) { 'draft-mtp' { 0 }; 'draft-dflash' { 1 }; 'draft-dspark' { 2 }; 'draft-eagle3' { 3 }; default { 4 } }
+        } }, @{ Expression = { $_.NameDistance } }, Path)[0]
+    }
+
     return @($Matches | Sort-Object @{ Expression = { $_.NameDistance } }, @{ Expression = {
         switch ($_.Type) { 'draft-dflash' { 0 }; 'draft-dspark' { 1 }; 'draft-eagle3' { 2 }; default { 3 } }
     } }, Path)[0]
@@ -4834,6 +5049,56 @@ function Test-MtpDefaultsEnabled {
     }
 
     return ($SpecTypes -contains "draft-mtp")
+}
+function Test-UsesMtpSpeculativeDecoding {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath,
+        [AllowNull()][string[]]$Arguments
+    )
+
+    if (Test-MtpDefaultsEnabled -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath -Arguments $Arguments) {
+        return $true
+    }
+
+    $ExplicitSpecType = (Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^--spec-type(?:=(.+))?$')).Trim()
+    if ([string]::IsNullOrWhiteSpace($ExplicitSpecType)) {
+        return $false
+    }
+
+    return (@(
+            $ExplicitSpecType -split ',' |
+                ForEach-Object { $_.Trim().ToLowerInvariant() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        ) -contains "draft-mtp")
+}
+
+function Resolve-MtpDraftModelPath {
+    param(
+        $ModelEntry,
+        [string]$ResolvedModelPath,
+        [AllowNull()][string[]]$Arguments
+    )
+
+    $ExplicitDraftPath = Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^(?:-md|--model-draft|--spec-draft-model)(?:=(.+))?$')
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitDraftPath)) {
+        $ResolvedExplicitDraftPath = Resolve-ModelPath -Path $ExplicitDraftPath
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedExplicitDraftPath) -and (Test-Path -LiteralPath $ResolvedExplicitDraftPath -PathType Leaf)) {
+            return $ResolvedExplicitDraftPath
+        }
+    }
+
+    $GemmaDraftPath = Resolve-Gemma4MtpDraftModelPath -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath
+    if (-not [string]::IsNullOrWhiteSpace($GemmaDraftPath)) {
+        return $GemmaDraftPath
+    }
+
+    $LocalDraft = Get-LocalSpeculativeDraft -ResolvedModelPath $ResolvedModelPath
+    if ($LocalDraft -and [string]$LocalDraft.Type -eq "draft-mtp") {
+        return [string]$LocalDraft.Path
+    }
+
+    return ""
 }
 
 function Test-Qwen36MtpDefaultsEnabled {
@@ -5457,14 +5722,35 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add("--no-reasoning-preserve")
     }
 
-    $ExtraArguments = @(Split-ArgumentLine -Line $Config.ExtraArgs)
+    # Speculative-decoding settings have dedicated config fields.  Remove any
+    # duplicated raw flags from Extra Args before rebuilding the command so a
+    # stale desktop shortcut cannot append an incompatible draft after the
+    # model-aware MTP checks below have already rejected it.
+    $ExtraArguments = @(Remove-LlamaArgumentsByPatterns -Arguments (Split-ArgumentLine -Line $Config.ExtraArgs) -Patterns @(
+            '^--spec-type(?:=|$)',
+            '^(?:--spec-draft-model|-md|--model-draft)(?:=|$)',
+            '^--spec-draft-n-max(?:=|$)',
+            '^(?:--spec-draft-ngl|--gpu-layers-draft|--n-gpu-layers-draft|-ngld)(?:=|$)',
+            '^(?:--spec-draft-device|--device-draft|-devd)(?:=|$)',
+            '^(?:--spec-draft-type-k|--cache-type-k-draft|-ctkd)(?:=|$)',
+            '^(?:--spec-draft-type-v|--cache-type-v-draft|-ctvd)(?:=|$)'
+        ))
+    $Config.ExtraArgs = ConvertTo-ArgumentString -Arguments $ExtraArguments
     $ModelUsesMtpDefaults = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     $SelectedSpecType = ([string]$Config.SpecType).Trim().ToLowerInvariant()
     $IsBuiltInMtp = Test-UsesBuiltInMtpDraft -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
+    $HasExplicitDraftModel = -not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftModel)
     $AutoDraft = if ($SelectedSpecType -eq "auto" -and [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftModel)) { Get-LocalSpeculativeDraft -ResolvedModelPath ([string]$Config.ModelPath) } else { $null }
-    # Older buggy auto-generated profiles may have retained a sidecar path.
-    # In Auto mode, a native MTP target must ignore it and use its built-in MTP.
-    $EffectiveDraftModel = if ($SelectedSpecType -eq "auto" -and $IsBuiltInMtp) { "" } else { [string]$Config.SpecDraftModel }
+    # Profiles can retain speculative settings when their target model changes.
+    # A draft-mtp model is valid only for a target that explicitly advertises
+    # MTP; never feed a previous model's MTP head into an unrelated target.
+    if ($SelectedSpecType -eq "draft-mtp" -and -not $ModelUsesMtpDefaults -and -not $HasExplicitDraftModel) {
+        $SelectedSpecType = "none"
+    }
+    # Native MTP targets own their NextN head unless the user explicitly chose
+    # a sidecar.  This preserves the safety default while allowing specialized
+    # runtimes such as HauhauCS FastMTP to use their matching external drafter.
+    $EffectiveDraftModel = if ($SelectedSpecType -eq "none" -or ($IsBuiltInMtp -and -not $HasExplicitDraftModel)) { "" } else { [string]$Config.SpecDraftModel }
     if ($AutoDraft) {
         $SelectedSpecType = [string]$AutoDraft.Type
         $EffectiveDraftModel = [string]$AutoDraft.Path
@@ -5496,7 +5782,7 @@ function Convert-MenuConfigToForwardArgs {
         }
     }
 
-    if (($SelectedSpecType -eq "" -or $SelectedSpecType -eq "auto") -and [bool]$Config.MtpEnabled) {
+    if (($SelectedSpecType -eq "" -or $SelectedSpecType -eq "auto") -and $ModelUsesMtpDefaults -and [bool]$Config.MtpEnabled) {
         $Arguments.Add("--spec-type")
         $Arguments.Add("draft-mtp")
         $Arguments.Add("--spec-draft-n-max")
@@ -5674,6 +5960,7 @@ function Save-SavedLaunchProfileData {
 
 function Get-SavedLaunchProfilePersistedKeys {
     return @(
+        "LlamaBinDirectory"
         "VisionModelName"
         "VisionModelPath"
         "VisionMmprojPath"
@@ -6529,7 +6816,14 @@ function Format-SavedLaunchProfileSummary {
     $ContextText = Get-SavedLaunchProfileContextText -Profile $Profile
     $ChatTemplateText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ChatTemplate)) { "model default" } else { [string]$Profile.config.ChatTemplate }
     $ReasoningText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ReasoningMode)) { "auto" } else { [string]$Profile.config.ReasoningMode }
-    $PreserveReasoningText = if ($null -eq $Profile.config.ReasoningPreserve -or [bool]$Profile.config.ReasoningPreserve) { "on" } else { "off" }
+    $ReasoningEffortText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.ReasoningEffort)) { "default" } else { ([string]$Profile.config.ReasoningEffort).Trim().ToLowerInvariant() }
+    $PreserveReasoningText = switch (([string]$Profile.config.ReasoningPreserve).Trim().ToLowerInvariant()) {
+        "on" { "on" }
+        "true" { "on" }
+        "off" { "off" }
+        "false" { "off" }
+        default { "auto" }
+    }
     $MtpText = if ($null -eq $Profile.config.MtpEnabled) { "auto" } elseif ([bool]$Profile.config.MtpEnabled) { "on" } else { "off" }
     $SlotsText = if ([string]::IsNullOrWhiteSpace([string]$Profile.config.Slots)) { [string]$FixedLlamaServerParallelSlots } else { [string]$Profile.config.Slots }
     $UpdatedAtText = ""
@@ -6542,8 +6836,8 @@ function Format-SavedLaunchProfileSummary {
         }
     }
 
-    $ChineseText = "{0} | GPU {1} | CTX {2} | Slots {3} | 模板 {4} | 推理 {5} | 保存思考 {6} | MTP {7}{8}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ChatTemplateText, $ReasoningText, $PreserveReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })
-    $EnglishText = "{0} | GPU {1} | CTX {2} | slots {3} | template {4} | reasoning {5} | preserve {6} | MTP {7}{8}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ChatTemplateText, $ReasoningText, $PreserveReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" })
+    $ChineseText = "{0} | GPU {1} | CTX {2} | Slots {3} | 模板 {4} | 推理 {5} | 思考等級 {6} | 保存思考 {7} | MTP {8}{9}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ChatTemplateText, $ReasoningText, $ReasoningEffortText, $PreserveReasoningText, $MtpText, $(if ($UpdatedAtText) { " | 更新 $UpdatedAtText" } else { "" })
+    $EnglishText = "{0} | GPU {1} | CTX {2} | slots {3} | template {4} | reasoning {5} | effort {6} | preserve {7} | MTP {8}{9}" -f $LaunchModeText, $GpuText, $ContextText, $SlotsText, $ChatTemplateText, $ReasoningText, $ReasoningEffortText, $PreserveReasoningText, $MtpText, $(if ($UpdatedAtText) { " | updated $UpdatedAtText" } else { "" })
 
     if ($Language -eq "Chinese") {
         return $ChineseText
@@ -6934,6 +7228,15 @@ function Get-ConsoleWidth {
     }
 }
 
+function Get-ConsoleHeight {
+    try {
+        return [Math]::Max(24, $Host.UI.RawUI.WindowSize.Height)
+    }
+    catch {
+        return 40
+    }
+}
+
 function Get-ConsolePageSize {
     try {
         return [Math]::Max(8, $Host.UI.RawUI.WindowSize.Height - 12)
@@ -7117,14 +7420,18 @@ function Write-StatusAsciiCard {
     param(
         [string]$Title,
         [object[]]$Fields,
-        [int]$Width
+        [int]$Width,
+        [string]$NextTitle,
+        [switch]$SkipTopBorder
     )
 
     if (-not $Fields -or $Fields.Count -eq 0) { return }
     $InnerWidth = $Width - 2
-    $TitleText = "[ $Title ]"
-    $TopFill = [Math]::Max(0, $InnerWidth - (Get-TextDisplayWidth -Text $TitleText))
-    Write-Host ('+' + $TitleText + ('-' * $TopFill) + '+') -ForegroundColor DarkCyan
+    if (-not $SkipTopBorder) {
+        $TitleText = "[ $Title ]"
+        $TopFill = [Math]::Max(0, $InnerWidth - (Get-TextDisplayWidth -Text $TitleText))
+        Write-Host ('+' + $TitleText + ('-' * $TopFill) + '+') -ForegroundColor DarkCyan
+    }
 
     $LabelWidth = [Math]::Min(24, [Math]::Max(16, [int](($Fields | ForEach-Object {
                         Get-TextDisplayWidth -Text (Format-BilingualText -ChineseText $_.ChineseLabel -EnglishText $_.EnglishLabel)
@@ -7148,8 +7455,16 @@ function Write-StatusAsciiCard {
             Write-Host ('|' + $Body + '|') -ForegroundColor $Color
         }
     }
-    Write-Host ('+' + ('-' * $InnerWidth) + '+') -ForegroundColor DarkCyan
-    Write-Host ''
+    # The next section title occupies this card's closing edge, so adjacent
+    # cards share one horizontal border instead of rendering two plus a gap.
+    if ([string]::IsNullOrWhiteSpace($NextTitle)) {
+        Write-Host ('+' + ('-' * $InnerWidth) + '+') -ForegroundColor DarkCyan
+    }
+    else {
+        $NextTitleText = "[ $NextTitle ]"
+        $NextFill = [Math]::Max(0, $InnerWidth - (Get-TextDisplayWidth -Text $NextTitleText))
+        Write-Host ('+' + $NextTitleText + ('-' * $NextFill) + '+') -ForegroundColor DarkCyan
+    }
 }
 
 function Write-StatusCardDashboard {
@@ -7163,9 +7478,25 @@ function Write-StatusCardDashboard {
         [pscustomobject]@{ Key = 'Inference'; Title = 'INFERENCE / 推理設定' },
         [pscustomobject]@{ Key = 'Files'; Title = 'VISION & FILES / 視覺與檔案' }
     )
+    $VisibleCards = New-Object System.Collections.Generic.List[object]
     foreach ($Card in $Cards) {
         $CardFields = @($Fields | Where-Object { (Get-StatusCardCategory -EnglishLabel $_.EnglishLabel) -eq $Card.Key })
-        Write-StatusAsciiCard -Title $Card.Title -Fields $CardFields -Width $Width
+        if ($CardFields.Count -gt 0) {
+            $VisibleCards.Add([pscustomobject]@{
+                    Title = $Card.Title
+                    Fields = $CardFields
+                })
+        }
+    }
+
+    for ($Index = 0; $Index -lt $VisibleCards.Count; $Index++) {
+        $NextTitle = if ($Index -lt ($VisibleCards.Count - 1)) { $VisibleCards[$Index + 1].Title } else { $null }
+        Write-StatusAsciiCard `
+            -Title $VisibleCards[$Index].Title `
+            -Fields $VisibleCards[$Index].Fields `
+            -Width $Width `
+            -NextTitle $NextTitle `
+            -SkipTopBorder:($Index -gt 0)
     }
 }
 
@@ -9154,6 +9485,11 @@ function Get-LaunchConfigWrapperArguments {
         $Arguments.Add("-NoBrowser")
     }
 
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.LlamaBinDirectory)) {
+        $Arguments.Add("-LlamaBinDirectory")
+        $Arguments.Add([string]$Config.LlamaBinDirectory)
+    }
+
     $Arguments.Add("-ModelPath")
     $Arguments.Add((Resolve-ModelPath -Path ([string]$Config.ModelPath)))
 
@@ -9563,6 +9899,7 @@ function New-LaunchConfig {
         ModelName         = $ModelEntry.name
         ModelPath         = Resolve-ModelPath -Path $ModelEntry.path
         ModelCapabilities = Format-ModelCapabilities -ModelEntry $ModelEntry
+        LlamaBinDirectory = ConvertTo-LlamaBinConfigValue -Directory $LlamaBinDirectory
         VisionModelName   = ""
         VisionModelPath   = ""
         VisionMmprojPath  = ""
@@ -9629,6 +9966,7 @@ function New-LaunchConfig {
 function Get-LaunchConfigItems {
     return @(
         [pscustomobject]@{ Key = "Model"; Label = (Format-BilingualText -ChineseText "模型" -EnglishText "Model"); Type = "model" },
+        [pscustomobject]@{ Key = "LlamaBinDirectory"; Label = (Format-BilingualText -ChineseText "llama.cpp Bin 路徑" -EnglishText "llama.cpp Bin Path"); Type = "binaryDirectory" },
         [pscustomobject]@{ Key = "VisionModel"; Label = (Format-BilingualText -ChineseText "視覺模型" -EnglishText "Vision Model"); Type = "visionModel" },
         [pscustomobject]@{ Key = "LaunchMode"; Label = (Format-BilingualText -ChineseText "啟動" -EnglishText "Launch"); Type = "choice"; Choices = @("Background Service", "Open Web UI") },
         [pscustomobject]@{ Key = "Port"; Label = "Port"; Type = "number"; Hint = "1-65535" },
@@ -9643,11 +9981,11 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "ReadyTimeoutSec"; Label = (Format-BilingualText -ChineseText "就緒逾時" -EnglishText "Ready Timeout"); Type = "number"; Hint = (Format-BilingualText -ChineseText "單位：秒" -EnglishText "seconds") },
         [pscustomobject]@{ Key = "ChatTemplate"; Label = (Format-BilingualText -ChineseText "聊天模板" -EnglishText "Chat Template"); Type = "chatTemplate" },
         [pscustomobject]@{ Key = "ReasoningMode"; Label = (Format-BilingualText -ChineseText "推理模式" -EnglishText "Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
-        [pscustomobject]@{ Key = "ThinkLevel"; Label = (Format-BilingualText -ChineseText "思考等級" -EnglishText "Think Level"); Type = "choice"; Choices = (Get-ThinkLevelChoices) },
-        [pscustomobject]@{ Key = "ReasoningEffort"; Label = (Format-BilingualText -ChineseText "推理強度" -EnglishText "Reasoning Effort"); Type = "choice"; Choices = @("default", "minimal", "low", "medium", "high", "xhigh", "max") },
+        [pscustomobject]@{ Key = "ThinkLevel"; Label = (Format-BilingualText -ChineseText "思考 Token 預算" -EnglishText "Think Token Budget"); Type = "choice"; Choices = (Get-ThinkLevelChoices) },
+        [pscustomobject]@{ Key = "ReasoningEffort"; Label = (Format-BilingualText -ChineseText "思考等級" -EnglishText "Thinking Level"); Type = "choice"; Choices = (Get-ReasoningEffortChoices) },
         [pscustomobject]@{ Key = "ReasoningPreserve"; Label = (Format-BilingualText -ChineseText "保留思考" -EnglishText "Preserve Reasoning"); Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "SpecType"; Label = (Format-BilingualText -ChineseText "推測解碼" -EnglishText "Speculative Decode"); Type = "choice"; Choices = @("auto", "none", "draft-mtp", "draft-simple", "draft-eagle3", "draft-dflash", "draft-dspark", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache") },
-        [pscustomobject]@{ Key = "SpecDraftModel"; Label = (Format-BilingualText -ChineseText "草稿模型" -EnglishText "Draft Model"); Type = "text"; Hint = (Format-BilingualText -ChineseText "DFlash、DSpark、EAGLE 或 simple draft 對應的 GGUF；留空讓 llama.cpp/MTP 自動處理" -EnglishText "Matching GGUF for DFlash, DSpark, EAGLE, or simple draft; blank keeps llama.cpp/MTP auto-discovery") },
+        [pscustomobject]@{ Key = "SpecDraftModel"; Label = (Format-BilingualText -ChineseText "草稿模型" -EnglishText "Draft Model"); Type = "text"; Hint = (Format-BilingualText -ChineseText "MTP、DFlash、DSpark、EAGLE 或 simple draft 對應的 GGUF；留空時自動尋找相鄰 sidecar" -EnglishText "Matching MTP, DFlash, DSpark, EAGLE, or simple-draft GGUF; blank auto-discovers a neighboring sidecar") },
         [pscustomobject]@{ Key = "SpecDraftNMax"; Label = "SPEC_DRAFT_N_MAX"; Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數；Gemma 4 MTP 預設 4，其他 MTP 預設 3" -EnglishText "positive integer; Gemma 4 MTP defaults to 4, other MTP defaults to 3") },
         [pscustomobject]@{ Key = "SpecDraftGpuLayers"; Label = (Format-BilingualText -ChineseText "草稿 GPU Layers" -EnglishText "Draft GPU Layers"); Type = "text"; Hint = (Format-BilingualText -ChineseText "auto、all 或非負整數" -EnglishText "auto, all, or non-negative integer") },
         [pscustomobject]@{ Key = "SpecDraftDevice"; Label = (Format-BilingualText -ChineseText "草稿裝置" -EnglishText "Draft Device"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 CUDA0" -EnglishText "blank uses auto; example: CUDA0") },
@@ -9689,6 +10027,7 @@ function Get-LaunchConfigDefaultText {
     )
 
     switch ($Key) {
+        "LlamaBinDirectory" { return "Standard (bin)" }
         "OpenPath" {
             if ($Config.LaunchMode -eq "Open Web UI") {
                 return "/"
@@ -9754,6 +10093,14 @@ function Get-LaunchConfigValueText {
 
     switch ($Item.Key) {
         "Model" { return [string]$Config.ModelName }
+        "LlamaBinDirectory" {
+            $ConfigValue = ConvertTo-LlamaBinConfigValue -Directory ([string]$Config.LlamaBinDirectory)
+            switch ($ConfigValue) {
+                "bin" { return "Standard (bin)" }
+                "bin_fast" { return "FastMTP (bin_fast)" }
+                default { return ("Custom -> {0}" -f $ConfigValue) }
+            }
+        }
         "VisionModel" {
             if ([string]::IsNullOrWhiteSpace([string]$Config.VisionMmprojPath)) {
                 if ([string]$Config.VisionSelectionMode -eq "disabled") {
@@ -10012,6 +10359,12 @@ function Get-LaunchConfigItemHelp {
                 Recommendation = Format-BilingualText -ChineseText "先選定你真正要跑的量化版本和微調模型，其他設定都應該跟著這個模型一起調，不要直接盲目沿用到其他 GGUF。" -EnglishText "Pick the exact quant and finetune you want first. Other settings should be tuned against this model, not reused blindly across different GGUFs."
             }
         }
+        "LlamaBinDirectory" {
+            return [pscustomobject]@{
+                Purpose = Format-BilingualText -ChineseText "選擇這次啟動要使用哪一套 llama.cpp 執行檔與相符 DLL。" -EnglishText "Selects the llama.cpp executable and matching DLL set for this launch."
+                Recommendation = Format-BilingualText -ChineseText "一般模型使用 Standard；HauhauCS FastMTP 模型使用 FastMTP。自訂目錄必須包含 llama-server.exe 與同一版 DLL。" -EnglishText "Use Standard for normal models and FastMTP for HauhauCS FastMTP models. A custom directory must contain llama-server.exe and its matching DLLs."
+            }
+        }
         "VisionModel" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "控制主服務是否同時掛載 mmproj 視覺 projector。" -EnglishText "Controls whether the main server also mounts an mmproj vision projector."
@@ -10033,25 +10386,25 @@ function Get-LaunchConfigItemHelp {
         "OpenPath" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "控制服務就緒後要自動開啟的網址路徑。" -EnglishText "Controls which URL path opens after the server is ready."
-                Recommendation = Format-BilingualText -ChineseText "Web UI 通常用 `/`，只想快速確認 API 是否就緒則用 `/v1/models`。" -EnglishText "Use / for the Web UI and /v1/models for a lightweight API readiness page."
+                Recommendation = Format-BilingualText -ChineseText "Web UI 通常用 /，只想快速確認 API 是否就緒則用 /v1/models。" -EnglishText "Use / for the Web UI and /v1/models for a lightweight API readiness page."
             }
         }
         "GpuLayers" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "控制有多少模型層要卸載到 GPU。`auto` 會讓 wrapper 或 llama.cpp 依可用 VRAM 自動 fitting。" -EnglishText "Controls how many model layers are offloaded to GPU. auto lets the wrapper or llama.cpp fit to available VRAM."
-                Recommendation = Format-BilingualText -ChineseText "除非你已經在這台機器驗證過完整卸載 preset，否則先從 `auto` 開始。只有已知穩定的雙 GPU wrapper 才建議直接用 `all`。" -EnglishText "Start with auto unless you already validated a full offload preset on this machine. Use all only for known-good dual-GPU wrappers."
+                Purpose = Format-BilingualText -ChineseText "控制有多少模型層要卸載到 GPU。auto 會讓 wrapper 或 llama.cpp 依可用 VRAM 自動 fitting。" -EnglishText "Controls how many model layers are offloaded to GPU. auto lets the wrapper or llama.cpp fit to available VRAM."
+                Recommendation = Format-BilingualText -ChineseText "除非你已經在這台機器驗證過完整卸載 preset，否則先從 auto 開始。只有已知穩定的雙 GPU wrapper 才建議直接用 all。" -EnglishText "Start with auto unless you already validated a full offload preset on this machine. Use all only for known-good dual-GPU wrappers."
             }
         }
         "RepeatingLayers" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "用另一種方式思考 GPU 卸載深度；wrapper 會自動把 repeating layers 換算成 llama.cpp 的 GPU layer 數。" -EnglishText "Alternative way to think about offload depth. The wrapper converts repeating layers into llama.cpp GPU layer count automatically."
-                Recommendation = Format-BilingualText -ChineseText "不確定時先用 `auto`。要微調 VRAM 使用量時，建議逐步增加，不要一開始就直接跳到 `all`。" -EnglishText "Use auto if you are unsure. When fine-tuning VRAM usage, raise this gradually instead of jumping straight to all."
+                Recommendation = Format-BilingualText -ChineseText "不確定時先用 auto。要微調 VRAM 使用量時，建議逐步增加，不要一開始就直接跳到 all。" -EnglishText "Use auto if you are unsure. When fine-tuning VRAM usage, raise this gradually instead of jumping straight to all."
             }
         }
         "LayerDistribution" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "顯示目前模型的總層數，以及依照 GPU Layers 設定預估會放在 GPU 與 CPU 的層數。" -EnglishText "Shows total model layers and the estimated GPU/CPU layer split from the current GPU Layers value."
-                Recommendation = Format-BilingualText -ChineseText "`auto` 啟動前只能顯示自動分配；服務真正載入後，狀態頁會改用 llama.cpp log 顯示實際 GPU/CPU 層數。" -EnglishText "Before launch, auto can only be shown as automatic allocation. After the server loads, the status page uses llama.cpp logs for the real GPU/CPU split."
+                Recommendation = Format-BilingualText -ChineseText "auto 啟動前只能顯示自動分配；服務真正載入後，狀態頁會改用 llama.cpp log 顯示實際 GPU/CPU 層數。" -EnglishText "Before launch, auto can only be shown as automatic allocation. After the server loads, the status page uses llama.cpp logs for the real GPU/CPU split."
             }
         }
         "ExtremeMode" {
@@ -10069,97 +10422,97 @@ function Get-LaunchConfigItemHelp {
         "Threads" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定 token 生成階段使用的 CPU 執行緒數。" -EnglishText "CPU threads used for token generation."
-                Recommendation = Format-BilingualText -ChineseText "建議先維持 `-1`。在這台機器上會自動變成邏輯核心數減 2，通常是合理的起手值。" -EnglishText "Keep -1 first. On this box that resolves to logical cores minus 2, which is usually the right starting point."
+                Recommendation = Format-BilingualText -ChineseText "建議先維持 -1。在這台機器上會自動變成邏輯核心數減 2，通常是合理的起手值。" -EnglishText "Keep -1 first. On this box that resolves to logical cores minus 2, which is usually the right starting point."
             }
         }
         "ThreadsBatch" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定 prompt ingest 與 batching 階段使用的 CPU 執行緒數。" -EnglishText "CPU threads used for prompt ingestion and batching work."
-                Recommendation = Format-BilingualText -ChineseText "建議先維持 `-1`。在這台機器上會自動等於全部邏輯核心，除非你有理由刻意降低 CPU 壓力。" -EnglishText "Keep -1 first. On this box it resolves to full logical core count unless you have a reason to reduce CPU pressure."
+                Recommendation = Format-BilingualText -ChineseText "建議先維持 -1。在這台機器上會自動等於全部邏輯核心，除非你有理由刻意降低 CPU 壓力。" -EnglishText "Keep -1 first. On this box it resolves to full logical core count unless you have a reason to reduce CPU pressure."
             }
         }
         "ReadyTimeoutSec" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定啟動器在放棄自動開頁與 ready 檢查前最多等待多久。" -EnglishText "How long the launcher waits before giving up on auto-open and ready checks."
-                Recommendation = Format-BilingualText -ChineseText "`180` 秒通常夠用。模型很大或第一次載入很慢時可以往上調。" -EnglishText "180 is a reasonable default. Raise it for very large models or slow first loads."
+                Recommendation = Format-BilingualText -ChineseText "180 秒通常夠用。模型很大或第一次載入很慢時可以往上調。" -EnglishText "180 is a reasonable default. Raise it for very large models or slow first loads."
             }
         }
         "ReasoningMode" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "用 `--reasoning auto|on|off` 控制 llama.cpp 的 thinking / reasoning 模式。" -EnglishText "Controls llama.cpp thinking mode with --reasoning auto, on, or off."
-                Recommendation = Format-BilingualText -ChineseText "除非你要強制開啟可見推理，或為了速度與更直接的回答而硬性關閉，否則保持 `auto`。" -EnglishText "Keep auto unless you want to force visible reasoning on or hard-disable it for speed and cleaner direct answers."
+                Purpose = Format-BilingualText -ChineseText "用 --reasoning auto|on|off 控制 llama.cpp 的 thinking / reasoning 模式。" -EnglishText "Controls llama.cpp thinking mode with --reasoning auto, on, or off."
+                Recommendation = Format-BilingualText -ChineseText "除非你要強制開啟可見推理，或為了速度與更直接的回答而硬性關閉，否則保持 auto。" -EnglishText "Keep auto unless you want to force visible reasoning on or hard-disable it for speed and cleaner direct answers."
             }
         }
         "ThinkLevel" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 `--reasoning-budget`。等級越高，模型在被強制結束 thinking 之前可用的思考 token 越多。" -EnglishText "Maps to llama.cpp --reasoning-budget. Higher levels allow more thinking tokens before the model is forced to stop thinking."
-                Recommendation = Format-BilingualText -ChineseText "較難的任務建議先用 `Medium (4096)`。在乎延遲時用 `Low (1024)`，要更深的推理可用 `High (8192)`，只有能接受很長 thinking 時才用 `Max (-1)`。" -EnglishText "Start with Medium (4096) for harder tasks. Use Low (1024) when latency matters, High (8192) for deeper problems, and Max (-1) only if you accept potentially long reasoning."
+                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 --reasoning-budget。等級越高，模型在被強制結束 thinking 之前可用的思考 token 越多。" -EnglishText "Maps to llama.cpp --reasoning-budget. Higher levels allow more thinking tokens before the model is forced to stop thinking."
+                Recommendation = Format-BilingualText -ChineseText "切換思考等級時會自動帶入建議預算，之後仍可在這裡手動覆寫。較難的任務建議先用 Medium (4096)；只有能接受很長 thinking 時才用 Max (-1)。" -EnglishText "Changing Thinking Level automatically applies its recommended budget, which you can still override here. Start with Medium (4096) for harder tasks; use Max (-1) only if you accept potentially long reasoning."
             }
         }
         "ReasoningEffort" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 `--reasoning-effort`，把思考策略等級傳給支援此欄位的聊天模板；它不等同於 token 預算。" -EnglishText "Maps to llama.cpp --reasoning-effort and passes a thinking-strategy level to chat templates that support it; it is separate from the token budget."
-                Recommendation = Format-BilingualText -ChineseText "預設維持 `default`，不傳旗標並沿用模板設定。只有已驗證模板支援時，才依任務選 low、medium、high 或 xhigh；Reasoning 設為 Off 時不會送出此參數。" -EnglishText "Keep default so no flag is sent and the template controls the setting. Use low, medium, high, or xhigh only after verifying template support; no effort flag is sent when Reasoning is Off."
+                Purpose = Format-BilingualText -ChineseText "對應 llama.cpp 的 --reasoning-effort，可選 default、minimal、low、medium、high、xhigh、max，並把思考策略等級傳給支援此欄位的聊天模板；它不等同於 token 預算。" -EnglishText "Maps to llama.cpp --reasoning-effort. It offers default, minimal, low, medium, high, xhigh, and max, passing the selected thinking-strategy level to compatible chat templates; it is separate from the token budget."
+                Recommendation = Format-BilingualText -ChineseText "選擇等級時會套用預設配對：default→Auto、minimal/low→1024、medium→4096、high/xhigh→8192、max→不限；之後仍可手動調整預算。Reasoning 設為 Off 時不會送出此參數。" -EnglishText "Selecting a level applies the preset pairing: default→Auto, minimal/low→1024, medium→4096, high/xhigh→8192, and max→unlimited. You can still adjust the budget afterwards. No effort flag is sent when Reasoning is Off."
             }
         }
         "ChatTemplate" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "列出專案 `chat template` 資料夾內的模板。選檔時對應 llama.cpp 的 `--chat-template-file`；選預設則使用 GGUF metadata。" -EnglishText "Lists templates in the project's chat template folder. Selecting a file maps to llama.cpp --chat-template-file; selecting the default uses GGUF metadata."
+                Purpose = Format-BilingualText -ChineseText "列出專案 chat template 資料夾內的模板。選檔時對應 llama.cpp 的 --chat-template-file；選預設則使用 GGUF metadata。" -EnglishText "Lists templates in the project's chat template folder. Selecting a file maps to llama.cpp --chat-template-file; selecting the default uses GGUF metadata."
                 Recommendation = Format-BilingualText -ChineseText "一般保持 GGUF 預設最安全。只有模型模板缺失、錯誤，或你明確知道下載模板與目前模型相容時才覆寫。" -EnglishText "The GGUF default is safest. Override it only when the model template is missing or wrong, or when the downloaded template is known to match the current model."
             }
         }
         "ReasoningPreserve" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "控制是否傳送 llama.cpp 的 `--reasoning-preserve` 旗標。Auto 不傳任何旗標，交給聊天模板預設處理。" -EnglishText "Controls whether llama.cpp receives --reasoning-preserve. Auto emits no flag and defers to the chat template default."
+                Purpose = Format-BilingualText -ChineseText "控制是否傳送 llama.cpp 的 --reasoning-preserve 旗標。Auto 不傳任何旗標，交給聊天模板預設處理。" -EnglishText "Controls whether llama.cpp receives --reasoning-preserve. Auto emits no flag and defers to the chat template default."
                 Recommendation = Format-BilingualText -ChineseText "預設保持 Auto，不新增任何思考保留參數。只有需要跨多輪保留 trace 時才選 On；模板不相容或希望減少歷史內容時選 Off。" -EnglishText "Keep Auto by default so no preservation argument is added. Choose On only to retain traces across turns, or Off for incompatible templates or a smaller history."
             }
         }
         "SpecType" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "選擇 llama.cpp 的 `--spec-type`。除了 MTP，也可選 DFlash、DSpark、EAGLE3、simple draft 或 n-gram 類型。" -EnglishText "Selects llama.cpp --spec-type, including MTP, DFlash, DSpark, EAGLE3, simple draft, and n-gram modes."
+                Purpose = Format-BilingualText -ChineseText "選擇 llama.cpp 的 --spec-type。除了 MTP，也可選 DFlash、DSpark、EAGLE3、simple draft 或 n-gram 類型。" -EnglishText "Selects llama.cpp --spec-type, including MTP, DFlash, DSpark, EAGLE3, simple draft, and n-gram modes."
                 Recommendation = Format-BilingualText -ChineseText "預設 Auto；只會對可辨識的 MTP 模型沿用既有自動設定。DFlash、DSpark 與 EAGLE3 必須搭配正確草稿 GGUF，先單獨測速與穩定性。" -EnglishText "Keep Auto; it only retains existing automatic behavior for recognized MTP models. DFlash, DSpark, and EAGLE3 require the matching draft GGUF, so benchmark and validate each independently."
             }
         }
         "SpecDraftModel" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "指定 `--spec-draft-model` 的草稿 GGUF，供 DFlash、DSpark、EAGLE3 或 draft-simple 使用。" -EnglishText "Sets --spec-draft-model for a DFlash, DSpark, EAGLE3, or draft-simple GGUF."
-                Recommendation = Format-BilingualText -ChineseText "只有手動選了需要草稿模型的推測類型時才填；MTP 可保留空白，讓既有 sidecar 偵測邏輯運作。" -EnglishText "Fill this only when you selected a draft-model-based speculative type. Leave it blank for MTP so the existing sidecar discovery logic remains active."
+                Purpose = Format-BilingualText -ChineseText "指定 --spec-draft-model 的草稿 GGUF，供 MTP、DFlash、DSpark、EAGLE3 或 draft-simple 使用。" -EnglishText "Sets --spec-draft-model for an MTP, DFlash, DSpark, EAGLE3, or draft-simple GGUF."
+                Recommendation = Format-BilingualText -ChineseText "一般保持空白，launcher 會自動帶入相鄰且名稱明確的 sidecar；找不到時，內建 MTP 模型仍會使用自己的 MTP head。只有要覆寫自動配對時才手動填入。" -EnglishText "Normally leave this blank so the launcher auto-selects an unambiguously named neighboring sidecar. When none is found, a built-in MTP model still uses its own MTP head. Enter a path only to override auto-pairing."
             }
         }
         "MtpEnabled" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "切換 speculative MTP 啟動。開啟後，launcher 會送出 `--spec-type draft-mtp` 與相關預設。" -EnglishText "Toggles speculative MTP startup. When enabled, the launcher emits --spec-type draft-mtp and related defaults."
+                Purpose = Format-BilingualText -ChineseText "切換 speculative MTP 啟動。開啟後，launcher 會送出 --spec-type draft-mtp 與相關預設。" -EnglishText "Toggles speculative MTP startup. When enabled, the launcher emits --spec-type draft-mtp and related defaults."
                 Recommendation = if ($IsMtpCapableModel) { (Format-BilingualText -ChineseText "如果這是 MTP GGUF，或 Gemma 4 QAT 主模型旁邊有 llama.cpp 可自動發現的 MTP drafter，建議保持開啟。只有在比較非 MTP 行為或疑難排解時才關掉。" -EnglishText "For an MTP GGUF, or a Gemma 4 QAT target with an auto-discoverable MTP drafter beside it, leave this On. Turn it Off only for non-MTP comparison or troubleshooting.") } else { (Format-BilingualText -ChineseText "除非你明確要使用 draft-mtp，且知道目前模型支援，否則保持關閉。" -EnglishText "Leave this Off unless you intentionally want draft-mtp and know the selected model supports it.") }
             }
         }
         "SpecDraftNMax" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "設定 llama.cpp 的 `--spec-draft-n-max`，也就是每一步 speculative drafting 最多要草擬多少 token。" -EnglishText "Sets llama.cpp --spec-draft-n-max, the maximum number of speculative draft tokens per step."
-                Recommendation = if ($IsGemma4QatMtpModel) { (Format-BilingualText -ChineseText "Gemma 4 MTP 先用 `4`。如果遇到穩定性或延遲問題，再降到 `2` 比較。" -EnglishText "For Gemma 4 MTP, start with 4. Drop to 2 when comparing stability or latency.") } else { (Format-BilingualText -ChineseText "先用 llama.cpp 的目前預設 `3`，再與較保守的 `2` 做相同提示詞 A/B 測試；只保留實測較快且 acceptance rate 穩定的值。" -EnglishText "Start with llama.cpp's current default of 3, then A/B it against the conservative value 2 using identical prompts. Keep only the value that is measurably faster with a stable acceptance rate.") }
+                Purpose = Format-BilingualText -ChineseText "設定 llama.cpp 的 --spec-draft-n-max，也就是每一步 speculative drafting 最多要草擬多少 token。" -EnglishText "Sets llama.cpp --spec-draft-n-max, the maximum number of speculative draft tokens per step."
+                Recommendation = if ($IsGemma4QatMtpModel) { (Format-BilingualText -ChineseText "Gemma 4 MTP 先用 4。如果遇到穩定性或延遲問題，再降到 2 比較。" -EnglishText "For Gemma 4 MTP, start with 4. Drop to 2 when comparing stability or latency.") } else { (Format-BilingualText -ChineseText "先用 llama.cpp 的目前預設 3，再與較保守的 2 做相同提示詞 A/B 測試；只保留實測較快且 acceptance rate 穩定的值。" -EnglishText "Start with llama.cpp's current default of 3, then A/B it against the conservative value 2 using identical prompts. Keep only the value that is measurably faster with a stable acceptance rate.") }
             }
         }
         "SpecDraftGpuLayers" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-ngl` 單獨控制 draft/MTP 模型放進 GPU 的層數。" -EnglishText "Uses --spec-draft-ngl to control draft/MTP GPU layers independently from the target model."
-                Recommendation = Format-BilingualText -ChineseText "一般保持 `auto`。只有在新版 fit 仍分配不理想，或你正在做受控 VRAM 測試時，才改成明確層數或 `all`。" -EnglishText "Keep auto normally. Use an exact number or all only for controlled VRAM testing or when fit still produces a poor placement."
+                Purpose = Format-BilingualText -ChineseText "用 --spec-draft-ngl 單獨控制 draft/MTP 模型放進 GPU 的層數。" -EnglishText "Uses --spec-draft-ngl to control draft/MTP GPU layers independently from the target model."
+                Recommendation = Format-BilingualText -ChineseText "一般保持 auto。只有在新版 fit 仍分配不理想，或你正在做受控 VRAM 測試時，才改成明確層數或 all。" -EnglishText "Keep auto normally. Use an exact number or all only for controlled VRAM testing or when fit still produces a poor placement."
             }
         }
         "SpecDraftDevice" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-device` 把 draft/MTP context 指定到獨立裝置。" -EnglishText "Uses --spec-draft-device to pin the draft/MTP context to specific accelerators."
-                Recommendation = Format-BilingualText -ChineseText "先留空讓 llama.cpp 自動處理。雙 5070 Ti 只有在逐卡 VRAM 或同步成本測試顯示明確收益時，才固定成例如 `CUDA0`。" -EnglishText "Leave blank first. On dual 5070 Ti, pin to CUDA0 only when per-device VRAM and synchronization tests show a clear benefit."
+                Purpose = Format-BilingualText -ChineseText "用 --spec-draft-device 把 draft/MTP context 指定到獨立裝置。" -EnglishText "Uses --spec-draft-device to pin the draft/MTP context to specific accelerators."
+                Recommendation = Format-BilingualText -ChineseText "先留空讓 llama.cpp 自動處理。雙 5070 Ti 只有在逐卡 VRAM 或同步成本測試顯示明確收益時，才固定成例如 CUDA0。" -EnglishText "Leave blank first. On dual 5070 Ti, pin to CUDA0 only when per-device VRAM and synchronization tests show a clear benefit."
             }
         }
         "SpecDraftCacheTypeK" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-type-k` 單獨設定 draft context 的 K cache 格式。" -EnglishText "Uses --spec-draft-type-k to set the draft context K-cache format independently."
-                Recommendation = Format-BilingualText -ChineseText "留空使用目前的 `f16` 預設。只有 VRAM 不足時才先試 `q8_0`，並重新量測 acceptance rate 與生成速度。" -EnglishText "Leave blank for the current f16 default. Try q8_0 only when VRAM is tight, then remeasure acceptance rate and generation speed."
+                Purpose = Format-BilingualText -ChineseText "用 --spec-draft-type-k 單獨設定 draft context 的 K cache 格式。" -EnglishText "Uses --spec-draft-type-k to set the draft context K-cache format independently."
+                Recommendation = Format-BilingualText -ChineseText "留空使用目前的 f16 預設。只有 VRAM 不足時才先試 q8_0，並重新量測 acceptance rate 與生成速度。" -EnglishText "Leave blank for the current f16 default. Try q8_0 only when VRAM is tight, then remeasure acceptance rate and generation speed."
             }
         }
         "SpecDraftCacheTypeV" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "用 `--spec-draft-type-v` 單獨設定 draft context 的 V cache 格式。" -EnglishText "Uses --spec-draft-type-v to set the draft context V-cache format independently."
-                Recommendation = Format-BilingualText -ChineseText "留空使用目前的 `f16` 預設。需要省 VRAM 時與 K cache 一起先試 `q8_0`，不要同時再改 tensor split 或 batch。" -EnglishText "Leave blank for the current f16 default. When saving VRAM, test q8_0 alongside K cache without also changing tensor split or batch."
+                Purpose = Format-BilingualText -ChineseText "用 --spec-draft-type-v 單獨設定 draft context 的 V cache 格式。" -EnglishText "Uses --spec-draft-type-v to set the draft context V-cache format independently."
+                Recommendation = Format-BilingualText -ChineseText "留空使用目前的 f16 預設。需要省 VRAM 時與 K cache 一起先試 q8_0，不要同時再改 tensor split 或 batch。" -EnglishText "Leave blank for the current f16 default. When saving VRAM, test q8_0 alongside K cache without also changing tensor split or batch."
             }
         }
         "ContextSize" {
@@ -10170,68 +10523,68 @@ function Get-LaunchConfigItemHelp {
         }
         "MaxOutputTokens" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "設定單次回應最多可生成多少 token，對應 llama.cpp 的 `--predict`。這是上限，不會強迫模型輸出到指定長度。" -EnglishText "Sets the maximum generated tokens per response via llama.cpp --predict. This is a ceiling and does not force responses to reach it."
+                Purpose = Format-BilingualText -ChineseText "設定單次回應最多可生成多少 token，對應 llama.cpp 的 --predict。這是上限，不會強迫模型輸出到指定長度。" -EnglishText "Sets the maximum generated tokens per response via llama.cpp --predict. This is a ceiling and does not force responses to reach it."
                 Recommendation = Format-BilingualText -ChineseText "Qwen 一般使用建議 32768；設為 -1 代表 server 不設上限，但 API 客戶端的 max_tokens 仍可能另外限制。" -EnglishText "Use 32768 for normal Qwen workloads. -1 removes the server default limit, though an API client's max_tokens may still impose one."
             }
         }
         "Slots" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "設定 llama-server 的 `--parallel`，也就是同時可服務的請求槽位數。" -EnglishText "Sets llama-server `--parallel`, the number of simultaneous request slots."
-                Recommendation = Format-BilingualText -ChineseText "一般單人本機使用請留空或用 `1`，這樣 context 不會被多個請求切分。只有你真的要同時處理多個 API 請求時，才調成 `2` 或更高，並同步確認 context 和 VRAM 是否足夠。" -EnglishText "For normal single-user local use, leave blank or use 1 so context is not split across requests. Raise this to 2 or higher only for real concurrent API traffic, and re-check context and VRAM headroom."
+                Purpose = Format-BilingualText -ChineseText "設定 llama-server 的 --parallel，也就是同時可服務的請求槽位數。" -EnglishText "Sets llama-server --parallel, the number of simultaneous request slots."
+                Recommendation = Format-BilingualText -ChineseText "一般單人本機使用請留空或用 1，這樣 context 不會被多個請求切分。只有你真的要同時處理多個 API 請求時，才調成 2 或更高，並同步確認 context 和 VRAM 是否足夠。" -EnglishText "For normal single-user local use, leave blank or use 1 so context is not split across requests. Raise this to 2 or higher only for real concurrent API traffic, and re-check context and VRAM headroom."
             }
         }
         "Temperature" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "控制採樣溫度，決定輸出要保守還是更發散。" -EnglishText "Controls sampling temperature, which shifts output between conservative and more varied behavior."
-                Recommendation = Format-BilingualText -ChineseText "先從 `1.0` 開始。要更穩定就往下調；要更有變化再慢慢往上加，不要一次拉太高。" -EnglishText "Start at 1.0. Lower it for more stable output, or raise it gradually when you want more variation."
+                Recommendation = Format-BilingualText -ChineseText "先從 1.0 開始。要更穩定就往下調；要更有變化再慢慢往上加，不要一次拉太高。" -EnglishText "Start at 1.0. Lower it for more stable output, or raise it gradually when you want more variation."
             }
         }
         "TopK" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "限制每一步採樣時只在前 K 個候選 token 之間挑選。" -EnglishText "Restricts each sampling step to the top K candidate tokens."
-                Recommendation = Format-BilingualText -ChineseText "一般先用 `20`。想讓輸出更收斂可再降低；只有你明確想放寬候選空間時才往上加。" -EnglishText "Start with 20. Lower it for tighter output, and raise it only when you deliberately want a wider candidate pool."
+                Recommendation = Format-BilingualText -ChineseText "一般先用 20。想讓輸出更收斂可再降低；只有你明確想放寬候選空間時才往上加。" -EnglishText "Start with 20. Lower it for tighter output, and raise it only when you deliberately want a wider candidate pool."
             }
         }
         "TopP" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "使用 nucleus sampling，根據累積機率決定保留多少候選 token。" -EnglishText "Uses nucleus sampling to keep candidates up to a cumulative probability threshold."
-                Recommendation = Format-BilingualText -ChineseText "一般先用 `0.95`。想更穩定可往下調到 `0.9` 左右；不要同時把 `temp` 和 `top-p` 都拉得太激進。" -EnglishText "Start with 0.95. Lower it toward 0.9 for more stable output, and avoid making both temp and top-p aggressive at the same time."
+                Recommendation = Format-BilingualText -ChineseText "一般先用 0.95。想更穩定可往下調到 0.9 左右；不要同時把 temp 和 top-p 都拉得太激進。" -EnglishText "Start with 0.95. Lower it toward 0.9 for more stable output, and avoid making both temp and top-p aggressive at the same time."
             }
         }
         "MinP" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "設定最小機率門檻，用來過濾過低機率的候選 token。" -EnglishText "Sets a minimum probability threshold that filters out very low-probability token candidates."
-                Recommendation = Format-BilingualText -ChineseText "先維持 `0.00`。只有你已經確認模型會亂飄，才再逐步往上調。" -EnglishText "Keep this at 0.00 initially. Raise it gradually only after confirming the model is drifting too much."
+                Recommendation = Format-BilingualText -ChineseText "先維持 0.00。只有你已經確認模型會亂飄，才再逐步往上調。" -EnglishText "Keep this at 0.00 initially. Raise it gradually only after confirming the model is drifting too much."
             }
         }
         "PresencePenalty" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "提高已出現內容再次出現的成本，降低重複貼近同一主題或句型的機率。" -EnglishText "Raises the cost of already-present content so responses are less likely to repeat the same topic or phrasing."
-                Recommendation = Format-BilingualText -ChineseText "先從 `1.5` 開始。若回答變得太跳或漏掉必要重述，再往下調。" -EnglishText "Start with 1.5. Lower it if responses become too jumpy or avoid necessary restatement."
+                Recommendation = Format-BilingualText -ChineseText "先從 1.5 開始。若回答變得太跳或漏掉必要重述，再往下調。" -EnglishText "Start with 1.5. Lower it if responses become too jumpy or avoid necessary restatement."
             }
         }
         "Host" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "控制 llama-server 要綁定在哪個網路介面。" -EnglishText "Controls which network interface llama-server binds to."
-                Recommendation = Format-BilingualText -ChineseText "只在本機使用時請維持 `127.0.0.1`。只有在可信任網路上，才用 `0.0.0.0`，而且要搭配 API key。" -EnglishText "Keep 127.0.0.1 for local-only use. Use 0.0.0.0 only on trusted networks and pair it with an API key."
+                Recommendation = Format-BilingualText -ChineseText "只在本機使用時請維持 127.0.0.1。只有在可信任網路上，才用 0.0.0.0，而且要搭配 API key。" -EnglishText "Keep 127.0.0.1 for local-only use. Use 0.0.0.0 only on trusted networks and pair it with an API key."
             }
         }
         "Metrics" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "啟用 Prometheus 的 `/metrics` 端點。" -EnglishText "Enables the Prometheus /metrics endpoint."
+                Purpose = Format-BilingualText -ChineseText "啟用 Prometheus 的 /metrics 端點。" -EnglishText "Enables the Prometheus /metrics endpoint."
                 Recommendation = Format-BilingualText -ChineseText "除非你真的會監看這個服務，否則保持關閉。" -EnglishText "Leave it Off unless you actively monitor the server."
             }
         }
         "ApiKey" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "為服務加上 API key 保護。" -EnglishText "Adds API key protection to the server."
-                Recommendation = Format-BilingualText -ChineseText "只要 Host 不是 `127.0.0.1`，或你不希望其他本機工具匿名連線時，就應該設定它。" -EnglishText "Set this whenever Host is not 127.0.0.1 or when other local tools should not have anonymous access."
+                Recommendation = Format-BilingualText -ChineseText "只要 Host 不是 127.0.0.1，或你不希望其他本機工具匿名連線時，就應該設定它。" -EnglishText "Set this whenever Host is not 127.0.0.1 or when other local tools should not have anonymous access."
             }
         }
         "Device" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "指定 llama.cpp 要使用哪些加速裝置。" -EnglishText "Pins which accelerators llama.cpp should target."
-                Recommendation = Format-BilingualText -ChineseText "留空代表自動選擇。這台機器若要同時用兩張 5070 Ti，可填 `CUDA0,CUDA1`。" -EnglishText "Leave blank for automatic selection. On this machine, use CUDA0,CUDA1 when you want both 5070 Ti cards."
+                Recommendation = Format-BilingualText -ChineseText "留空代表自動選擇。這台機器若要同時用兩張 5070 Ti，可填 CUDA0,CUDA1。" -EnglishText "Leave blank for automatic selection. On this machine, use CUDA0,CUDA1 when you want both 5070 Ti cards."
             }
         }
         "VramAllocationStrategy" {
@@ -10243,31 +10596,31 @@ function Get-LaunchConfigItemHelp {
         "SplitMode" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "控制 llama.cpp 在多張 GPU 之間如何分割工作。" -EnglishText "Controls how llama.cpp splits work across multiple GPUs."
-                Recommendation = Format-BilingualText -ChineseText "大多數雙 GPU 啟動建議用 `layer`。單 GPU 情況通常留空，除非你在測試特定分割策略。" -EnglishText "Use layer for most dual-GPU launches. Leave blank on single-GPU runs unless you are testing a specific split strategy."
+                Recommendation = Format-BilingualText -ChineseText "大多數雙 GPU 啟動建議用 layer。單 GPU 情況通常留空，除非你在測試特定分割策略。" -EnglishText "Use layer for most dual-GPU launches. Leave blank on single-GPU runs unless you are testing a specific split strategy."
             }
         }
         "TensorSplit" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "在啟用多 GPU 分割時，定義各張 GPU 之間的張量分配比例。" -EnglishText "Defines the distribution ratio between GPUs when multi-GPU split is active."
-                Recommendation = Format-BilingualText -ChineseText "兩張規格相同的 GPU 可先用 `1,1`。只有在你確認某一張卡才是瓶頸後，才需要細調這個比例。" -EnglishText "For two equal GPUs, start with 1,1. Tune this only after you know one GPU is the bottleneck."
+                Recommendation = Format-BilingualText -ChineseText "兩張規格相同的 GPU 可先用 1,1。只有在你確認某一張卡才是瓶頸後，才需要細調這個比例。" -EnglishText "For two equal GPUs, start with 1,1. Tune this only after you know one GPU is the bottleneck."
             }
         }
         "Fit" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "在你想覆蓋預設行為時，直接控制 llama.cpp 的 fit 行為。" -EnglishText "Directly controls llama.cpp fit behavior when you want to override its default."
-                Recommendation = Format-BilingualText -ChineseText "一般由 wrapper 管理時保持留空。只有在你刻意比較 fit 行為時，才手動設成 `on` 或 `off`。" -EnglishText "Leave blank for normal wrapper-managed launches. Use on or off only when comparing fit behavior deliberately."
+                Recommendation = Format-BilingualText -ChineseText "一般由 wrapper 管理時保持留空。只有在你刻意比較 fit 行為時，才手動設成 on 或 off。" -EnglishText "Leave blank for normal wrapper-managed launches. Use on or off only when comparing fit behavior deliberately."
             }
         }
         "LoadMode" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "使用新版 `--load-mode` 統一控制模型載入；它取代已 deprecated 的 `--mmap`、`--no-mmap`、`--mlock` 與 DirectIO 旗標。" -EnglishText "Uses the unified --load-mode option, replacing the deprecated mmap, mlock, and DirectIO flags."
-                Recommendation = Format-BilingualText -ChineseText "Windows 一般保持 `mmap`。RAM 很充足且要避免換頁時可測 `mmap+mlock`；`dio` 與 `none` 只在受控載入效能或 pageout 測試時使用。" -EnglishText "Keep mmap for normal Windows use. Test mmap+mlock when RAM is plentiful and paging must be avoided; reserve dio and none for controlled loading/pageout tests."
+                Purpose = Format-BilingualText -ChineseText "使用新版 --load-mode 統一控制模型載入；它取代已 deprecated 的 --mmap、--no-mmap、--mlock 與 DirectIO 旗標。" -EnglishText "Uses the unified --load-mode option, replacing the deprecated mmap, mlock, and DirectIO flags."
+                Recommendation = Format-BilingualText -ChineseText "Windows 一般保持 mmap。RAM 很充足且要避免換頁時可測 mmap+mlock；dio 與 none 只在受控載入效能或 pageout 測試時使用。" -EnglishText "Keep mmap for normal Windows use. Test mmap+mlock when RAM is plentiful and paging must be avoided; reserve dio and none for controlled loading/pageout tests."
             }
         }
         "FlashAttention2" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "控制 llama.cpp 的 Flash Attention 2（`--flash-attn`）模式。" -EnglishText "Controls llama.cpp Flash Attention 2 mode (`--flash-attn`)."
-                Recommendation = Format-BilingualText -ChineseText "建議先用 `auto`。想強制啟用時用 `on`；若要排除相容性或穩定性問題，可改 `off`。" -EnglishText "Start with auto. Use on to force-enable it. Switch to off when troubleshooting compatibility or stability issues."
+                Purpose = Format-BilingualText -ChineseText "控制 llama.cpp 的 Flash Attention 2（--flash-attn）模式。" -EnglishText "Controls llama.cpp Flash Attention 2 mode (--flash-attn)."
+                Recommendation = Format-BilingualText -ChineseText "建議先用 auto。想強制啟用時用 on；若要排除相容性或穩定性問題，可改 off。" -EnglishText "Start with auto. Use on to force-enable it. Switch to off when troubleshooting compatibility or stability issues."
             }
         }
         "ExtraArgs" {
@@ -10290,7 +10643,7 @@ function Get-LaunchConfigItemHelp {
         }
         "ExportProfile" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "把目前頁面上的設定直接輸出成可雙擊的一鍵啟動 `.cmd`。" -EnglishText "Exports the current page settings directly as a double-click one-shot `.cmd` launcher."
+                Purpose = Format-BilingualText -ChineseText "把目前頁面上的設定直接輸出成可雙擊的一鍵啟動 .cmd。" -EnglishText "Exports the current page settings directly as a double-click one-shot .cmd launcher."
                 Recommendation = Format-BilingualText -ChineseText "適合把這次調好的設定放到桌面或排程使用；它會走 Start_LCPP.ps1 包裝器，因此保留自動 fit、vision 與 MTP sidecar 邏輯。" -EnglishText "Use this for desktop shortcuts or scheduled runs; it goes through the Start_LCPP.ps1 wrapper, preserving auto-fit, vision, and MTP sidecar behavior."
             }
         }
@@ -10302,7 +10655,7 @@ function Get-LaunchConfigItemHelp {
         }
         "ExportCommand" {
             return [pscustomobject]@{
-                Purpose = Format-BilingualText -ChineseText "把目前頁面的設定轉成一行 `llama-server.exe` 命令，可直接貼到 PowerShell 執行。" -EnglishText "Converts the current page settings into a one-line `llama-server.exe` command you can paste into PowerShell."
+                Purpose = Format-BilingualText -ChineseText "把目前頁面的設定轉成一行 llama-server.exe 命令，可直接貼到 PowerShell 執行。" -EnglishText "Converts the current page settings into a one-line llama-server.exe command you can paste into PowerShell."
                 Recommendation = Format-BilingualText -ChineseText "適合拿去做純 llama.cpp 直啟、捷徑、排程或自動化腳本。輸出後會自動複製到剪貼簿（如果系統支援）。" -EnglishText "Use this for direct llama.cpp startup, shortcuts, scheduled tasks, or automation scripts. The command is copied to clipboard automatically when supported."
             }
         }
@@ -10327,6 +10680,187 @@ function Get-LaunchConfigItemHelp {
     }
 }
 
+function Get-LaunchConfigChoiceDescription {
+    param(
+        [string]$Key,
+        [AllowEmptyString()][string]$Choice
+    )
+
+    $NormalizedChoice = ([string]$Choice).Trim().ToLowerInvariant()
+    switch ($Key) {
+        "LaunchMode" {
+            switch ($NormalizedChoice) {
+                "background service" { return Format-BilingualText -ChineseText "在背景啟動服務，不自動開啟瀏覽器；適合 API、常駐後端與其他前端連線。" -EnglishText "Starts the service in the background without opening a browser; suited to APIs, persistent backends, and external frontends." }
+                "open web ui" { return Format-BilingualText -ChineseText "啟動服務後自動開啟內建 Web UI，適合立刻在瀏覽器對話。" -EnglishText "Starts the service and opens the built-in Web UI for immediate browser chat." }
+            }
+        }
+        "ReasoningMode" {
+            switch ($NormalizedChoice) {
+                "auto" { return Format-BilingualText -ChineseText "不強制開關，由聊天模板與模型能力自動決定是否 thinking。" -EnglishText "Does not force the mode; the chat template and model capability decide whether thinking is used." }
+                "on" { return Format-BilingualText -ChineseText "強制啟用 reasoning/thinking；模板仍必須支援。" -EnglishText "Forces reasoning/thinking on; the template must still support it." }
+                "off" { return Format-BilingualText -ChineseText "停用 reasoning/thinking，並且不送出思考等級與思考預算。" -EnglishText "Disables reasoning/thinking and suppresses thinking-level and thinking-budget arguments." }
+            }
+        }
+        "ThinkLevel" {
+            switch ($NormalizedChoice) {
+                "auto" { return Format-BilingualText -ChineseText "不送出 reasoning budget，沿用 llama.cpp 或模板的預設行為。" -EnglishText "Emits no reasoning budget and keeps llama.cpp or template defaults." }
+                "low (1024)" { return Format-BilingualText -ChineseText "最多使用 1024 個 thinking token；延遲較低，適合簡單任務。" -EnglishText "Allows up to 1024 thinking tokens for lower latency and simpler tasks." }
+                "medium (4096)" { return Format-BilingualText -ChineseText "最多使用 4096 個 thinking token；一般任務的平衡預設。" -EnglishText "Allows up to 4096 thinking tokens; the balanced default for general tasks." }
+                "high (8192)" { return Format-BilingualText -ChineseText "最多使用 8192 個 thinking token；適合較深推理，但延遲與輸出占用較高。" -EnglishText "Allows up to 8192 thinking tokens for deeper reasoning at higher latency and output usage." }
+                "max (-1)" { return Format-BilingualText -ChineseText "不限制 thinking token 預算；模型仍可能自行提早結束，且會占用總輸出額度。" -EnglishText "Leaves the thinking-token budget unrestricted; the model may still stop early and thinking consumes the total output allowance." }
+            }
+        }
+        "ReasoningEffort" {
+            switch ($NormalizedChoice) {
+                "default" { return Format-BilingualText -ChineseText "不送出 reasoning-effort，完全沿用聊天模板的預設等級。" -EnglishText "Emits no reasoning-effort value and uses the chat template default." }
+                "minimal" { return Format-BilingualText -ChineseText "要求最精簡的思考策略，優先降低延遲。" -EnglishText "Requests the lightest thinking strategy, prioritizing low latency." }
+                "low" { return Format-BilingualText -ChineseText "要求較淺的思考，適合直接、低延遲的任務。" -EnglishText "Requests shallow reasoning for direct, latency-sensitive tasks." }
+                "medium" { return Format-BilingualText -ChineseText "要求平衡的思考深度，預設搭配 4096 token 預算。" -EnglishText "Requests balanced reasoning depth and pairs with a 4096-token budget by default." }
+                "high" { return Format-BilingualText -ChineseText "要求較深的思考，預設搭配 8192 token 預算。" -EnglishText "Requests deeper reasoning and pairs with an 8192-token budget by default." }
+                "xhigh" { return Format-BilingualText -ChineseText "要求非常深入的思考；只有模板支援此等級時才會生效，預設搭配 8192 token。" -EnglishText "Requests very deep reasoning; it works only with templates that support this level and pairs with 8192 tokens by default." }
+                "max" { return Format-BilingualText -ChineseText "要求模板支援的最高思考等級，預設搭配不限 token 預算。" -EnglishText "Requests the highest template-supported thinking level and pairs with an unrestricted token budget by default." }
+            }
+        }
+        "ReasoningPreserve" {
+            switch ($NormalizedChoice) {
+                "auto" { return Format-BilingualText -ChineseText "不送出 preserve 旗標，由聊天模板決定是否保存先前的 reasoning trace。" -EnglishText "Emits no preserve flag and lets the chat template decide whether prior reasoning traces are retained." }
+                "on" { return Format-BilingualText -ChineseText "在完整多輪歷史中保留先前 reasoning trace；會增加 context 用量。" -EnglishText "Retains prior reasoning traces in full multi-turn history, increasing context usage." }
+                "off" { return Format-BilingualText -ChineseText "不在完整歷史中保留先前 reasoning trace，可減少 context 占用。" -EnglishText "Does not retain prior reasoning traces in full history, reducing context usage." }
+            }
+        }
+        "SpecType" {
+            switch ($NormalizedChoice) {
+                "auto" { return Format-BilingualText -ChineseText "由啟動器依目前模型與同資料夾草稿檔自動選擇；找不到相容模式時不啟用推測解碼。" -EnglishText "Lets the launcher choose from the current model and nearby draft files; speculative decoding stays off when no compatible mode is found." }
+                "none" { return Format-BilingualText -ChineseText "完全停用 speculative decoding，只使用主模型生成。" -EnglishText "Disables speculative decoding and generates with the target model only." }
+                "draft-mtp" { return Format-BilingualText -ChineseText "使用模型內建 MTP head 或相符 MTP drafter 一次預測多個候選 token。" -EnglishText "Uses an embedded MTP head or matching MTP drafter to propose multiple future tokens." }
+                "draft-simple" { return Format-BilingualText -ChineseText "使用另一個一般小型 GGUF 作為草稿模型，再由主模型驗證候選 token。" -EnglishText "Uses a separate ordinary small GGUF as the draft model, with candidates verified by the target model." }
+                "draft-eagle3" { return Format-BilingualText -ChineseText "使用與主模型匹配的 EAGLE3 草稿模型；不能任意混用 GGUF。" -EnglishText "Uses a matching EAGLE3 draft model; arbitrary GGUF combinations are incompatible." }
+                "draft-dflash" { return Format-BilingualText -ChineseText "使用與主模型匹配的 DFlash drafter；需要專用草稿 GGUF。" -EnglishText "Uses a target-matched DFlash drafter and requires its dedicated draft GGUF." }
+                "draft-dspark" { return Format-BilingualText -ChineseText "使用與主模型匹配的 DSpark drafter；需要專用草稿 GGUF。" -EnglishText "Uses a target-matched DSpark drafter and requires its dedicated draft GGUF." }
+                "ngram-simple" { return Format-BilingualText -ChineseText "用簡單 n-gram 比對從既有文字猜測後續 token，不需要草稿模型。" -EnglishText "Predicts subsequent tokens through simple n-gram matching over existing text, without a draft model." }
+                "ngram-map-k" { return Format-BilingualText -ChineseText "使用 map-k 索引查找重複 n-gram 後續內容，不需要草稿模型。" -EnglishText "Uses a map-k index to look up continuations of repeated n-grams, without a draft model." }
+                "ngram-map-k4v" { return Format-BilingualText -ChineseText "使用 map-k4v n-gram 索引變體，在多個候選後續間進行查找。" -EnglishText "Uses the map-k4v n-gram-index variant to look up among multiple candidate continuations." }
+                "ngram-mod" { return Format-BilingualText -ChineseText "使用可調整最小、最大與匹配長度的 modified n-gram 推測策略。" -EnglishText "Uses a modified n-gram strategy with configurable minimum, maximum, and match lengths." }
+                "ngram-cache" { return Format-BilingualText -ChineseText "從 prompt cache 與既有 token 序列重用 n-gram 後續，不需要草稿模型。" -EnglishText "Reuses n-gram continuations from prompt cache and existing token sequences, without a draft model." }
+            }
+        }
+        { $_ -in @("SpecDraftCacheTypeK", "SpecDraftCacheTypeV") } {
+            switch ($NormalizedChoice) {
+                "" { return Format-BilingualText -ChineseText "不送出旗標，使用 llama.cpp 的 draft cache 預設 f16。" -EnglishText "Emits no flag and uses llama.cpp's f16 draft-cache default." }
+                "f32" { return Format-BilingualText -ChineseText "32-bit 浮點，精度最高但 VRAM 用量最大。" -EnglishText "32-bit floating point: highest precision and largest VRAM use." }
+                "f16" { return Format-BilingualText -ChineseText "16-bit 浮點預設值，品質、速度與 VRAM 的穩健平衡。" -EnglishText "Default 16-bit floating point, balancing quality, speed, and VRAM." }
+                "bf16" { return Format-BilingualText -ChineseText "16-bit brain float，動態範圍較大；需要後端與 GPU 支援。" -EnglishText "16-bit brain float with wider dynamic range; requires backend and GPU support." }
+                "q8_0" { return Format-BilingualText -ChineseText "8-bit 量化 cache，通常可大幅省 VRAM，品質損失較小。" -EnglishText "8-bit quantized cache, usually saving substantial VRAM with a small quality cost." }
+                "q5_1" { return Format-BilingualText -ChineseText "5-bit 量化且保留較多校正資訊；比 q5_0 稍重但通常較準。" -EnglishText "5-bit quantization with additional calibration information; slightly heavier and usually more accurate than q5_0." }
+                "q5_0" { return Format-BilingualText -ChineseText "較精簡的 5-bit 量化，進一步省 VRAM，但誤差高於 q5_1。" -EnglishText "Lean 5-bit quantization that saves more VRAM but has more error than q5_1." }
+                "q4_1" { return Format-BilingualText -ChineseText "4-bit 量化且保留較多校正資訊；比 q4_0 稍重但通常較準。" -EnglishText "4-bit quantization with additional calibration information; slightly heavier and usually more accurate than q4_0." }
+                "q4_0" { return Format-BilingualText -ChineseText "精簡 4-bit 量化，VRAM 用量低，但 cache 誤差與品質風險較高。" -EnglishText "Lean 4-bit quantization with low VRAM use but higher cache error and quality risk." }
+                "iq4_nl" { return Format-BilingualText -ChineseText "非線性 improved 4-bit 量化，嘗試在低 VRAM 下改善精度；相容性需實測。" -EnglishText "Non-linear improved 4-bit quantization intended to improve accuracy at low VRAM; compatibility should be tested." }
+            }
+        }
+        "VramAllocationStrategy" {
+            switch ($NormalizedChoice) {
+                "smart" { return Format-BilingualText -ChineseText "由 wrapper 依每張 GPU 可用 VRAM，以及 mmproj/MTP 集中負擔計算裝置順序與分配。" -EnglishText "Lets the wrapper calculate device order and allocation from per-GPU free VRAM and concentrated mmproj/MTP load." }
+                "auto" { return Format-BilingualText -ChineseText "不由 wrapper 指定分配比例，交給 llama.cpp 自動處理。" -EnglishText "Leaves allocation ratios unspecified so llama.cpp handles them automatically." }
+                "manual" { return Format-BilingualText -ChineseText "使用下方 Split Mode、Tensor Split 與 Device 的明確設定。" -EnglishText "Uses explicit Device, Split Mode, and Tensor Split settings below." }
+            }
+        }
+        "SplitMode" {
+            switch ($NormalizedChoice) {
+                "" { return Format-BilingualText -ChineseText "不送出 split-mode，沿用 llama.cpp 預設 layer。" -EnglishText "Emits no split-mode flag and keeps llama.cpp's layer default." }
+                "layer" { return Format-BilingualText -ChineseText "依層把模型與 KV 分到多張 GPU，使用 pipeline；一般多 GPU 的預設。" -EnglishText "Splits model layers and KV across GPUs using a pipeline; the normal multi-GPU default." }
+                "row" { return Format-BilingualText -ChineseText "把權重按列拆到多張 GPU 並行計算；同步成本較高，需實測效益。" -EnglishText "Splits weight rows across GPUs for parallel computation; synchronization cost is higher and should be benchmarked." }
+                "none" { return Format-BilingualText -ChineseText "不做多 GPU 分割，只使用單一 GPU。" -EnglishText "Disables multi-GPU splitting and uses one GPU only." }
+            }
+        }
+        "Fit" {
+            switch ($NormalizedChoice) {
+                "" { return Format-BilingualText -ChineseText "不明確覆寫 fit，由 wrapper 的智慧分配或 llama.cpp 預設決定。" -EnglishText "Does not explicitly override fit; the wrapper's smart allocation or llama.cpp default decides." }
+                "on" { return Format-BilingualText -ChineseText "允許 llama.cpp 調整尚未固定的參數，以符合裝置記憶體。" -EnglishText "Allows llama.cpp to adjust unset arguments to fit device memory." }
+                "off" { return Format-BilingualText -ChineseText "禁止 llama.cpp 自動 fitting；設定超出 VRAM 時可能直接啟動失敗。" -EnglishText "Disables llama.cpp automatic fitting; startup may fail directly when settings exceed VRAM." }
+            }
+        }
+        "LoadMode" {
+            switch ($NormalizedChoice) {
+                "mmap" { return Format-BilingualText -ChineseText "以記憶體映射載入模型，讓作業系統按需讀取頁面；Windows 一般使用的平衡選項。" -EnglishText "Memory-maps the model so the OS loads pages on demand; the balanced option for normal Windows use." }
+                "mmap+mlock" { return Format-BilingualText -ChineseText "先 mmap，再把模型頁面鎖在 RAM，避免 swap 或記憶體壓縮；需要足夠實體 RAM。" -EnglishText "Memory-maps and then locks model pages in RAM to avoid swapping or compression; requires enough physical RAM." }
+                "mlock" { return Format-BilingualText -ChineseText "不依賴 mmap，並強制模型常駐 RAM、不被 swap 或壓縮；載入較慢且 RAM 壓力較高。" -EnglishText "Avoids relying on mmap and forces the model to remain in RAM without swapping or compression; loading is slower and RAM pressure is higher." }
+                "dio" { return Format-BilingualText -ChineseText "可用時使用 DirectIO，繞過一般作業系統 page cache；屬進階效能測試選項。" -EnglishText "Uses DirectIO when available, bypassing the normal OS page cache; intended for advanced loading-performance tests." }
+                "none" { return Format-BilingualText -ChineseText "不使用 mmap、mlock 或 DirectIO 等特殊載入模式；通常載入較慢，但可用於排除 pageout 或相容性問題。" -EnglishText "Uses no special mmap, mlock, or DirectIO mode; usually slower to load but useful for pageout or compatibility troubleshooting." }
+            }
+        }
+        "FlashAttention2" {
+            switch ($NormalizedChoice) {
+                "auto" { return Format-BilingualText -ChineseText "讓 llama.cpp 依模型、後端與裝置能力自動決定。" -EnglishText "Lets llama.cpp decide from model, backend, and device capabilities." }
+                "on" { return Format-BilingualText -ChineseText "強制啟用 Flash Attention；通常更省記憶體且更快，但需後端支援。" -EnglishText "Forces Flash Attention on; it is often faster and more memory-efficient but requires backend support." }
+                "off" { return Format-BilingualText -ChineseText "停用 Flash Attention，適合排查相容性、精度或穩定性問題。" -EnglishText "Disables Flash Attention for compatibility, precision, or stability troubleshooting." }
+            }
+        }
+    }
+
+    return Format-BilingualText -ChineseText "這個值目前沒有額外說明。" -EnglishText "No additional description is available for this value yet."
+}
+
+function Show-LaunchConfigItemHelp {
+    param(
+        [System.Collections.IDictionary]$Config,
+        $Item
+    )
+
+    $Help = Get-LaunchConfigItemHelp -Config $Config -Item $Item
+    $CurrentValue = Get-LaunchConfigValueText -Config $Config -Item $Item
+
+    Write-Host (Format-BilingualText -ChineseText "詳細說明" -EnglishText "Details") -ForegroundColor DarkCyan
+    Write-WrappedInfoLine `
+        -Prefix ((Format-BilingualText -ChineseText "目前值" -EnglishText "Current") + " : ") `
+        -Text $CurrentValue `
+        -PrefixColor Cyan `
+        -TextColor White
+
+    if ([string]$Item.Type -eq "choice" -and $Item.Choices) {
+        $ChoiceLabels = @(
+            foreach ($Choice in @($Item.Choices)) {
+                if ([string]::IsNullOrWhiteSpace([string]$Choice)) {
+                    Format-BilingualText -ChineseText "（空白）" -EnglishText "(blank)"
+                }
+                else {
+                    [string]$Choice
+                }
+            }
+        )
+        Write-WrappedInfoLine `
+            -Prefix ((Format-BilingualText -ChineseText "可選值" -EnglishText "Options") + " : ") `
+            -Text ($ChoiceLabels -join ", ") `
+            -PrefixColor Cyan `
+            -TextColor Gray
+
+        $RawChoice = [string]$Config[$Item.Key]
+        $SelectedChoiceLabel = if ([string]::IsNullOrWhiteSpace($RawChoice)) {
+            Format-BilingualText -ChineseText "（空白）" -EnglishText "(blank)"
+        }
+        else {
+            $RawChoice
+        }
+        $ChoiceDescription = Get-LaunchConfigChoiceDescription -Key ([string]$Item.Key) -Choice $RawChoice
+        Write-WrappedInfoLine `
+            -Prefix ((Format-BilingualText -ChineseText "選項意義" -EnglishText "Selected option") + " : ") `
+            -Text ("{0} — {1}" -f $SelectedChoiceLabel, $ChoiceDescription) `
+            -PrefixColor Green `
+            -TextColor Green
+    }
+
+    Write-WrappedInfoLine `
+        -Prefix ((Format-BilingualText -ChineseText "用途" -EnglishText "Purpose") + " : ") `
+        -Text ([string]$Help.Purpose) `
+        -PrefixColor Cyan `
+        -TextColor Gray
+    Write-WrappedInfoLine `
+        -Prefix ((Format-BilingualText -ChineseText "建議" -EnglishText "Recommendation") + " : ") `
+        -Text ([string]$Help.Recommendation) `
+        -PrefixColor Yellow `
+        -TextColor Yellow
+}
+
 function Read-ConfigInput {
     param(
         [string]$Label,
@@ -10348,6 +10882,100 @@ function Read-ConfigInput {
     }
     $InputText = Read-Host (Format-BilingualText -ChineseText "輸入新值（留空代表清除）" -EnglishText "New value (leave blank to clear)")
     return $InputText
+}
+
+function Edit-LlamaBinDirectorySelection {
+    param([System.Collections.IDictionary]$Config)
+
+    $CurrentValue = ConvertTo-LlamaBinConfigValue -Directory ([string]$Config.LlamaBinDirectory)
+    $Options = New-Object System.Collections.Generic.List[object]
+    $Options.Add([pscustomobject]@{
+            Name = Format-BilingualText -ChineseText "Standard（bin）" -EnglishText "Standard (bin)"
+            Description = $(if (Test-Path -LiteralPath $DefaultServerExe -PathType Leaf) { $DefaultServerExe } else { Format-BilingualText -ChineseText "尚未安裝" -EnglishText "not installed" })
+            Value = "bin"
+        })
+    $Options.Add([pscustomobject]@{
+            Name = Format-BilingualText -ChineseText "FastMTP（bin_fast）" -EnglishText "FastMTP (bin_fast)"
+            Description = $(if (Test-Path -LiteralPath $FastServerExe -PathType Leaf) { $FastServerExe } else { Format-BilingualText -ChineseText "尚未安裝" -EnglishText "not installed" })
+            Value = "bin_fast"
+        })
+    $KnownDirectoryValues = New-Object System.Collections.Generic.List[string]
+    [void]$KnownDirectoryValues.Add("bin")
+    [void]$KnownDirectoryValues.Add("bin_fast")
+    # Make bundled variants (for example bin-mtp-3gpu) directly selectable,
+    # while retaining the custom-path option for any external llama.cpp build.
+    foreach ($ProjectBinDirectory in @(Get-ChildItem -LiteralPath $ScriptRoot -Directory -Filter "bin*" -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        $DirectoryName = [string]$ProjectBinDirectory.Name
+        if ($KnownDirectoryValues -contains $DirectoryName) {
+            continue
+        }
+        $ProjectServerExe = Join-Path $ProjectBinDirectory.FullName "llama-server.exe"
+        if (-not (Test-Path -LiteralPath $ProjectServerExe -PathType Leaf)) {
+            continue
+        }
+        $Options.Add([pscustomobject]@{
+                Name = Format-BilingualText -ChineseText ("本機目錄（{0}）" -f $DirectoryName) -EnglishText ("Local directory ({0})" -f $DirectoryName)
+                Description = $ProjectServerExe
+                Value = $DirectoryName
+            })
+        [void]$KnownDirectoryValues.Add($DirectoryName)
+        # Custom project-local directories are stored as absolute paths, so
+        # recognise that form too and do not show the selected folder twice.
+        $NormalizedDirectoryValue = ConvertTo-LlamaBinConfigValue -Directory $DirectoryName
+        if ($KnownDirectoryValues -notcontains $NormalizedDirectoryValue) {
+            [void]$KnownDirectoryValues.Add($NormalizedDirectoryValue)
+        }
+    }
+    if ($CurrentValue -notin @($KnownDirectoryValues.ToArray())) {
+        $Options.Add([pscustomobject]@{
+                Name = Format-BilingualText -ChineseText "目前的自訂目錄" -EnglishText "Current custom directory"
+                Description = $CurrentValue
+                Value = $CurrentValue
+            })
+    }
+    $Options.Add([pscustomobject]@{
+            Name = Format-BilingualText -ChineseText "輸入其他目錄..." -EnglishText "Enter another directory..."
+            Description = Format-BilingualText -ChineseText "可輸入相對於專案根目錄的路徑，或完整絕對路徑。" -EnglishText "Enter a project-relative path or a full absolute path."
+            Value = "__custom__"
+        })
+    $Options.Add([pscustomobject]@{
+            Name = Format-BilingualText -ChineseText "返回" -EnglishText "Back"
+            Description = Format-BilingualText -ChineseText "保留目前設定。" -EnglishText "Keep the current setting."
+            Value = "__back__"
+        })
+
+    $CurrentIndex = 0
+    for ($Index = 0; $Index -lt $Options.Count; $Index++) {
+        if ([string]$Options[$Index].Value -eq $CurrentValue) {
+            $CurrentIndex = $Index
+            break
+        }
+    }
+    $Selection = Show-ListMenu `
+        -Title (Format-BilingualText -ChineseText "llama.cpp Bin 路徑" -EnglishText "llama.cpp Bin Path") `
+        -Subtitle (Format-BilingualText -ChineseText "每個儲存設定可指定不同的 llama.cpp 目錄。" -EnglishText "Each saved profile can use a different llama.cpp directory.") `
+        -Items @($Options.ToArray()) `
+        -SelectedIndex $CurrentIndex
+    if ([string]::IsNullOrWhiteSpace([string]$Selection) -or $Selection -eq "__back__") {
+        return
+    }
+    if ($Selection -eq "__custom__") {
+        $Selection = Read-ConfigInput `
+            -Label (Format-BilingualText -ChineseText "llama.cpp 目錄" -EnglishText "llama.cpp Directory") `
+            -CurrentValue $CurrentValue `
+            -CurrentDisplayValue $CurrentValue `
+            -Hint (Format-BilingualText -ChineseText "例如 bin_fast 或 D:\llama.cpp\build\bin" -EnglishText "For example bin_fast or D:\llama.cpp\build\bin")
+        if ([string]::IsNullOrWhiteSpace([string]$Selection)) {
+            return
+        }
+    }
+
+    $ResolvedDirectory = Resolve-LlamaBinDirectoryPath -Directory ([string]$Selection)
+    $ResolvedServer = Join-Path $ResolvedDirectory "llama-server.exe"
+    if (-not (Test-Path -LiteralPath $ResolvedServer -PathType Leaf)) {
+        throw (Format-BilingualText -ChineseText ("目錄中找不到 llama-server.exe：{0}" -f $ResolvedDirectory) -EnglishText ("The directory does not contain llama-server.exe: {0}" -f $ResolvedDirectory))
+    }
+    $Config.LlamaBinDirectory = ConvertTo-LlamaBinConfigValue -Directory $ResolvedDirectory
 }
 
 function Edit-LaunchConfigItem {
@@ -10379,6 +11007,9 @@ function Edit-LaunchConfigItem {
                 }
             }
         }
+        "binaryDirectory" {
+            Edit-LlamaBinDirectorySelection -Config $Config
+        }
         "visionModel" {
             Edit-VisionModelSelection -Config $Config -IndexPath $IndexPath
         }
@@ -10408,6 +11039,11 @@ function Edit-LaunchConfigItem {
             }
             elseif ($Item.Key -eq "ReasoningMode" -and [string]$Config.ReasoningMode -eq "off") {
                 $Config.ThinkLevel = "Auto"
+            }
+            elseif ($Item.Key -eq "ReasoningEffort") {
+                # Apply the built-in pairing as a convenient preset.  The
+                # budget remains independently editable afterwards.
+                $Config.ThinkLevel = Get-RecommendedThinkLevelForReasoningEffort -ReasoningEffort ([string]$Config.ReasoningEffort)
             }
         }
         "bool" {
@@ -10762,10 +11398,14 @@ function Get-LaunchConfigCommandExport {
     )
 
     $LlamaPreview = Get-LlamaServerArgsFromLaunchConfig -Config $Config
+    $ConfigServerExe = Resolve-LlamaServerExecutablePath -Directory ([string]$Config.LlamaBinDirectory)
+    if (-not (Test-Path -LiteralPath $ConfigServerExe -PathType Leaf)) {
+        throw (Format-BilingualText -ChineseText ("找不到設定所選的 llama-server.exe：{0}" -f $ConfigServerExe) -EnglishText ("Cannot find the llama-server.exe selected by this profile: {0}" -f $ConfigServerExe))
+    }
     $CommandTokens = New-Object System.Collections.Generic.List[string]
 
     $CommandTokens.Add("&")
-    $CommandTokens.Add((ConvertTo-PowerShellSingleQuotedToken -Value $ServerExe))
+    $CommandTokens.Add((ConvertTo-PowerShellSingleQuotedToken -Value $ConfigServerExe))
     foreach ($LlamaArgument in @($LlamaPreview.Arguments)) {
         $CommandTokens.Add((ConvertTo-PowerShellCommandToken -Value ([string]$LlamaArgument)))
     }
@@ -10854,12 +11494,23 @@ function Show-LaunchConfigGrid {
 
     $Items = Get-LaunchConfigItems
     $SelectedIndex = 0
-    # Keep the original one-screen set of settings, but split it into exactly
-    # two compact card pages so selection redraws stay within the terminal.
-    $CardsPerPage = [Math]::Ceiling($Items.Count / 2)
     $PageIndex = 0
 
     while ($true) {
+        $Width = Get-ConsoleWidth
+        $Height = Get-ConsoleHeight
+        $ColumnGap = 0
+        $MinTwoColumnCellWidth = 28
+        # Prefer readable model and draft names over an artificially narrow
+        # grid; on wide terminals each of the two cards can use 72 columns.
+        $MaxTwoColumnCellWidth = 72
+        $ColumnCount = if (($Width - $ColumnGap) -ge ($MinTwoColumnCellWidth * 2)) { 2 } else { 1 }
+        # Reserve enough lines below the grid for current value, choices,
+        # purpose, recommendation, and navigation.  Taller terminals
+        # automatically receive more cards per page.
+        $ReservedDetailRows = 20
+        $AvailableGridRows = [Math]::Max(3, [Math]::Floor(([Math]::Max(7, $Height - $ReservedDetailRows) - 1) / 2))
+        $CardsPerPage = [Math]::Max($ColumnCount * 3, $AvailableGridRows * $ColumnCount)
         $PageCount = [Math]::Ceiling($Items.Count / $CardsPerPage)
         $PageIndex = [Math]::Max(0, [Math]::Min($PageIndex, $PageCount - 1))
         $PageStart = $PageIndex * $CardsPerPage
@@ -10868,13 +11519,6 @@ function Show-LaunchConfigGrid {
         $SelectedIndex = [Math]::Max(0, [Math]::Min($SelectedIndex, $VisibleItems.Count - 1))
 
         Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle ((Format-BilingualText -ChineseText "方向鍵移動，Enter 或 Space 編輯；Tab／PgUp／PgDn 切換卡片頁。" -EnglishText "Arrow keys move; Enter or Space edits; Tab/PgUp/PgDn changes card pages.") + "  [$($PageIndex + 1)/$PageCount]")
-        $Width = Get-ConsoleWidth
-        $ColumnGap = 0
-        $MinTwoColumnCellWidth = 28
-        # Prefer readable model and draft names over an artificially narrow
-        # grid; on wide terminals each of the two cards can now use 72 columns.
-        $MaxTwoColumnCellWidth = 72
-        $ColumnCount = if (($Width - $ColumnGap) -ge ($MinTwoColumnCellWidth * 2)) { 2 } else { 1 }
         if ($ColumnCount -eq 2) {
             $CellWidth = [Math]::Max($MinTwoColumnCellWidth, [Math]::Min($MaxTwoColumnCellWidth, [Math]::Floor(($Width - $ColumnGap) / 2)))
         }
@@ -10883,7 +11527,6 @@ function Show-LaunchConfigGrid {
         }
         $RowCount = [Math]::Ceiling($VisibleItems.Count / $ColumnCount)
         $SelectedItem = $VisibleItems[$SelectedIndex]
-        $SelectedHelp = Get-LaunchConfigItemHelp -Config $Config -Item $SelectedItem
         $CellInnerWidth = $CellWidth - 2
 
         for ($Row = 0; $Row -lt $RowCount; $Row++) {
@@ -10913,8 +11556,12 @@ function Show-LaunchConfigGrid {
             for ($Column = 0; $Column -lt $ColumnCount; $Column++) {
                 $Card = $Cards[$Column]
                 $Line = if ($null -eq $Card) { " " * $CellInnerWidth } else { [string]$Card.Lines }
-                $Foreground = if ($null -ne $Card -and $Card.Selected) { "Black" } else { "Gray" }
-                $Background = if ($null -ne $Card -and $Card.Selected) { "DarkCyan" } else { "Black" }
+                # Windows Console can corrupt wide CJK characters when a
+                # partially written cell switches background colour.  The
+                # leading '>' already marks selection, so use a foreground
+                # highlight and retain the shared grid's stable background.
+                $Foreground = if ($null -ne $Card -and $Card.Selected) { "Cyan" } else { "Gray" }
+                $Background = "Black"
                 Write-Host $Line -NoNewline -ForegroundColor $Foreground -BackgroundColor $Background
                 Write-Host "|" -NoNewline -ForegroundColor Gray
             }
@@ -10929,6 +11576,8 @@ function Show-LaunchConfigGrid {
 
         Write-Host ""
         Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "目前選取" -EnglishText "Selected"), $SelectedItem.Label) -ForegroundColor Cyan
+        Show-LaunchConfigItemHelp -Config $Config -Item $SelectedItem
+        Write-Host ""
         Write-Host (Format-BilingualText -ChineseText "Enter／Space 編輯；Tab／PgUp／PgDn 切換頁；Esc 返回。" -EnglishText "Enter/Space edits; Tab/PgUp/PgDn changes pages; Esc returns.") -ForegroundColor Yellow
 
         $Key = Read-ConsoleKey
@@ -11149,6 +11798,10 @@ function Apply-LaunchSelection {
     )
 
     $script:ActiveLaunchConfig = $Config
+    Set-LlamaBinaryDirectory -Directory ([string]$Config.LlamaBinDirectory)
+    if (-not (Test-Path -LiteralPath $script:ServerExe -PathType Leaf)) {
+        throw (Format-BilingualText -ChineseText ("找不到設定所選的 llama-server.exe：{0}" -f $script:ServerExe) -EnglishText ("Cannot find the llama-server.exe selected by this profile: {0}" -f $script:ServerExe))
+    }
     $script:ModelPath = Resolve-ModelPath -Path $Config.ModelPath
     $script:Port = [int]$Config.Port
     $script:GpuLayers = [string]$Config.GpuLayers
@@ -13559,7 +14212,12 @@ try {
                 if ($TrackedBackgroundPid) {
                     Set-Content -LiteralPath $PidFile -Value $TrackedBackgroundPid -Encoding ASCII
                 }
-                if ($StartupState -eq 'Ready' -and
+                # Once a server is ready, keep it. Rebalancing by restarting
+                # makes large models pay the full disk/GPU load cost twice.
+                # OOM failures still take the adaptive retry path below.
+                $RetryReadyServerForBalance = $false
+                if ($RetryReadyServerForBalance -and
+                    $StartupState -eq 'Ready' -and
                     $AutoLaunchTuning.PSObject.Properties['SmartVramPlan'] -and
                     $AutoLaunchTuning.SmartVramPlan -and
                     $AutoLaunchTuning.SmartVramPlan.UsesFitManagedSplit -and
