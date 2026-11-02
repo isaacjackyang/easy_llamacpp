@@ -35,7 +35,7 @@ auto leaves distribution to llama.cpp. manual uses explicit --split-mode/--tenso
 
 .PARAMETER LoadMode
 Value passed to --load-mode.
-Allowed values are none, mmap, mlock, mmap+mlock, and dio.
+Allowed values are auto, none, mmap, mlock, mmap+mlock, and dio.
 Default is mmap. This replaces the deprecated --mmap/--no-mmap, --mlock,
 and --direct-io/--no-direct-io flags used by older llama.cpp builds.
 
@@ -193,7 +193,7 @@ param(
     [string]$GpuLayers = "auto",
     [ValidateSet("smart", "auto", "manual")]
     [string]$VramAllocationStrategy = "smart",
-    [ValidateSet("none", "mmap", "mlock", "mmap+mlock", "dio")]
+    [ValidateSet("auto", "none", "mmap", "mlock", "mmap+mlock", "dio")]
     [string]$LoadMode = "mmap",
     [int]$Threads = -1,
     [int]$ThreadsBatch = -1,
@@ -216,6 +216,7 @@ param(
     [switch]$NoPause,
     [switch]$ReturnNonZeroOnError,
     [switch]$WrapperControlsPause,
+    [string]$EncodedLlamaArgs = "",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$LlamaArgs
 )
@@ -227,6 +228,13 @@ $ConfiguredModelScanPaths = @()
 $ConfiguredModelScanPath = "C:\Users\USER\Documents\GitHub\easy_llamacpp\Model"
 
 $ErrorActionPreference = "Stop"
+if ($EncodedLlamaArgs) {
+    $DecodedJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EncodedLlamaArgs))
+    $DecodedArgs = ConvertFrom-Json -InputObject $DecodedJson
+    if ($null -eq $DecodedArgs -and $DecodedJson -match '^\s*\[\s*\]\s*$') { $DecodedArgs = @() }
+    if (-not $DecodedJson.TrimStart().StartsWith('[') -or @($DecodedArgs | Where-Object { $_ -isnot [string] }).Count -gt 0) { throw 'Invalid encoded llama arguments: expected a JSON string array.' }
+    $LlamaArgs = @($DecodedArgs) + @($LlamaArgs)
+}
 
 try {
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -965,9 +973,10 @@ function Get-ServerArgs {
             $Arguments.Add("--spec-draft-ngl")
             $Arguments.Add($RequestedMtpDraftGpuLayers)
         }
-        if (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftDevice)) {
+        $ResolvedMtpDraftDevice = Resolve-SpecDraftDeviceValue -RequestedDevice $RequestedMtpDraftDevice
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedMtpDraftDevice)) {
             $Arguments.Add("--spec-draft-device")
-            $Arguments.Add($RequestedMtpDraftDevice)
+            $Arguments.Add($ResolvedMtpDraftDevice)
         }
         if (-not [string]::IsNullOrWhiteSpace($RequestedMtpDraftCacheTypeK)) {
             $Arguments.Add("--spec-draft-type-k")
@@ -986,7 +995,7 @@ function Get-ServerArgs {
         }
     }
 
-    if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
+    if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--ctx-size|-c|--kv-unified-per-slot)(?:=|$)'))) {
         $Arguments.Add("--ctx-size")
         $Arguments.Add([string]$script:ManagedDefaultContextSize)
     }
@@ -1021,6 +1030,7 @@ function Get-ServerArgs {
         $Arguments.Add($Argument)
     }
 
+    Assert-LlamaLaunchCapabilities -Config ([ordered]@{ LlamaBinDirectory = $LlamaBinDirectory }) -Arguments @($Arguments)
     return @($Arguments)
 }
 
@@ -1059,7 +1069,8 @@ function Test-LlamaArgConflict {
         '^--jinja$'
     )
 
-    foreach ($Argument in $Arguments) {
+    foreach ($ArgumentFlag in @(Get-LlamaArgumentFlags -Arguments $Arguments)) {
+        $Argument = $ArgumentFlag.Token
         foreach ($Pattern in $ManagedPatterns) {
             if ($Argument -match $Pattern) {
                 throw "Do not pass managed llama-server arguments via trailing args: $Argument. Use the script parameters instead."
@@ -1094,54 +1105,23 @@ function Get-ArgumentSearchText {
         return " "
     }
 
-    return " " + (($Arguments | ForEach-Object { $_.Trim() }) -join " ") + " "
+    $SearchArguments = @($Arguments)
+    foreach ($ArgumentFlag in @(Get-LlamaArgumentFlags -Arguments $Arguments)) {
+        if ($ArgumentFlag.Flag -ne '--reasoning-budget-message') { continue }
+        if ($ArgumentFlag.Token.Contains('=')) { $SearchArguments[$ArgumentFlag.Index] = '--reasoning-budget-message=<text>' }
+        elseif (($ArgumentFlag.Index + 1) -lt $SearchArguments.Count) { $SearchArguments[$ArgumentFlag.Index + 1] = '<text>' }
+    }
+    return " " + (($SearchArguments | ForEach-Object { $_.Trim() }) -join " ") + " "
 }
 
 function Remove-LlamaParallelArgs {
-    param(
-        [string[]]$Arguments
-    )
-
-    $FilteredArguments = New-Object System.Collections.Generic.List[string]
-    if (-not $Arguments) {
-        return @()
-    }
-
-    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
-        $Argument = [string]$Arguments[$Index]
-        if ($Argument -match '^(?:--parallel|-np)(?:=.*)?$') {
-            if ($Argument -notmatch '=' -and ($Index + 1) -lt $Arguments.Count) {
-                $Index++
-            }
-            continue
-        }
-
-        $FilteredArguments.Add($Argument)
-    }
-
-    return $FilteredArguments.ToArray()
+    param([string[]]$Arguments)
+    return @(Remove-LlamaArgumentsByPatterns -Arguments $Arguments -Patterns @('^(?:--parallel|-np)(?:=.*)?$'))
 }
 
 function Get-LlamaParallelSlotsFromArgs {
-    param(
-        [string[]]$Arguments
-    )
-
-    if (-not $Arguments) {
-        return ""
-    }
-
-    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
-        $Argument = [string]$Arguments[$Index]
-        if ($Argument -match '^(?:--parallel|-np)=(.+)$') {
-            return [string]$Matches[1]
-        }
-        if ($Argument -match '^(?:--parallel|-np)$' -and ($Index + 1) -lt $Arguments.Count) {
-            return [string]$Arguments[$Index + 1]
-        }
-    }
-
-    return ""
+    param([string[]]$Arguments)
+    return Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^(?:--parallel|-np)(?:=(.+))?$')
 }
 
 function Resolve-RequestedParallelSlots {
@@ -1154,8 +1134,8 @@ function Resolve-RequestedParallelSlots {
     }
 
     [int]$ParsedSlots = 0
-    if (-not [int]::TryParse([string]$RequestedSlots, [ref]$ParsedSlots) -or $ParsedSlots -lt 1) {
-        throw "Slots must be blank or a positive integer."
+    if (-not [int]::TryParse([string]$RequestedSlots, [ref]$ParsedSlots) -or $ParsedSlots -lt -1 -or $ParsedSlots -eq 0) {
+        throw "Slots must be blank, -1 (auto), or a positive integer."
     }
 
     return $ParsedSlots
@@ -1220,6 +1200,69 @@ function Get-AcceleratorInventory {
     }
 
     return [object[]]$Inventory.ToArray()
+}
+
+# llama.cpp rejects a --spec-draft-device value it cannot resolve to a real
+# accelerator at argument-parsing time and exits before it ever binds the API
+# port, so a stale draft device (GPU asleep, driver reset, fewer CUDA devices
+# than the saved profile expects) silently kills the whole launch.  Dropping
+# that device instead makes the draft follow --device, which is llama.cpp's own
+# documented default, and keeps the server reachable.
+function Resolve-SpecDraftDeviceValue {
+    param(
+        [string]$RequestedDevice
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RequestedDevice)) {
+        return $null
+    }
+
+    $KnownIds = @()
+    foreach ($Device in @(Get-AcceleratorInventory)) {
+        $KnownIds += [string]$Device.Id
+    }
+
+    if ($KnownIds.Count -lt 1) {
+        return $RequestedDevice
+    }
+
+    $Kept = New-Object System.Collections.Generic.List[string]
+    $Dropped = New-Object System.Collections.Generic.List[string]
+    foreach ($Token in ($RequestedDevice -split ',')) {
+        $Candidate = [string]$Token.Trim()
+        if ([string]::IsNullOrWhiteSpace($Candidate)) {
+            continue
+        }
+
+        # Non-CUDA tokens (cpu/mps/vulkan) are outside this inventory check.
+        if ($Candidate -notmatch '(?i)^CUDA\d+$') {
+            $Kept.Add($Candidate)
+            continue
+        }
+
+        if ($KnownIds -contains $Candidate) {
+            $Kept.Add($Candidate)
+        }
+        else {
+            $Dropped.Add($Candidate)
+        }
+    }
+
+    if ($Dropped.Count -gt 0) {
+        Write-WrappedInfoLine `
+            -Prefix "[!] " `
+            -PrefixColor "Yellow" `
+            -TextColor "Yellow" `
+            -Text (Format-BilingualText `
+                -ChineseText ("已略過 draft 裝置 {0}：本次執行偵測不到該裝置（可用：{1}）。draft 將改隨 --device 配置。" -f ($Dropped -join ','), ($KnownIds -join ',')) `
+                -EnglishText ("Skipped draft device {0}: not present in this run (available: {1}). The draft now follows --device." -f ($Dropped -join ','), ($KnownIds -join ',')))
+    }
+
+    if ($Kept.Count -lt 1) {
+        return $null
+    }
+
+    return ($Kept -join ',')
 }
 
 function Get-AcceleratorSignature {
@@ -2706,7 +2749,7 @@ function Sync-LaunchConfigLoadModeFields {
         [System.Collections.IDictionary]$Config
     )
 
-    $ValidModes = @("none", "mmap", "mlock", "mmap+mlock", "dio")
+    $ValidModes = @("auto", "none", "mmap", "mlock", "mmap+mlock", "dio")
     $ResolvedMode = if ($Config.Contains("LoadMode") -and $ValidModes -contains ([string]$Config.LoadMode).Trim().ToLowerInvariant()) {
         ([string]$Config.LoadMode).Trim().ToLowerInvariant()
     }
@@ -4643,7 +4686,8 @@ function Test-LlamaArgumentProvided {
         [Parameter(Mandatory = $true)][string[]]$Patterns
     )
 
-    foreach ($Argument in @($Arguments)) {
+    foreach ($ArgumentFlag in @(Get-LlamaArgumentFlags -Arguments $Arguments)) {
+        $Argument = $ArgumentFlag.Token
         foreach ($Pattern in $Patterns) {
             if ([string]$Argument -match $Pattern) {
                 return $true
@@ -4664,8 +4708,9 @@ function Get-LlamaArgumentValue {
         return ""
     }
 
-    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
-        $Argument = [string]$Arguments[$Index]
+    foreach ($ArgumentFlag in @(Get-LlamaArgumentFlags -Arguments $Arguments)) {
+        $Index = $ArgumentFlag.Index
+        $Argument = $ArgumentFlag.Token
         foreach ($Pattern in $Patterns) {
             $Match = [regex]::Match($Argument, $Pattern)
             if (-not $Match.Success) {
@@ -5029,26 +5074,32 @@ function Test-MtpDefaultsEnabled {
         [AllowNull()][string[]]$Arguments
     )
 
-    if (-not (Test-IsMtpCapableModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)) {
-        return $false
-    }
-
     $ExplicitSpecType = (Get-LlamaArgumentValue -Arguments $Arguments -Patterns @('^--spec-type(?:=(.+))?$')).Trim()
-    if ([string]::IsNullOrWhiteSpace($ExplicitSpecType)) {
-        return $true
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitSpecType)) {
+        $SpecTypes = @(
+            $ExplicitSpecType -split ',' |
+                ForEach-Object { $_.Trim().ToLowerInvariant() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+
+        # An explicit "none" is both an opt-out and a fast path: avoid
+        # reading a large GGUF metadata table just to confirm MTP is disabled.
+        if ($SpecTypes -contains "none") {
+            return $false
+        }
+
+        if (-not (Test-IsMtpCapableModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)) {
+            return $false
+        }
+
+        if ($SpecTypes.Count -eq 0) {
+            return $true
+        }
+
+        return ($SpecTypes -contains "draft-mtp")
     }
 
-    $SpecTypes = @(
-        $ExplicitSpecType -split ',' |
-            ForEach-Object { $_.Trim().ToLowerInvariant() } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    )
-
-    if ($SpecTypes.Count -eq 0) {
-        return $true
-    }
-
-    return ($SpecTypes -contains "draft-mtp")
+    return (Test-IsMtpCapableModel -ModelEntry $ModelEntry -ResolvedModelPath $ResolvedModelPath)
 }
 function Test-UsesMtpSpeculativeDecoding {
     param(
@@ -5344,40 +5395,227 @@ function Split-ArgumentLine {
 }
 
 function Remove-LlamaArgumentsByPatterns {
-    param(
-        [string[]]$Arguments,
-        [string[]]$Patterns
-    )
-
-    if (-not $Arguments) {
-        return @()
-    }
-
+    param([string[]]$Arguments, [string[]]$Patterns)
+    $Flags = @{}
+    foreach ($ArgumentFlag in @(Get-LlamaArgumentFlags -Arguments $Arguments)) { $Flags[$ArgumentFlag.Index] = $ArgumentFlag }
     $FilteredArguments = New-Object System.Collections.Generic.List[string]
     for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
         $Argument = [string]$Arguments[$Index]
         $ShouldRemove = $false
-        foreach ($Pattern in $Patterns) {
-            if ($Argument -match $Pattern) {
-                $ShouldRemove = $true
-                break
+        if ($Flags.ContainsKey($Index)) {
+            foreach ($Pattern in $Patterns) {
+                if ($Argument -match $Pattern) { $ShouldRemove = $true; break }
             }
         }
-
         if ($ShouldRemove) {
-            if ($Argument -notmatch '=' -and ($Index + 1) -lt $Arguments.Count) {
-                $NextToken = [string]$Arguments[$Index + 1]
-                if ($NextToken -notmatch '^-') {
-                    $Index++
-                }
-            }
+            if (-not $Argument.Contains('=') -and $Flags[$Index].TakesValue) { $Index++ }
             continue
         }
-
         $FilteredArguments.Add($Argument)
     }
-
     return $FilteredArguments.ToArray()
+}
+
+function Get-ExtendedLaunchOptions {
+    # One schema drives menu, parsing, validation, persistence and export.
+    return @(
+        [pscustomobject]@{ Key='Seed'; Flag='--seed'; Aliases=@('-s'); Label='隨機種子 / Seed'; Kind='seed'; MemoryRelevant=$false; Hint='-1 隨機，或 0–4294967295；固定種子不保證跨硬體完全一致 / -1 random or uint32; reproducibility depends on backend.' }
+        [pscustomobject]@{ Key='RepeatPenalty'; Flag='--repeat-penalty'; Aliases=@(); Label='重複懲罰 / Repeat Penalty'; Kind='positiveFloat'; MemoryRelevant=$false; Hint='大於 0 的有限數值；1 停用；過高可能影響品質 / finite positive value; 1 disables.' }
+        [pscustomobject]@{ Key='FrequencyPenalty'; Flag='--frequency-penalty'; Aliases=@(); Label='頻率懲罰 / Frequency Penalty'; Kind='float'; MemoryRelevant=$false; Hint='有限數值；0 停用，正值降低高頻 token / finite value; 0 disables, positive values penalize frequent tokens.' }
+        [pscustomobject]@{ Key='RepeatLastN'; Flag='--repeat-last-n'; Aliases=@(); Label='重複檢查範圍 / Repeat Last N'; Kind='zero'; Hint='最近 N 個 token；0 停用 / last N tokens for penalties; 0 disables.' }
+        [pscustomobject]@{ Key='ReasoningFormat'; Flag='--reasoning-format'; Aliases=@(); Label='推理回傳格式 / Reasoning Format'; Kind='enum'; Values=@('auto','none','deepseek','deepseek-legacy'); MemoryRelevant=$false; Hint='none 保留原始文字；deepseek 分離 reasoning_content；legacy 也保留 think 標籤 / controls parsing, not whether the model thinks.' }
+        [pscustomobject]@{ Key='ReasoningBudgetMessage'; Flag='--reasoning-budget-message'; Aliases=@(); Label='預算耗盡提示 / Budget Message'; Kind='text'; MemoryRelevant=$false; Hint='思考預算耗盡時插入的單行文字；留空不設定 / single-line text injected when the reasoning budget is exhausted.' }
+        [pscustomobject]@{ Key='CachePrompt'; Flag='--cache-prompt'; NegativeFlag='--no-cache-prompt'; Aliases=@(); NegativeAliases=@(); Label='提示詞快取 / Cache Prompt'; Kind='switch'; Hint='控制提示詞快取；留空沿用 server / enable or disable prompt caching; blank keeps defaults.' }
+        [pscustomobject]@{ Key='CacheReuse'; Flag='--cache-reuse'; Aliases=@(); Label='快取重用門檻 / Cache Reuse'; Kind='zero'; Hint='嘗試 KV shifting 重用的最小片段 token 數；0 停用，需要提示詞快取 / minimum reusable chunk; 0 disables, requires prompt caching.' }
+        [pscustomobject]@{ Key='ContextShift'; Flag='--context-shift'; NegativeFlag='--no-context-shift'; Aliases=@(); NegativeAliases=@(); Label='上下文位移 / Context Shift'; Kind='switch'; Hint='長對話接近上限時位移上下文；模型須支援，可能捨棄較早內容 / shift context when full; model support required, older content may be discarded.' }
+        [pscustomobject]@{ Key='SpecDraftNMin'; Flag='--spec-draft-n-min'; Aliases=@(); Label='最小草稿長度 / Draft Min'; Kind='zero'; Hint='最小草稿 token 數；0 使用 server 預設 / minimum draft tokens; 0 is server default.' }
+        [pscustomobject]@{ Key='SpecDraftUBatch'; Flag='--spec-draft-n-ubatch'; Aliases=@(); Label='草稿實體批次 / Draft UBatch'; Kind='zero'; Hint='草稿批次上限；0 沿用主模型 UBatch，降低可省 VRAM / draft physical batch; 0 follows main UBatch, lower to spare VRAM.' }
+        [pscustomobject]@{ Key='SpecDraftSampling'; Flag='--spec-draft-sampling'; Aliases=@(); Label='草稿取樣 / Draft Sampling'; Kind='enum'; Values=@('greedy','probabilistic'); Hint='greedy 取最大機率；probabilistic 取樣後由主模型驗證 / argmax or probabilistic sampling with target verification.' }
+        [pscustomobject]@{ Key='SpecDraftBackendSampling'; Flag='--spec-draft-backend-sampling'; NegativeFlag='--no-spec-draft-backend-sampling'; Aliases=@(); NegativeAliases=@(); Label='草稿後端取樣 / Backend Sampling'; Kind='switch'; Hint='on/off 明確控制草稿後端取樣；留空沿用 server / explicitly enable or disable draft backend sampling; blank keeps defaults.' }
+        [pscustomobject]@{ Key='KvUnified'; Flag='--kv-unified'; NegativeFlag='--no-kv-unified'; Aliases=@('-kvu'); NegativeAliases=@('-no-kvu'); Label='共享 KV / Unified KV'; Kind='switch'; Hint='使用跨槽位共享 KV 池；留空沿用 server / shared KV pool across slots; blank keeps defaults.' }
+        [pscustomobject]@{ Key='KvUnifiedPerSlot'; Flag='--kv-unified-per-slot'; Aliases=@(); Label='每槽位上下文 / Context Per Slot'; Kind='positive'; Hint='每槽位 context 上限；Context 留空時交由 server 決定共享池大小 / per-slot context limit; leave Context blank for server pool sizing.' }
+        [pscustomobject]@{ Key='CacheIdleSlots'; Flag='--cache-idle-slots'; NegativeFlag='--no-cache-idle-slots'; Aliases=@(); NegativeAliases=@(); Label='閒置槽位快取 / Cache Idle Slots'; Kind='switch'; Hint='將閒置槽位存入提示詞快取；需要非零 Cache RAM / save idle slots to prompt cache; requires nonzero Cache RAM.' }
+        [pscustomobject]@{ Key='SleepIdleSeconds'; Flag='--sleep-idle-seconds'; Aliases=@(); Label='閒置休眠秒數 / Sleep Idle Seconds'; Kind='sleep'; Hint='正整數秒數；-1 停用，0 無效；收到請求會重新載入 / positive seconds; -1 disables, 0 invalid; requests reload the model.' }
+        [pscustomobject]@{ Key='CpuMoe'; Flag='--cpu-moe'; Aliases=@('-cmoe'); Label='CPU MoE'; Kind='toggle'; Hint='on: 全部專家留在 CPU / keep all experts on CPU; off: omit flag.' }
+        [pscustomobject]@{ Key='NCpuMoe'; Flag='--n-cpu-moe'; Aliases=@('-ncmoe'); Label='CPU MoE 層數 / Layers'; Kind='zero'; Hint='前 N 層的 MoE 專家放 CPU；0 停用 / first N layers on CPU; 0 disables.' }
+        [pscustomobject]@{ Key='MoeCacheMiB'; Flag='--moe-cache-mib'; Aliases=@(); Label='MoE GPU 快取 / Cache MiB'; Kind='zero'; Hint='CPU 專家的 GPU 快取總量 MiB；0 停用，多卡分攤 / GPU cache for CPU experts; 0 disables, shared across GPUs.' }
+        [pscustomobject]@{ Key='NCpuFfn'; Flag='--n-cpu-ffn'; Aliases=@('-ncffn'); Label='CPU FFN 層數 / Layers'; Kind='zero'; Hint='Dense 模型前 N 層 FFN 放 CPU；MoE 請用 CPU MoE / dense FFN layers on CPU; use CPU MoE for experts.' }
+        [pscustomobject]@{ Key='BatchSize'; Flag='--batch-size'; Aliases=@('-b'); Label='邏輯批次 / Batch Size'; Kind='positive'; Hint='提示詞邏輯批次上限 / logical prompt batch maximum; server default 2048.' }
+        [pscustomobject]@{ Key='UBatchSize'; Flag='--ubatch-size'; Aliases=@('-ub'); Label='實體批次 / UBatch Size'; Kind='positive'; Hint='實體批次上限；降低可節省記憶體 / physical batch maximum; lower to spare memory; server default 512.' }
+        [pscustomobject]@{ Key='FitTarget'; Flag='--fit-target'; Aliases=@('-fitt'); Label='顯存保留 / Fit Target MiB'; Kind='list'; Hint='每張 GPU 保留 MiB；單值套用全部，或逗號分隔 / reserve MiB per GPU, one value or comma-separated list.' }
+        [pscustomobject]@{ Key='FitContext'; Flag='--fit-ctx'; Aliases=@('-fitc'); Label='Fit 最小上下文 / Min Context'; Kind='positive'; Hint='僅限制 fit 可選的最小 context；明確指定 context 時不會取代它 / minimum context for fit; does not override explicit context.' }
+        [pscustomobject]@{ Key='CacheRam'; Flag='--cache-ram'; Aliases=@('-cram'); Label='提示詞 RAM 快取 / Cache MiB'; Kind='minusOne'; Hint='MiB；-1 不限、0 停用 / MiB; -1 unlimited, 0 disables. Blank keeps launcher tuning.' }
+    )
+}
+
+function Get-LlamaServerCapabilities {
+    param([string]$Directory)
+    $Executable = Resolve-LlamaServerExecutablePath -Directory $Directory
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw "Cannot inspect llama-server.exe: $Executable" }
+    $File = Get-Item -LiteralPath $Executable
+    $Key = "$($File.FullName)|$($File.Length)|$($File.LastWriteTimeUtc.Ticks)"
+    if (-not $script:LlamaCapabilityCache) { $script:LlamaCapabilityCache = @{} }
+    if ($script:LlamaCapabilityCache.ContainsKey($Key)) { return $script:LlamaCapabilityCache[$Key] }
+    $Process = New-Object System.Diagnostics.Process
+    $Process.StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $Process.StartInfo.FileName = $Executable
+    $Process.StartInfo.Arguments = '--help'
+    $Process.StartInfo.UseShellExecute = $false
+    $Process.StartInfo.CreateNoWindow = $true
+    $Process.StartInfo.RedirectStandardOutput = $true
+    $Process.StartInfo.RedirectStandardError = $true
+    try {
+        [void]$Process.Start()
+        $Stdout = $Process.StandardOutput.ReadToEndAsync()
+        $Stderr = $Process.StandardError.ReadToEndAsync()
+        if (-not $Process.WaitForExit(15000)) { $Process.Kill(); throw "llama-server --help timed out: $Executable" }
+        $HelpText = $Stdout.Result + "`n" + $Stderr.Result
+        if ($Process.ExitCode -ne 0 -or $HelpText -notmatch '--help') { throw "Cannot read llama-server --help: $Executable" }
+        $Flags = @{}
+        foreach ($Line in ($HelpText -split "`n")) {
+            if ($Line -match '^\s*-') {
+                foreach ($Match in [regex]::Matches($Line, '(?<![\w-])--?[a-zA-Z][a-zA-Z0-9-]*')) { $Flags[$Match.Value] = $true }
+            }
+        }
+        $Result = [pscustomobject]@{ Executable=$Executable; Flags=$Flags; HelpText=$HelpText }
+        $script:LlamaCapabilityCache[$Key] = $Result
+        return $Result
+    }
+    finally { $Process.Dispose() }
+}
+
+function Get-LaunchOptionFlag {
+    param([string]$Key)
+    $Option = Get-ExtendedLaunchOptions | Where-Object Key -eq $Key | Select-Object -First 1
+    if ($Option) { return $Option.Flag }
+    switch ($Key) {
+        'CacheTypeK' { return '--cache-type-k' }
+        'CacheTypeV' { return '--cache-type-v' }
+        'LazyMode' { return '--lazy-mode' }
+        'ContextCheckpoints' { return '--ctx-checkpoints' }
+        'CheckpointMinStep' { return '--checkpoint-min-step' }
+        'SpecType' { return '--spec-type' }
+    }
+}
+
+function Assert-ExtendedLaunchValue {
+    param($Option, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    if ($Option.Kind -eq 'text') {
+        if ($Value -match '[\r\n\x00]') { throw "$($Option.Key) must be a single line without NUL characters." }
+        return
+    }
+    if ($Option.Kind -eq 'seed') {
+        [long]$SeedValue = 0
+        if ($Value -notmatch '^-?\d+$' -or -not [long]::TryParse($Value, [ref]$SeedValue) -or $SeedValue -lt -1 -or $SeedValue -gt [uint32]::MaxValue) { throw 'Seed must be -1 or an unsigned 32-bit integer.' }
+        return
+    }
+    if ($Option.Kind -in @('float','positiveFloat')) {
+        [single]$FloatValue = 0
+        if (-not [single]::TryParse($Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$FloatValue) -or [single]::IsNaN($FloatValue) -or [single]::IsInfinity($FloatValue)) { throw "Invalid $($Option.Key): use a finite number with a decimal point." }
+        if ($Option.Kind -eq 'positiveFloat' -and ($FloatValue -le 0 -or [single]::IsInfinity([single](1.0 / $FloatValue)))) { throw 'Repeat penalty must be finite and greater than zero, with a finite reciprocal.' }
+        return
+    }
+    if ($Option.Kind -in @('toggle','switch')) {
+        if ($Value -notin @('on','off')) { throw "Invalid $($Option.Key): $Value" }
+        return
+    }
+    if ($Option.Kind -eq 'enum') {
+        if ($Option.Values -notcontains $Value) { throw "Invalid $($Option.Key): $Value. $($Option.Hint)" }
+        return
+    }
+    $Parts = if ($Option.Kind -eq 'list') { $Value -split ',', 0, 'SimpleMatch' } else { @($Value) }
+    foreach ($Part in $Parts) {
+        [int]$Number = 0
+        $Minimum = if ($Option.Kind -eq 'positive') { 1 } elseif ($Option.Kind -in @('minusOne','sleep')) { -1 } else { 0 }
+        if ($Part -notmatch '^-?\d+$' -or -not [int]::TryParse($Part, [ref]$Number) -or $Number -lt $Minimum -or ($Option.Kind -eq 'sleep' -and $Number -eq 0)) {
+            throw "Invalid $($Option.Key): $Value. $($Option.Hint)"
+        }
+    }
+}
+
+function Get-LlamaArgumentFlags {
+    param([string[]]$Arguments)
+    $ValueFlags = @((Get-ExtendedLaunchOptions | Where-Object { $_.Kind -notin @('toggle','switch') } | ForEach-Object { $_.Flag; $_.Aliases })) + @(
+        '-m','--model','--port','--host','--api-key','--ctx-size','-c','--predict','--n-predict','-n','--parallel','-np',
+        '--temp','--temperature','--top-k','--top-p','--min-p','--presence-penalty','--device','-dev','--split-mode','-sm','--tensor-split','-ts','--fit','-fit','--load-mode','-lm','--flash-attn','-fa',
+        '--threads','-t','--threads-batch','-tb','--mmproj','--chat-template','--chat-template-file','--chat-template-kwargs','--reasoning','-rea','--reasoning-effort','--reasoning-budget',
+        '--cache-type-k','-ctk','--cache-type-v','-ctv','--lazy-mode','-lzm','--ctx-checkpoints','--swa-checkpoints','-ctxcp','--checkpoint-min-step','-cms',
+        '--spec-type','--spec-draft-n-max','--spec-draft-model','-md','--model-draft','--spec-draft-ngl','--gpu-layers-draft','--n-gpu-layers-draft','-ngld','--spec-draft-device','--device-draft','-devd','--spec-draft-type-k','--cache-type-k-draft','-ctkd','--spec-draft-type-v','--cache-type-v-draft','-ctvd',
+        '--reverse-prompt','-r','--grammar','--grammar-file','--json-schema','--json-schema-file','--log-file',
+        '--draft','--draft-n','--draft-max','--draft-min','--draft-n-min','--spec-ngram-size-n','--spec-ngram-size-m','--spec-ngram-min-hits'
+    )
+    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
+        $Argument = [string]$Arguments[$Index]
+        if ($Argument -notmatch '^-') { continue }
+        $Flag = ($Argument -split '=', 2)[0]
+        [pscustomobject]@{ Flag=$Flag; Index=$Index; Token=$Argument; TakesValue=($ValueFlags -contains $Flag) }
+        if (-not $Argument.Contains('=') -and $ValueFlags -contains $Flag) { $Index++ }
+    }
+}
+
+function Assert-LlamaRemovedArguments {
+    param([string[]]$Arguments, $Capabilities = $null)
+    $Replacements = @{
+        '--draft' = '--spec-draft-n-max or --spec-ngram-mod-n-max'
+        '--draft-n' = '--spec-draft-n-max or --spec-ngram-mod-n-max'
+        '--draft-max' = '--spec-draft-n-max or --spec-ngram-mod-n-max'
+        '--draft-min' = '--spec-draft-n-min or --spec-ngram-mod-n-min'
+        '--draft-n-min' = '--spec-draft-n-min or --spec-ngram-mod-n-min'
+        '--spec-ngram-size-n' = '--spec-ngram-<type>-size-n or --spec-ngram-mod-n-match'
+        '--spec-ngram-size-m' = '--spec-ngram-<type>-size-m'
+        '--spec-ngram-min-hits' = '--spec-ngram-<type>-min-hits'
+    }
+    foreach ($ArgumentFlag in @(Get-LlamaArgumentFlags -Arguments $Arguments)) {
+        $Flag = $ArgumentFlag.Flag
+        if (-not $Replacements.ContainsKey($Flag)) { continue }
+        if ($Capabilities -and $Capabilities.Flags.ContainsKey($Flag)) {
+            # Legacy binaries may still implement this option. Modern help also
+            # lists removed flags, so examine the option's own description.
+            $Lines = @($Capabilities.HelpText -split "`n")
+            $Description = ''
+            for ($Index = 0; $Index -lt $Lines.Count; $Index++) {
+                if ($Lines[$Index] -match ('^\s*(?=-).*?(?<![\w-])' + [regex]::Escape($Flag) + '(?![\w-])')) {
+                    $Description = $Lines[$Index]
+                    for ($Next = $Index + 1; $Next -lt $Lines.Count -and $Lines[$Next] -notmatch '^\s*-'; $Next++) { $Description += ' ' + $Lines[$Next] }
+                    break
+                }
+            }
+            if ($Description -and $Description -notmatch '(?i)removed') { continue }
+        }
+        throw "已移除參數 / Removed argument $Flag. 請改用 / Use $($Replacements[$Flag]); choose the replacement matching your speculative type."
+    }
+}
+
+function Assert-LlamaLaunchCapabilities {
+    param([System.Collections.IDictionary]$Config, [string[]]$Arguments)
+    if (-not $Config.Contains('LlamaBinDirectory')) {
+        Assert-LlamaRemovedArguments -Arguments $Arguments
+        return
+    }
+    $Capabilities = Get-LlamaServerCapabilities -Directory ([string]$Config.LlamaBinDirectory)
+    Assert-LlamaRemovedArguments -Arguments $Arguments -Capabilities $Capabilities
+    $ManagedFlags = @((Get-ExtendedLaunchOptions | ForEach-Object { $_.Flag; $_.Aliases; if ($_.Kind -eq 'switch') { $_.NegativeFlag; $_.NegativeAliases } })) + @('--cache-type-k','--cache-type-v','--lazy-mode','--ctx-checkpoints','--checkpoint-min-step','--spec-type','--load-mode','--spec-draft-model','--spec-draft-ngl','--spec-draft-device','--spec-draft-type-k','--spec-draft-type-v','--spec-draft-n-max','--reasoning','--reasoning-effort','--reasoning-budget','--reasoning-preserve','--no-reasoning-preserve')
+    $ArgumentFlags = @(Get-LlamaArgumentFlags -Arguments $Arguments)
+    foreach ($ArgumentFlag in $ArgumentFlags) {
+        $Flag = $ArgumentFlag.Flag
+        if ($ManagedFlags -contains $Flag -and -not $Capabilities.Flags.ContainsKey($Flag)) {
+            throw "目前版本不支援 / Selected binary does not support $Flag : $($Capabilities.Executable)"
+        }
+    }
+    $SplitArgument = $ArgumentFlags | Where-Object { $_.Flag -in @('--split-mode','-sm') } | Select-Object -First 1
+    $SplitMode = if ($SplitArgument) { if ($SplitArgument.Token.Contains('=')) { ($SplitArgument.Token -split '=',2)[1] } else { $Arguments[$SplitArgument.Index+1] } } else { '' }
+    if ($SplitMode -eq 'tensor' -and $Capabilities.HelpText -notmatch '(?m)^.*--split-mode.*\btensor\b') {
+        throw 'Selected binary does not support --split-mode tensor.'
+    }
+    $SpecArgument = $ArgumentFlags | Where-Object Flag -eq '--spec-type' | Select-Object -First 1
+    $SpecType = if ($SpecArgument) { if ($SpecArgument.Token.Contains('=')) { ($SpecArgument.Token -split '=',2)[1] } else { $Arguments[$SpecArgument.Index+1] } } else { '' }
+    if ($SpecType) {
+        $SpecLine = ($Capabilities.HelpText -split "`n" | Where-Object { $_ -match '^\s*--spec-type\s' }) -join ' '
+        foreach ($Type in ($SpecType -split ',')) {
+            if ($SpecLine -notmatch ('(?<![\w-])' + [regex]::Escape($Type) + '(?![\w-])')) { throw "Selected binary does not support --spec-type $Type." }
+        }
+    }
 }
 
 function Convert-ForwardArgsToMenuConfig {
@@ -5386,6 +5624,11 @@ function Convert-ForwardArgsToMenuConfig {
     )
 
     $Config = [ordered]@{
+        CacheTypeK = ""
+        CacheTypeV = ""
+        LazyMode = ""
+        ContextCheckpoints = ""
+        CheckpointMinStep = ""
         ContextSize     = ""
         MaxOutputTokens = [string]$script:ManagedDefaultMaxOutputTokens
         Temperature     = ""
@@ -5419,6 +5662,8 @@ function Convert-ForwardArgsToMenuConfig {
         ExtraArgs       = ""
     }
 
+    foreach ($Option in Get-ExtendedLaunchOptions) { $Config[$Option.Key] = '' }
+
     if (-not $Arguments) {
         return $Config
     }
@@ -5428,7 +5673,33 @@ function Convert-ForwardArgsToMenuConfig {
     for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
         $Argument = $Arguments[$Index]
 
+        $ExtendedOption = Get-ExtendedLaunchOptions | Where-Object { (@($_.Flag) + @($_.Aliases) + @($_.NegativeFlag) + @($_.NegativeAliases)) -contains (($Argument -split '=', 2)[0]) } | Select-Object -First 1
+        if ($ExtendedOption) {
+            if ($ExtendedOption.Kind -in @('toggle','switch')) {
+                $Config[$ExtendedOption.Key] = if ((@($ExtendedOption.NegativeFlag) + @($ExtendedOption.NegativeAliases)) -contains $Argument) { 'off' } else { 'on' }
+            }
+            elseif ($Argument.Contains('=')) { $Config[$ExtendedOption.Key] = ($Argument -split '=', 2)[1] }
+            elseif (($Index + 1) -lt $Arguments.Count) { $Config[$ExtendedOption.Key] = $Arguments[++$Index] }
+            else { throw "Missing value for $Argument" }
+            continue
+        }
+
         switch -Regex ($Argument) {
+            '^(?:--cache-type-k|-ctk)(?:=(.+))?$' {
+                $Config.CacheTypeK = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--cache-type-v|-ctv)(?:=(.+))?$' {
+                $Config.CacheTypeV = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--lazy-mode|-lzm)(?:=(.+))?$' {
+                $Config.LazyMode = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--ctx-checkpoints|-ctxcp|--swa-checkpoints)(?:=(.+))?$' {
+                $Config.ContextCheckpoints = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
+            '^(?:--checkpoint-min-step|-cms)(?:=(.+))?$' {
+                $Config.CheckpointMinStep = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
+            }
             '^--ctx-size(?:=(.+))?$' {
                 $Config.ContextSize = if ($Matches[1]) { $Matches[1] } else { $Arguments[++$Index] }
             }
@@ -5578,7 +5849,7 @@ function Convert-ForwardArgsToMenuConfig {
         }
     }
 
-    $Config.ExtraArgs = ($Remaining -join " ")
+    $Config.ExtraArgs = ConvertTo-ArgumentString -Arguments $Remaining.ToArray()
     return $Config
 }
 
@@ -5587,7 +5858,54 @@ function Convert-MenuConfigToForwardArgs {
         [System.Collections.IDictionary]$Config
     )
 
+    Assert-LlamaLaunchCapabilities -Config $Config -Arguments @(Split-ArgumentLine -Line ([string]$Config.ExtraArgs))
     $Arguments = New-Object System.Collections.Generic.List[string]
+
+    foreach ($Option in Get-ExtendedLaunchOptions) {
+        $Value = if ($Option.Kind -eq 'text') { [string]$Config[$Option.Key] } else { ([string]$Config[$Option.Key]).Trim() }
+        Assert-ExtendedLaunchValue -Option $Option -Value $Value
+        if ($Value -ne '' -and -not ($Option.Kind -eq 'toggle' -and $Value -eq 'off')) {
+            if ($Option.Kind -eq 'switch' -and $Value -eq 'off') { $Arguments.Add($Option.NegativeFlag) }
+            else { $Arguments.Add($Option.Flag) }
+            if ($Option.Kind -notin @('toggle','switch')) { $Arguments.Add($Value) }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ContextSize)) {
+        [int]$Context = 0
+        if (-not [int]::TryParse([string]$Config.ContextSize, [ref]$Context) -or $Context -lt 0) { throw 'Context must be blank, 0 (full model context), or a positive integer.' }
+    }
+    [void](Resolve-RequestedParallelSlots -RequestedSlots ([string]$Config.Slots))
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.CacheTypeK)) {
+        $Value = ([string]$Config.CacheTypeK).Trim()
+        if (@("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") -notcontains $Value) { throw "Invalid CacheTypeK: $Value" }
+        $Arguments.Add("--cache-type-k")
+        $Arguments.Add($Value)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.CacheTypeV)) {
+        $Value = ([string]$Config.CacheTypeV).Trim()
+        if (@("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") -notcontains $Value) { throw "Invalid CacheTypeV: $Value" }
+        $Arguments.Add("--cache-type-v")
+        $Arguments.Add($Value)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.LazyMode)) {
+        $Value = ([string]$Config.LazyMode).Trim()
+        if (@("", "auto", "on", "off") -notcontains $Value) { throw "Invalid LazyMode: $Value" }
+        $Arguments.Add("--lazy-mode")
+        $Arguments.Add($Value)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ContextCheckpoints)) {
+        $Value = ([string]$Config.ContextCheckpoints).Trim()
+        if ($Value -notmatch '^\d+$' -or $Value.Length -gt 10 -or [long]$Value -gt [int]::MaxValue) { throw "Invalid ContextCheckpoints: $Value" }
+        $Arguments.Add("--ctx-checkpoints")
+        $Arguments.Add($Value)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.CheckpointMinStep)) {
+        $Value = ([string]$Config.CheckpointMinStep).Trim()
+        if ($Value -notmatch '^\d+$' -or $Value.Length -gt 10 -or [long]$Value -gt [int]::MaxValue) { throw "Invalid CheckpointMinStep: $Value" }
+        $Arguments.Add("--checkpoint-min-step")
+        $Arguments.Add($Value)
+    }
 
     if ($Config.ContextSize) {
         $Arguments.Add("--ctx-size")
@@ -5670,7 +5988,7 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add([string]$Config.Fit)
     }
 
-    $EffectiveLoadMode = if ($Config.Contains("LoadMode") -and @("none", "mmap", "mlock", "mmap+mlock", "dio") -contains ([string]$Config.LoadMode).Trim().ToLowerInvariant()) {
+    $EffectiveLoadMode = if ($Config.Contains("LoadMode") -and @("auto", "none", "mmap", "mlock", "mmap+mlock", "dio") -contains ([string]$Config.LoadMode).Trim().ToLowerInvariant()) {
         ([string]$Config.LoadMode).Trim().ToLowerInvariant()
     }
     else {
@@ -5735,6 +6053,25 @@ function Convert-MenuConfigToForwardArgs {
             '^(?:--spec-draft-type-k|--cache-type-k-draft|-ctkd)(?:=|$)',
             '^(?:--spec-draft-type-v|--cache-type-v-draft|-ctvd)(?:=|$)'
         ))
+    # Older profiles may still store these options in ExtraArgs. An explicit
+    # dedicated field wins; a blank field keeps the legacy raw option intact.
+    $ManagedOptionPatterns = @{
+        CacheTypeK = '^(?:--cache-type-k|-ctk)(?:=|$)'
+        CacheTypeV = '^(?:--cache-type-v|-ctv)(?:=|$)'
+        LazyMode = '^(?:--lazy-mode|-lzm)(?:=|$)'
+        ContextCheckpoints = '^(?:--ctx-checkpoints|--swa-checkpoints|-ctxcp)(?:=|$)'
+        CheckpointMinStep = '^(?:--checkpoint-min-step|-cms)(?:=|$)'
+    }
+    foreach ($Option in Get-ExtendedLaunchOptions) {
+        $Names = @($Option.Flag) + @($Option.Aliases)
+        if ($Option.Kind -eq 'switch') { $Names += @($Option.NegativeFlag) + @($Option.NegativeAliases) }
+        $ManagedOptionPatterns[$Option.Key] = '^(?:' + (($Names | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')(?:=|$)'
+    }
+    foreach ($Key in $ManagedOptionPatterns.Keys) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Config[$Key])) {
+            $ExtraArguments = @(Remove-LlamaArgumentsByPatterns -Arguments $ExtraArguments -Patterns @($ManagedOptionPatterns[$Key]))
+        }
+    }
     $Config.ExtraArgs = ConvertTo-ArgumentString -Arguments $ExtraArguments
     $ModelUsesMtpDefaults = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     $SelectedSpecType = ([string]$Config.SpecType).Trim().ToLowerInvariant()
@@ -5767,9 +6104,10 @@ function Convert-MenuConfigToForwardArgs {
             $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { if ($SelectedSpecType -eq "draft-mtp") { Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) } else { "3" } } else { [string]$Config.SpecDraftNMax }))
             $Arguments.Add("--spec-draft-ngl")
             $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftGpuLayers)) { "auto" } else { [string]$Config.SpecDraftGpuLayers }))
-            if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftDevice)) {
+            $ResolvedConfigDraftDevice = Resolve-SpecDraftDeviceValue -RequestedDevice ([string]$Config.SpecDraftDevice)
+            if (-not [string]::IsNullOrWhiteSpace($ResolvedConfigDraftDevice)) {
                 $Arguments.Add("--spec-draft-device")
-                $Arguments.Add([string]$Config.SpecDraftDevice)
+                $Arguments.Add($ResolvedConfigDraftDevice)
             }
             if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeK)) {
                 $Arguments.Add("--spec-draft-type-k")
@@ -5789,9 +6127,10 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftNMax)) { Get-MtpDefaultSpecDraftNMax -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath) } else { [string]$Config.SpecDraftNMax }))
         $Arguments.Add("--spec-draft-ngl")
         $Arguments.Add($(if ([string]::IsNullOrWhiteSpace([string]$Config.SpecDraftGpuLayers)) { "auto" } else { [string]$Config.SpecDraftGpuLayers }))
-        if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftDevice)) {
+        $ResolvedConfigDraftDevice = Resolve-SpecDraftDeviceValue -RequestedDevice ([string]$Config.SpecDraftDevice)
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedConfigDraftDevice)) {
             $Arguments.Add("--spec-draft-device")
-            $Arguments.Add([string]$Config.SpecDraftDevice)
+            $Arguments.Add($ResolvedConfigDraftDevice)
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$Config.SpecDraftCacheTypeK)) {
             $Arguments.Add("--spec-draft-type-k")
@@ -5812,6 +6151,7 @@ function Convert-MenuConfigToForwardArgs {
         $Arguments.Add($ExtraArgument)
     }
 
+    Assert-LlamaLaunchCapabilities -Config $Config -Arguments @($Arguments)
     return @($Arguments)
 }
 
@@ -5959,7 +6299,7 @@ function Save-SavedLaunchProfileData {
 }
 
 function Get-SavedLaunchProfilePersistedKeys {
-    return @(
+    return @((Get-ExtendedLaunchOptions | ForEach-Object { $_.Key })) + @(
         "LlamaBinDirectory"
         "VisionModelName"
         "VisionModelPath"
@@ -5974,6 +6314,11 @@ function Get-SavedLaunchProfilePersistedKeys {
         "ThreadsBatch"
         "ReadyTimeoutSec"
         "OpenPath"
+        "CacheTypeK"
+        "CacheTypeV"
+        "LazyMode"
+        "ContextCheckpoints"
+        "CheckpointMinStep"
         "ContextSize"
         "MaxOutputTokens"
         "Temperature"
@@ -6789,6 +7134,7 @@ function Get-SavedLaunchProfileContextText {
         return [string]$Profile.config.ContextSize
     }
 
+    $ExtraArgs = @()
     if (-not [string]::IsNullOrWhiteSpace([string]$Profile.config.ExtraArgs)) {
         $ExtraArgs = @(Split-ArgumentLine -Line ([string]$Profile.config.ExtraArgs))
         $ContextFromExtraArgs = Get-LlamaArgumentValue -Arguments $ExtraArgs -Patterns @('^--ctx-size(?:=(.+))?$')
@@ -6797,6 +7143,11 @@ function Get-SavedLaunchProfileContextText {
         }
     }
 
+    $PerSlot = [string]$Profile.config.KvUnifiedPerSlot
+    if ([string]::IsNullOrWhiteSpace($PerSlot) -and $ExtraArgs) {
+        $PerSlot = Get-LlamaArgumentValue -Arguments $ExtraArgs -Patterns @('^--kv-unified-per-slot(?:=(.+))?$')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PerSlot)) { return "$PerSlot per slot (server pool sizing)" }
     return [string]$script:ManagedDefaultContextSize
 }
 
@@ -7061,12 +7412,10 @@ function Apply-AutoTuneLearnedValuesToConfig {
     }
 
     if ($null -ne $Profile.fit_target_mib) {
-        $UpdatedExtraArguments.Add("--fit-target")
-        $UpdatedExtraArguments.Add([string]$Profile.fit_target_mib)
+        $Config.FitTarget = [string]$Profile.fit_target_mib
     }
     if ($null -ne $Profile.cache_ram_mib) {
-        $UpdatedExtraArguments.Add("--cache-ram")
-        $UpdatedExtraArguments.Add([string]$Profile.cache_ram_mib)
+        $Config.CacheRam = [string]$Profile.cache_ram_mib
     }
     if ($null -ne $Profile.parallel_slots) {
         $Config.Slots = [string]$Profile.parallel_slots
@@ -7131,6 +7480,18 @@ function Get-LaunchTuningContext {
     if (-not [string]::IsNullOrWhiteSpace([string]$ForwardConfig.Fit)) {
         $RelevantArgs.Add("--fit")
         $RelevantArgs.Add([string]$ForwardConfig.Fit)
+    }
+    # Dedicated fields are removed from ExtraArgs by the parser. Retain their
+    # values in the learned-profile key so memory settings cannot reuse a
+    # profile learned with different batch sizes, placement or KV limits.
+    foreach ($Option in Get-ExtendedLaunchOptions) {
+        if ($Option.Key -eq 'SleepIdleSeconds' -or ($Option.PSObject.Properties['MemoryRelevant'] -and -not $Option.MemoryRelevant)) { continue }
+        $Value = [string]$ForwardConfig[$Option.Key]
+        if ([string]::IsNullOrWhiteSpace($Value)) { continue }
+        if ($Option.Kind -eq 'toggle' -and $Value -eq 'off') { continue }
+        if ($Option.Kind -eq 'switch' -and $Value -eq 'off') { $RelevantArgs.Add($Option.NegativeFlag) }
+        else { $RelevantArgs.Add($Option.Flag) }
+        if ($Option.Kind -notin @('toggle','switch')) { $RelevantArgs.Add($Value) }
     }
     foreach ($ExtraArgument in (Split-ArgumentLine -Line ([string]$ForwardConfig.ExtraArgs))) {
         $RelevantArgs.Add($ExtraArgument)
@@ -9473,7 +9834,8 @@ function ConvertTo-SafeCommandFileName {
 
 function Get-LaunchConfigWrapperArguments {
     param(
-        [System.Collections.IDictionary]$Config
+        [System.Collections.IDictionary]$Config,
+        [switch]$EncodeForwardArgs
     )
 
     $Arguments = New-Object System.Collections.Generic.List[string]
@@ -9536,8 +9898,12 @@ function Get-LaunchConfigWrapperArguments {
         }
     }
 
-    foreach ($ForwardArgument in @(Convert-MenuConfigToForwardArgs -Config $Config)) {
-        $Arguments.Add([string]$ForwardArgument)
+    $ForwardArguments = @(Convert-MenuConfigToForwardArgs -Config $Config)
+    if ($EncodeForwardArgs) {
+        $Arguments.Add('-EncodedLlamaArgs')
+        $Arguments.Add([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $ForwardArguments -Compress))))
+    } else {
+        foreach ($ForwardArgument in $ForwardArguments) { $Arguments.Add([string]$ForwardArgument) }
     }
 
     return @($Arguments)
@@ -9551,7 +9917,7 @@ function New-ProfileCommandFileContent {
 
     $LauncherPath = Join-Path $Ps1Root "Start_LCPP.ps1"
     $ArgumentLines = @(
-        foreach ($Argument in @(Get-LaunchConfigWrapperArguments -Config $Config)) {
+        foreach ($Argument in @(Get-LaunchConfigWrapperArguments -Config $Config -EncodeForwardArgs)) {
             "    {0} ^" -f (ConvertTo-CmdArgument -Value $Argument)
         }
     )
@@ -9559,7 +9925,7 @@ function New-ProfileCommandFileContent {
 
     $Lines = New-Object System.Collections.Generic.List[string]
     $Lines.Add("@echo off")
-    $Lines.Add("setlocal EnableExtensions")
+    $Lines.Add("setlocal EnableExtensions DisableDelayedExpansion")
     $Lines.Add("")
     $Lines.Add("chcp 65001 >nul 2>nul")
     $Lines.Add("")
@@ -9915,6 +10281,11 @@ function New-LaunchConfig {
         ThreadsBatch      = [string]$RawThreadsBatch
         ReadyTimeoutSec   = [string]$ReadyTimeoutSec
         OpenPath          = if ($OpenPath) { $OpenPath } else { "/" }
+        CacheTypeK = [string]$ForwardConfig.CacheTypeK
+        CacheTypeV = [string]$ForwardConfig.CacheTypeV
+        LazyMode = [string]$ForwardConfig.LazyMode
+        ContextCheckpoints = [string]$ForwardConfig.ContextCheckpoints
+        CheckpointMinStep = [string]$ForwardConfig.CheckpointMinStep
         ContextSize       = [string]$ForwardConfig.ContextSize
         MaxOutputTokens   = if ([string]::IsNullOrWhiteSpace([string]$ForwardConfig.MaxOutputTokens)) { [string]$script:ManagedDefaultMaxOutputTokens } else { [string]$ForwardConfig.MaxOutputTokens }
         Temperature       = [string]$ForwardConfig.Temperature
@@ -9949,6 +10320,8 @@ function New-LaunchConfig {
         ExtraArgs         = [string]$ForwardConfig.ExtraArgs
     }
 
+    foreach ($Option in Get-ExtendedLaunchOptions) { $Config[$Option.Key] = [string]$ForwardConfig[$Option.Key] }
+
     Sync-LaunchConfigGpuFields -Config $Config
     Sync-LaunchConfigReasoningFields -Config $Config
     Sync-LaunchConfigMtpFields -Config $Config
@@ -9964,7 +10337,10 @@ function New-LaunchConfig {
 }
 
 function Get-LaunchConfigItems {
-    return @(
+    $ExtendedItems = @(foreach ($Option in Get-ExtendedLaunchOptions) {
+        [pscustomobject]@{ Key=$Option.Key; Label=$Option.Label; Type=$(if ($Option.Kind -in @('toggle','switch','enum')) { 'choice' } else { 'extendedOption' }); Choices=$(if ($Option.Kind -eq 'enum') { @('') + $Option.Values } else { @('', 'on', 'off') }); Hint=$Option.Hint }
+    })
+    $Items = @(
         [pscustomobject]@{ Key = "Model"; Label = (Format-BilingualText -ChineseText "模型" -EnglishText "Model"); Type = "model" },
         [pscustomobject]@{ Key = "LlamaBinDirectory"; Label = (Format-BilingualText -ChineseText "llama.cpp Bin 路徑" -EnglishText "llama.cpp Bin Path"); Type = "binaryDirectory" },
         [pscustomobject]@{ Key = "VisionModel"; Label = (Format-BilingualText -ChineseText "視覺模型" -EnglishText "Vision Model"); Type = "visionModel" },
@@ -9991,9 +10367,14 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "SpecDraftDevice"; Label = (Format-BilingualText -ChineseText "草稿裝置" -EnglishText "Draft Device"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 CUDA0" -EnglishText "blank uses auto; example: CUDA0") },
         [pscustomobject]@{ Key = "SpecDraftCacheTypeK"; Label = (Format-BilingualText -ChineseText "草稿 K 快取" -EnglishText "Draft K Cache"); Type = "choice"; Choices = @("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") },
         [pscustomobject]@{ Key = "SpecDraftCacheTypeV"; Label = (Format-BilingualText -ChineseText "草稿 V 快取" -EnglishText "Draft V Cache"); Type = "choice"; Choices = @("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") },
-        [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空會使用管理預設 131072" -EnglishText "blank uses managed default 131072") },
+        [pscustomobject]@{ Key = "CacheTypeK"; Label = "主模型 K 快取 / Main K Cache"; Type = "choice"; Choices = @("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") },
+        [pscustomobject]@{ Key = "CacheTypeV"; Label = "主模型 V 快取 / Main V Cache"; Type = "choice"; Choices = @("", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16", "f32") },
+        [pscustomobject]@{ Key = "LazyMode"; Label = "按需讀取張量 / Lazy Mode"; Type = "choice"; Choices = @("", "auto", "on", "off") },
+        [pscustomobject]@{ Key = "ContextCheckpoints"; Label = "上下文檢查點 / Context Checkpoints"; Type = "nonNegativeOrBlank"; Hint = "Maximum context checkpoints per slot; 0 disables, blank uses server default." },
+        [pscustomobject]@{ Key = "CheckpointMinStep"; Label = "檢查點最小間距 / Checkpoint Min Step"; Type = "nonNegativeOrBlank"; Hint = "Minimum token spacing between checkpoints; 0 means no minimum, blank uses server default." },
+        [pscustomobject]@{ Key = "ContextSize"; Label = (Format-BilingualText -ChineseText "上下文長度" -EnglishText "Context Size"); Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "0 使用模型完整上下文；留空通常使用 131072，設定每槽位上限時交由 server 配置" -EnglishText "0 = full model context; blank = 131072 unless per-slot context is set") },
         [pscustomobject]@{ Key = "MaxOutputTokens"; Label = (Format-BilingualText -ChineseText "最大輸出長度" -EnglishText "Max Output Length"); Type = "number"; Hint = (Format-BilingualText -ChineseText "正整數，或 -1 代表不限" -EnglishText "positive integer, or -1 for unlimited") },
-        [pscustomobject]@{ Key = "Slots"; Label = "Slots"; Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "留空使用 1；多請求才調高" -EnglishText "blank uses 1; raise only for concurrent requests") },
+        [pscustomobject]@{ Key = "Slots"; Label = "Slots"; Type = "numberOrBlank"; Hint = (Format-BilingualText -ChineseText "-1 自動；留空使用 1；多請求才調高" -EnglishText "-1 = auto; blank uses 1; raise for concurrent requests") },
         [pscustomobject]@{ Key = "Temperature"; Label = "Temp"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 1.0" -EnglishText "blank uses the default; example: 1.0") },
         [pscustomobject]@{ Key = "TopK"; Label = "Top K"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 20" -EnglishText "blank uses the default; example: 20") },
         [pscustomobject]@{ Key = "TopP"; Label = "Top P"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空使用預設；例如 0.95" -EnglishText "blank uses the default; example: 0.95") },
@@ -10004,10 +10385,10 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "ApiKey"; Label = "API Key"; Type = "text" },
         [pscustomobject]@{ Key = "Device"; Label = "Device"; Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 CUDA0,CUDA1" -EnglishText "blank uses auto; example: CUDA0,CUDA1") },
         [pscustomobject]@{ Key = "VramAllocationStrategy"; Label = (Format-BilingualText -ChineseText "顯存分配策略" -EnglishText "VRAM Allocation"); Type = "choice"; Choices = @("smart", "auto", "manual") },
-        [pscustomobject]@{ Key = "SplitMode"; Label = (Format-BilingualText -ChineseText "分割模式" -EnglishText "Split Mode"); Type = "choice"; Choices = @("", "layer", "row", "none") },
+        [pscustomobject]@{ Key = "SplitMode"; Label = (Format-BilingualText -ChineseText "分割模式" -EnglishText "Split Mode"); Type = "choice"; Choices = @("", "layer", "row", "tensor", "none") },
         [pscustomobject]@{ Key = "TensorSplit"; Label = (Format-BilingualText -ChineseText "張量分配" -EnglishText "Tensor Split"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空自動；例如 3,2" -EnglishText "blank uses auto; example: 3,2") },
         [pscustomobject]@{ Key = "Fit"; Label = "Fit"; Type = "choice"; Choices = @("", "on", "off") },
-        [pscustomobject]@{ Key = "LoadMode"; Label = (Format-BilingualText -ChineseText "模型載入模式" -EnglishText "Load Mode"); Type = "choice"; Choices = @("mmap", "mmap+mlock", "mlock", "dio", "none") },
+        [pscustomobject]@{ Key = "LoadMode"; Label = (Format-BilingualText -ChineseText "模型載入模式" -EnglishText "Load Mode"); Type = "choice"; Choices = @("auto", "mmap", "mmap+mlock", "mlock", "dio", "none") },
         [pscustomobject]@{ Key = "FlashAttention2"; Label = "Flash Attention 2"; Type = "choice"; Choices = @("auto", "on", "off") },
         [pscustomobject]@{ Key = "ExtraArgs"; Label = (Format-BilingualText -ChineseText "額外參數" -EnglishText "Extra Args"); Type = "text"; Hint = (Format-BilingualText -ChineseText "留空代表不加額外參數" -EnglishText "blank means no extra args") },
         [pscustomobject]@{ Key = "ApplyAutoTune"; Label = (Format-BilingualText -ChineseText "套用自動調校學習值" -EnglishText "Apply Auto Tune Learned Values"); Type = "actionAutoTuneApply" },
@@ -10018,6 +10399,10 @@ function Get-LaunchConfigItems {
         [pscustomobject]@{ Key = "Start"; Label = (Format-BilingualText -ChineseText "開始啟動" -EnglishText "Start Launch"); Type = "actionStart" },
         [pscustomobject]@{ Key = "Back"; Label = (Format-BilingualText -ChineseText "返回" -EnglishText "Back"); Type = "actionBack" }
     )
+    return @(foreach ($Item in $Items) {
+        if ($Item.Key -eq 'ExtraArgs') { $ExtendedItems }
+        $Item
+    })
 }
 
 function Get-LaunchConfigDefaultText {
@@ -10058,7 +10443,10 @@ function Get-LaunchConfigDefaultText {
         "SpecDraftDevice" { return "auto" }
         "SpecDraftCacheTypeK" { return "server default -> f16" }
         "SpecDraftCacheTypeV" { return "server default -> f16" }
-        "ContextSize" { return ("managed default {0}" -f $script:ManagedDefaultContextSize) }
+        "ContextSize" {
+            if (-not [string]::IsNullOrWhiteSpace([string]$Config.KvUnifiedPerSlot)) { return '每槽位上限決定 / Server per-slot sizing' }
+            return ("managed default {0}" -f $script:ManagedDefaultContextSize)
+        }
         "MaxOutputTokens" { return [string]$script:ManagedDefaultMaxOutputTokens }
         "Slots" { return ("{0} active request slot" -f $FixedLlamaServerParallelSlots) }
         "Temperature" { return "1.0" }
@@ -10090,6 +10478,22 @@ function Get-LaunchConfigValueText {
         [System.Collections.IDictionary]$Config,
         $Item
     )
+
+    if ($Config.Contains('LlamaBinDirectory')) {
+        $Flag = Get-LaunchOptionFlag -Key $Item.Key
+        if ($Flag) {
+            try {
+                $Capabilities = Get-LlamaServerCapabilities -Directory ([string]$Config.LlamaBinDirectory)
+                if (-not $Capabilities.Flags.ContainsKey($Flag)) { return "不支援 / Unsupported ($($Config[$Item.Key]))" }
+            } catch { return '無法偵測 / Detection failed' }
+        }
+    }
+    if (@(Get-ExtendedLaunchOptions | Where-Object Key -eq $Item.Key).Count -gt 0) {
+        if ([string]::IsNullOrWhiteSpace([string]$Config[$Item.Key])) { return '留空：沿用預設 / Default' }
+        return [string]$Config[$Item.Key]
+    }
+    if ($Item.Key -eq 'ContextSize' -and [string]$Config.ContextSize -eq '0') { return '0: 模型完整上下文 / Full model context' }
+    if ($Item.Key -eq 'Slots' -and [string]$Config.Slots -eq '-1') { return '-1: llama.cpp 自動 / Auto' }
 
     switch ($Item.Key) {
         "Model" { return [string]$Config.ModelName }
@@ -10348,6 +10752,17 @@ function Get-LaunchConfigItemHelp {
         [System.Collections.IDictionary]$Config,
         $Item
     )
+
+    $Option = Get-ExtendedLaunchOptions | Where-Object Key -eq $Item.Key | Select-Object -First 1
+    if ($Option) { return [pscustomobject]@{ Purpose="$($Option.Flag): $($Option.Hint)"; Recommendation='留空保留預設；依所選版本支援情況調整。 / Blank preserves defaults; check selected binary support.' } }
+
+    switch ([string]$Item.Key) {
+        "CacheTypeK" { return [pscustomobject]@{ Purpose = "KV cache K type; blank preserves launcher/model defaults."; Recommendation = "留空保留原有預設；依目前選用版本的 --help 調整。 / Leave blank to preserve defaults; check the selected binary --help." } }
+        "CacheTypeV" { return [pscustomobject]@{ Purpose = "KV cache V type; quantized V needs compatible Flash Attention."; Recommendation = "留空保留原有預設；依目前選用版本的 --help 調整。 / Leave blank to preserve defaults; check the selected binary --help." } }
+        "LazyMode" { return [pscustomobject]@{ Purpose = "On-demand tensor reads require mmap; auto applies to tensors larger than 4 GiB. Blank uses server default."; Recommendation = "留空保留原有預設；依目前選用版本的 --help 調整。 / Leave blank to preserve defaults; check the selected binary --help." } }
+        "ContextCheckpoints" { return [pscustomobject]@{ Purpose = "Maximum context checkpoints per slot; 0 disables, blank uses server default."; Recommendation = "留空保留原有預設；依目前選用版本的 --help 調整。 / Leave blank to preserve defaults; check the selected binary --help." } }
+        "CheckpointMinStep" { return [pscustomobject]@{ Purpose = "Minimum token spacing between checkpoints; 0 means no minimum, blank uses server default."; Recommendation = "留空保留原有預設；依目前選用版本的 --help 調整。 / Leave blank to preserve defaults; check the selected binary --help." } }
+    }
 
     $IsMtpCapableModel = Test-IsMtpCapableModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
     $IsGemma4QatMtpModel = Test-IsGemma4QatMtpModel -ModelEntry $null -ResolvedModelPath ([string]$Config.ModelPath)
@@ -10632,7 +11047,7 @@ function Get-LaunchConfigItemHelp {
         "ApplyAutoTune" {
             return [pscustomobject]@{
                 Purpose = Format-BilingualText -ChineseText "把目前模型對得上的 auto-tune learned profile 轉成明確的啟動值，直接寫回目前頁面。" -EnglishText "Converts the matching auto-tune learned profile for this model into explicit launch values and writes them back into the current page."
-                Recommendation = Format-BilingualText -ChineseText "按下後會套用學到的 GPU Layers，並把 fit-target、cache-ram、parallel 寫進 Extra Args。如果目前沒有匹配的 learned profile，畫面會直接告訴你原因。" -EnglishText "When you press it, the learned GPU Layers are applied and fit-target, cache-ram, and parallel are written into Extra Args. If no learned profile matches right now, the screen tells you why."
+                Recommendation = Format-BilingualText -ChineseText "按下後會套用學到的 GPU Layers，並更新 Fit Target、提示詞 RAM 快取與 Slots 欄位。如果目前沒有匹配的 learned profile，畫面會直接告訴你原因。" -EnglishText "When you press it, the learned GPU Layers are applied and the Fit Target, prompt-cache RAM, and Slots fields are updated. If no learned profile matches right now, the screen tells you why."
             }
         }
         "SaveProfile" {
@@ -10769,6 +11184,7 @@ function Get-LaunchConfigChoiceDescription {
             switch ($NormalizedChoice) {
                 "" { return Format-BilingualText -ChineseText "不送出 split-mode，沿用 llama.cpp 預設 layer。" -EnglishText "Emits no split-mode flag and keeps llama.cpp's layer default." }
                 "layer" { return Format-BilingualText -ChineseText "依層把模型與 KV 分到多張 GPU，使用 pipeline；一般多 GPU 的預設。" -EnglishText "Splits model layers and KV across GPUs using a pipeline; the normal multi-GPU default." }
+                "tensor" { return "跨 GPU 分割張量；需模型及後端支援，請實測效能。 / Tensor parallelism across GPUs; requires model and backend support." }
                 "row" { return Format-BilingualText -ChineseText "把權重按列拆到多張 GPU 並行計算；同步成本較高，需實測效益。" -EnglishText "Splits weight rows across GPUs for parallel computation; synchronization cost is higher and should be benchmarked." }
                 "none" { return Format-BilingualText -ChineseText "不做多 GPU 分割，只使用單一 GPU。" -EnglishText "Disables multi-GPU splitting and uses one GPU only." }
             }
@@ -10782,6 +11198,7 @@ function Get-LaunchConfigChoiceDescription {
         }
         "LoadMode" {
             switch ($NormalizedChoice) {
+                "auto" { return "自動選擇 mmap，裝置不支援時改用其他載入模式。 / Uses mmap unless a device does not support it." }
                 "mmap" { return Format-BilingualText -ChineseText "以記憶體映射載入模型，讓作業系統按需讀取頁面；Windows 一般使用的平衡選項。" -EnglishText "Memory-maps the model so the OS loads pages on demand; the balanced option for normal Windows use." }
                 "mmap+mlock" { return Format-BilingualText -ChineseText "先 mmap，再把模型頁面鎖在 RAM，避免 swap 或記憶體壓縮；需要足夠實體 RAM。" -EnglishText "Memory-maps and then locks model pages in RAM to avoid swapping or compression; requires enough physical RAM." }
                 "mlock" { return Format-BilingualText -ChineseText "不依賴 mmap，並強制模型常駐 RAM、不被 swap 或壓縮；載入較慢且 RAM 壓力較高。" -EnglishText "Avoids relying on mmap and forces the model to remain in RAM without swapping or compression; loading is slower and RAM pressure is higher." }
@@ -10985,6 +11402,7 @@ function Edit-LaunchConfigItem {
         [string]$IndexPath
     )
 
+    # Unsupported fields remain editable so users can clear values from older profiles.
     switch ($Item.Type) {
         "info" {
             return $null
@@ -11157,6 +11575,20 @@ function Edit-LaunchConfigItem {
 
             $Config[$Item.Key] = [string]$Value
         }
+        "extendedOption" {
+            $Value = Read-ConfigInput -Label $Item.Label -CurrentValue ([string]$Config[$Item.Key]) -CurrentDisplayValue (Get-LaunchConfigValueText -Config $Config -Item $Item) -Hint $Item.Hint
+            $Option = Get-ExtendedLaunchOptions | Where-Object Key -eq $Item.Key | Select-Object -First 1
+            Assert-ExtendedLaunchValue -Option $Option -Value $Value
+            $Config[$Item.Key] = if ($Option.Kind -eq 'text') { $Value } else { $Value.Trim() }
+        }
+        "nonNegativeOrBlank" {
+            $Value = Read-ConfigInput -Label $Item.Label -CurrentValue ([string]$Config[$Item.Key]) -CurrentDisplayValue (Get-LaunchConfigValueText -Config $Config -Item $Item) -Hint $Item.Hint
+            if ([string]::IsNullOrWhiteSpace($Value)) { $Config[$Item.Key] = ""; return $null }
+            if ($Value -notmatch '^\d+$' -or $Value.Length -gt 10 -or [long]$Value -gt [int]::MaxValue) {
+                throw ("{0} must be blank or a non-negative integer." -f $Item.Label)
+            }
+            $Config[$Item.Key] = [string]$Value
+        }
         "numberOrBlank" {
             $Value = Read-ConfigInput `
                 -Label $Item.Label `
@@ -11168,8 +11600,10 @@ function Edit-LaunchConfigItem {
                 return $null
             }
 
-            if ($Value -notmatch '^\d+$' -or [int]$Value -lt 1) {
-                throw "{0} must be blank or a positive integer." -f $Item.Label
+            [int]$ParsedNumber = 0
+            $Minimum = if ($Item.Key -eq 'ContextSize') { 0 } elseif ($Item.Key -eq 'Slots') { -1 } else { 1 }
+            if (-not [int]::TryParse($Value, [ref]$ParsedNumber) -or $ParsedNumber -lt $Minimum -or ($Item.Key -eq 'Slots' -and $ParsedNumber -eq 0)) {
+                throw "Invalid $($Item.Label). $($Item.Hint)"
             }
 
             $Config[$Item.Key] = [string]$Value
@@ -11353,7 +11787,7 @@ function Get-LlamaServerArgsFromLaunchConfig {
         Add-DefaultLlamaArgument -TargetArguments $Arguments -UserArguments $CombinedArgs -Patterns @('^--jinja$','^--no-jinja$') -Flag "--jinja"
     }
 
-    if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^--ctx-size(?:=|$)'))) {
+    if (-not (Test-LlamaArgumentProvided -Arguments $CombinedArgs -Patterns @('^(?:--ctx-size|-c|--kv-unified-per-slot)(?:=|$)'))) {
         $Arguments.Add("--ctx-size")
         $Arguments.Add([string]$script:ManagedDefaultContextSize)
     }
@@ -11383,6 +11817,7 @@ function Get-LlamaServerArgsFromLaunchConfig {
         $Arguments.Add([string]$Argument)
     }
 
+    Assert-LlamaLaunchCapabilities -Config $Config -Arguments @($Arguments)
     return [pscustomobject]@{
         Arguments          = @($Arguments.ToArray())
         AutoLaunchTuning   = $AutoLaunchTuning
@@ -11486,6 +11921,39 @@ function Get-LaunchConfigCardLines {
     return (Add-StatusCardPadding -Text $LabelAndValue -Width $InnerWidth)
 }
 
+function Get-LaunchConfigGroups {
+    return @(
+        [pscustomobject]@{ Key='Basic'; Title='F1 基本 / Basic'; Keys=@('Model','LlamaBinDirectory','VisionModel','ContextSize','MaxOutputTokens','Slots') }
+        [pscustomobject]@{ Key='Gpu'; Title='F2 GPU 與資源 / Resources'; Keys=@('GpuLayers','RepeatingLayers','LayerDistribution','ExtremeMode','AutoTune','Threads','ThreadsBatch','Device','VramAllocationStrategy','SplitMode','TensorSplit','Fit','LoadMode','FlashAttention2','CpuMoe','NCpuMoe','MoeCacheMiB','NCpuFfn','BatchSize','UBatchSize','FitTarget','FitContext') }
+        [pscustomobject]@{ Key='Draft'; Title='F3 草稿 / Draft'; Keys=@('SpecType','SpecDraftModel','SpecDraftNMax','SpecDraftGpuLayers','SpecDraftDevice','SpecDraftCacheTypeK','SpecDraftCacheTypeV','SpecDraftNMin','SpecDraftUBatch','SpecDraftSampling','SpecDraftBackendSampling') }
+        [pscustomobject]@{ Key='Kv'; Title='F4 KV 與長對話 / KV'; Keys=@('CacheTypeK','CacheTypeV','LazyMode','ContextCheckpoints','CheckpointMinStep','KvUnified','KvUnifiedPerSlot','CacheIdleSlots','CacheRam','CachePrompt','CacheReuse','ContextShift') }
+        [pscustomobject]@{ Key='Sampling'; Title='F5 取樣 / Sampling'; Keys=@('Temperature','TopK','TopP','MinP','PresencePenalty','Seed','RepeatPenalty','FrequencyPenalty','RepeatLastN') }
+        [pscustomobject]@{ Key='Reasoning'; Title='F6 推理 / Reasoning'; Keys=@('ChatTemplate','ReasoningMode','ThinkLevel','ReasoningEffort','ReasoningPreserve','ReasoningFormat','ReasoningBudgetMessage') }
+        [pscustomobject]@{ Key='Service'; Title='F7 服務 / Service'; Keys=@('LaunchMode','Port','OpenPath','ReadyTimeoutSec','Host','Metrics','ApiKey','SleepIdleSeconds','ExtraArgs') }
+        [pscustomobject]@{ Key='Actions'; Title='F8 儲存與啟動 / Actions'; Keys=@('ApplyAutoTune','SaveProfile','ExportProfile','SaveDefault','ExportCommand','Start','Back') }
+    )
+}
+
+function Get-LaunchConfigPages {
+    param([object[]]$Items, [int]$CardsPerPage)
+    if ($CardsPerPage -lt 1) { throw 'CardsPerPage must be positive.' }
+    $Groups = @(Get-LaunchConfigGroups)
+    $Assigned = @{}
+    foreach ($Group in $Groups) {
+        foreach ($Key in $Group.Keys) { $Assigned[$Key] = $Group.Key }
+    }
+    foreach ($Group in $Groups) {
+        # Future fields without a group stay visible in Service.
+        $GroupItems = @($Items | Where-Object { $Assigned[$_.Key] -eq $Group.Key -or (-not $Assigned.ContainsKey($_.Key) -and $Group.Key -eq 'Service') })
+        $Count = [int][Math]::Ceiling($GroupItems.Count / $CardsPerPage)
+        for ($Page = 0; $Page -lt $Count; $Page++) {
+            $Start = $Page * $CardsPerPage
+            $End = [Math]::Min($GroupItems.Count - 1, $Start + $CardsPerPage - 1)
+            [pscustomobject]@{ Group=$Group.Key; Title=$Group.Title; Number=$Page+1; Count=$Count; Items=@($GroupItems[$Start..$End]) }
+        }
+    }
+}
+
 function Show-LaunchConfigGrid {
     param(
         [System.Collections.IDictionary]$Config,
@@ -11511,14 +11979,14 @@ function Show-LaunchConfigGrid {
         $ReservedDetailRows = 20
         $AvailableGridRows = [Math]::Max(3, [Math]::Floor(([Math]::Max(7, $Height - $ReservedDetailRows) - 1) / 2))
         $CardsPerPage = [Math]::Max($ColumnCount * 3, $AvailableGridRows * $ColumnCount)
-        $PageCount = [Math]::Ceiling($Items.Count / $CardsPerPage)
+        $Pages = @(Get-LaunchConfigPages -Items $Items -CardsPerPage $CardsPerPage)
+        $PageCount = $Pages.Count
         $PageIndex = [Math]::Max(0, [Math]::Min($PageIndex, $PageCount - 1))
-        $PageStart = $PageIndex * $CardsPerPage
-        $PageEnd = [Math]::Min($Items.Count - 1, $PageStart + $CardsPerPage - 1)
-        $VisibleItems = @($Items[$PageStart..$PageEnd])
+        $CurrentPage = $Pages[$PageIndex]
+        $VisibleItems = @($CurrentPage.Items)
         $SelectedIndex = [Math]::Max(0, [Math]::Min($SelectedIndex, $VisibleItems.Count - 1))
 
-        Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle ((Format-BilingualText -ChineseText "方向鍵移動，Enter 或 Space 編輯；Tab／PgUp／PgDn 切換卡片頁。" -EnglishText "Arrow keys move; Enter or Space edits; Tab/PgUp/PgDn changes card pages.") + "  [$($PageIndex + 1)/$PageCount]")
+        Show-MenuHeader -Title (Format-BilingualText -ChineseText "調校後啟動" -EnglishText "Tune And Launch") -Subtitle ((Format-BilingualText -ChineseText "方向鍵移動；F1–F8 跳分類；Tab／PgUp／PgDn 翻頁。" -EnglishText "Arrows move; F1-F8 jump categories; Tab/PgUp/PgDn changes pages.") + "  $($CurrentPage.Title) [$($CurrentPage.Number)/$($CurrentPage.Count)]")
         if ($ColumnCount -eq 2) {
             $CellWidth = [Math]::Max($MinTwoColumnCellWidth, [Math]::Min($MaxTwoColumnCellWidth, [Math]::Floor(($Width - $ColumnGap) / 2)))
         }
@@ -11578,9 +12046,16 @@ function Show-LaunchConfigGrid {
         Write-Host ("{0}: {1}" -f (Format-BilingualText -ChineseText "目前選取" -EnglishText "Selected"), $SelectedItem.Label) -ForegroundColor Cyan
         Show-LaunchConfigItemHelp -Config $Config -Item $SelectedItem
         Write-Host ""
-        Write-Host (Format-BilingualText -ChineseText "Enter／Space 編輯；Tab／PgUp／PgDn 切換頁；Esc 返回。" -EnglishText "Enter/Space edits; Tab/PgUp/PgDn changes pages; Esc returns.") -ForegroundColor Yellow
+        Write-Host (Format-BilingualText -ChineseText "Enter／Space 編輯；F1–F8 跳分類（F8 儲存／啟動）；Tab 翻頁；Esc 返回。" -EnglishText "Enter/Space edits; F1-F8 jumps categories (F8 actions); Tab changes pages; Esc returns.") -ForegroundColor Yellow
 
         $Key = Read-ConsoleKey
+        if ($Key.VirtualKeyCode -ge 112 -and $Key.VirtualKeyCode -le 119) {
+            $TargetGroup = @(Get-LaunchConfigGroups)[$Key.VirtualKeyCode - 112].Key
+            for ($Index = 0; $Index -lt $Pages.Count; $Index++) {
+                if ($Pages[$Index].Group -eq $TargetGroup) { $PageIndex = $Index; $SelectedIndex = 0; break }
+            }
+            continue
+        }
         switch ($Key.VirtualKeyCode) {
             37 {
                 if ($ColumnCount -eq 2 -and ($SelectedIndex % 2) -eq 1) {
@@ -14041,6 +14516,7 @@ try {
 
     $script:RequestedParallelSlots = Get-LlamaParallelSlotsFromArgs -Arguments $LlamaArgs
     [void](Resolve-RequestedParallelSlots -RequestedSlots $script:RequestedParallelSlots)
+    Assert-LlamaLaunchCapabilities -Config ([ordered]@{ LlamaBinDirectory = $LlamaBinDirectory }) -Arguments $LlamaArgs
     $LlamaArgs = @(Remove-LlamaParallelArgs -Arguments $LlamaArgs)
     $script:LlamaArgs = $LlamaArgs
 
