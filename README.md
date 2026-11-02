@@ -127,6 +127,55 @@ Common examples:
 
 ## 內建說明 / Built-in Help
 
+### 2026-11 選單調校與版本相容性 / Tuning and binary compatibility
+
+- `Tune And Launch` 新增 CPU MoE、CPU MoE 層數、MoE GPU 快取（MiB）、Dense CPU FFN 層數、Batch／UBatch、Fit Target（支援每張 GPU 的逗號分隔數值）、Fit 最小上下文，以及提示詞 RAM 快取。欄位留空會保留原本的啟動器／server 預設；明確填值會優先於 Extra Args 的同名參數。這些欄位支援設定儲存與啟動命令匯出。
+- 提示詞 RAM 快取 `-1` 表示不限、`0` 表示停用；MoE GPU 快取 `0` 表示停用。CPU MoE 的 `off` 表示不送出 `--cpu-moe`，仍可另用 CPU MoE 層數設定部分卸載。MoE GPU 快取需要選用版本支援 `--moe-cache-mib`。
+- Context Size 可明確輸入 `0`，使用模型的完整上下文長度（不允許 fit 縮減 context）；Slots 可輸入 `-1` 自動決定。留空仍分別使用啟動器原本的 `131072` 與 `1`。Fit 最小上下文只限制自動 fit 可選的下限；Context `0` 會要求完整模型上下文，不能用它啟用 fit 的上下文縮減。
+- 選單會讀取所選 `llama-server.exe --help` 並快取能力資訊。不支援的欄位會顯示 `Unsupported`，仍可編輯以清除舊設定；啟動與匯出時會拒絕不支援的已設定參數。切換執行檔目錄後會依該版本重新判斷，執行檔更新後會重新讀取。
+
+New tuning fields cover CPU MoE / dense FFN placement, GPU expert caching, batch sizes, fit margins and minimum context, and prompt-cache RAM. Blank preserves existing defaults; explicit fields override duplicate Extra Args. Profiles and exported launchers retain the values. Context `0` requests the full model context and prevents fit from reducing it; slots `-1` requests automatic slot selection. The selected binary's help determines support; unsupported configured options are rejected before launch/export.
+
+執行 `powershell -NoProfile -File tools\Test-ExtendedLauncherOptions.ps1` 可檢查新欄位、別名、儲存、覆蓋順序、自動值及本機各個 `bin*` 版本的能力偵測，不會載入模型。此測試也會執行原有的 `Test-LauncherOptions.ps1`。
+
+### 第二批：草稿、KV 與休眠 / Draft, KV and sleep
+
+- 草稿模型新增最小 token 數（`--spec-draft-n-min`）、實體批次（`--spec-draft-n-ubatch`）、`greedy`／`probabilistic` 取樣，以及後端取樣開關。草稿實體批次 `0` 沿用主模型 UBatch；留空保留 server 預設。
+- KV 新增共享池（`--kv-unified`）、每槽位上下文上限（`--kv-unified-per-slot`）與閒置槽位快取（`--cache-idle-slots`）。開關留空沿用 server，`on`／`off` 會明確送出正／反向旗標；閒置槽位快取需要提示詞 RAM 快取。
+- 設定每槽位上下文上限並將 Context Size 留空時，啟動與匯出都會省略固定的 `--ctx-size 131072`，讓 server 配置共享池。明確輸入 Context Size（包括 `0`）仍會保留該總上下文設定。
+- 閒置休眠（`--sleep-idle-seconds`）接受正整數秒數，`-1` 停用，`0` 無效。休眠會卸載模型與 KV，下一個請求將重新載入，因而增加該次等待時間。
+- 舊 `--draft`／`--draft-n`／`--draft-max`、`--draft-min`／`--draft-n-min` 與舊 n-gram 參數會在啟動或匯出前檢查，並指出替代參數。若所選舊版執行檔仍有實作該參數，則允許使用；不會自動猜測要改成哪一種 speculative 模式。
+- 所有新增欄位均支援儲存與匯出，明確填值優先於 Extra Args。會影響記憶體的調校欄位也會納入 Auto Tune 設定比對，避免沿用其他批次大小或 KV 配置的學習值。
+
+Second-batch fields cover draft minimum tokens, physical batches, sampling and backend sampling, unified KV, per-slot context limits, idle-slot caching, and idle sleep. Explicit on/off switches emit their positive/negative flags. Per-slot limits with a blank total context let the server size the KV pool. Obsolete flags receive actionable replacement messages; genuinely supported legacy flags remain usable.
+
+完整回歸測試：`powershell -NoProfile -File tools\Test-SecondBatchLauncherOptions.ps1`。它包含前兩組測試，並驗證本機各版本、設定儲存、正反旗標、舊參數、Auto Tune 比對與最終啟動／匯出命令；不會載入模型。
+
+### 第三批：取樣、推理輸出與分類選單 / Sampling, reasoning output and categories
+
+- 常用取樣新增 Seed、Repeat Penalty、Frequency Penalty 與 Repeat Last N。Seed 可填 `-1`（隨機）或 uint32；`4294967295` 也是隨機種子的特殊值。固定種子仍受模型、後端、硬體與其他設定影響。Repeat Penalty 必須為大於零的有限數值（`1` 停用），Frequency Penalty 接受有限數值（`0` 停用），Repeat Last N 為非負整數（`0` 停用）。小數使用小數點，不隨 Windows 地區設定改變。
+- 推理輸出新增 Reasoning Format（`auto`、`none`、`deepseek`、`deepseek-legacy`）與 Reasoning Budget Message（單行文字）。Format 控制回傳解析格式，不控制模型是否思考；`none` 將思考留在原始 content，`deepseek` 分離至 reasoning_content，legacy 也保留 content 的 think 標籤。Budget Message 在思考預算耗盡時插入。
+- 長對話新增 Cache Prompt、Cache Reuse 與 Context Shift。Cache Reuse 為嘗試 KV 位移重用的最小片段長度，`0` 停用，且需要提示詞快取。Context Shift 需要模型支援，啟用後可能捨棄較早內容；留空沿用 server 預設。
+- 分類選單使用 **F1 基本、F2 GPU 與資源、F3 草稿、F4 KV 與長對話、F5 取樣、F6 推理、F7 服務、F8 儲存與啟動**。分類內依主控台大小分頁；Tab／PgUp／PgDn 依序翻頁，方向鍵移動，Enter／Space 編輯，Esc 返回。
+- 新欄位支援儲存、匯出、同名 Extra Args 覆蓋及版本相容性檢查。一鍵啟動檔會編碼傳遞 llama.cpp 參數，保留提示文字中的中文、空白、引號及 shell 特殊字元；仍可在啟動檔後面追加參數。一般命令匯出仍顯示可讀的完整命令。
+
+Third-batch fields add common sampling controls, reasoning response format and budget-exhaustion text, prompt caching, cache reuse and context shift. F1–F8 jumps directly to categories; paging adapts to terminal size. Saved profiles and exports retain all values. Generated CMD launchers preserve quoted text through an encoded argument payload and keep forwarding runtime arguments.
+
+完整回歸測試：`powershell -NoProfile -File tools\Test-ThirdBatchLauncherOptions.ps1`。它包含前面所有測試，並驗證新欄位、數值邊界、中文與特殊字元、實際執行匯出的 CMD（參數擷取程式）、分類分頁及模擬鍵盤操作；不載入模型。
+
+### 2026-09 參數與安裝更新 / Options and installer update
+
+依官方 [v0.4.0](https://github.com/ggml-org/llama.cpp/releases/tag/v0.4.0) 與 [server 參數](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) 更新：
+
+- `Tune And Launch` 新增主模型 K/V 快取類型（`--cache-type-k/v`）、按需讀取張量（`--lazy-mode`）、每個 slot 的上下文檢查點數量（`--ctx-checkpoints`）及最小 token 間距（`--checkpoint-min-step`）。這些欄位留空時保留原本預設，並支援儲存設定與匯出啟動檔。檢查點數量 `0` 表示停用；間距 `0` 表示不設最小間距。
+- `Load Mode` 新增 `auto`：裝置支援時使用 mmap；既有預設仍為 mmap。`Lazy Mode=on` 需要 mmap，`auto` 只對大於 4 GiB 的適用張量按需讀取。
+- `Split Mode` 新增 `tensor`；請搭配 `VRAM Allocation Strategy=manual`，並確認選用版本、模型與後端支援。
+- 官方語意版本 release 若只有 `nightly-tag.txt`，兩個安裝器會解析該指標，使用對應 nightly 的預編譯附件或原始碼。仍相容直接含附件的舊版 release。
+
+New tuning fields cover main-model K/V cache types, lazy tensor loading, context checkpoint count, and minimum checkpoint spacing. Blank fields preserve existing defaults. Saved profiles and exported launchers retain these values. Load mode now accepts `auto`; manual GPU allocation also exposes `tensor` splitting. Installers resolve semantic-release nightly pointers before downloading binaries or source. Check the selected binary's `--help` when using older or custom builds.
+
+可用 `powershell -NoProfile -File tools\Test-LauncherOptions.ps1` 執行不載入模型的參數／設定回歸測試。
+
 你可以直接在 PowerShell 裡查看腳本內建說明：  
 You can view the built-in PowerShell help directly:
 

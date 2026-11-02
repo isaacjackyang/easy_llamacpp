@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Builds and installs the latest official llama.cpp for this launcher workspace.
 
@@ -267,9 +267,20 @@ function Test-CachedArchiveAvailable {
 }
 
 function Get-LatestReleaseMetadata {
-    return Invoke-RestMethod `
+    $Release = Invoke-RestMethod `
         -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" `
         -Headers (Get-GitHubHeaders)
+    # Semantic releases may point at the immutable nightly containing their binaries.
+    $Pointer = @($Release.assets | Where-Object { $_.name -eq "nightly-tag.txt" })
+    if ($Pointer.Count -gt 0) {
+        $Content = (Invoke-WebRequest -UseBasicParsing -Uri $Pointer[0].browser_download_url -Headers (Get-GitHubHeaders)).Content
+        $Tag = if ($Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($Content).Trim() } else { ([string]$Content).Trim() }
+        if ($Tag -notmatch '^b[0-9]+$') { throw "Invalid nightly-tag.txt in release $($Release.tag_name): $Tag" }
+        $Release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$Tag" `
+            -Headers (Get-GitHubHeaders)
+    }
+    return $Release
 }
 
 function Get-SourceMetadata {

@@ -26,12 +26,14 @@ param(
     [string]$BaseUrl = "http://127.0.0.1:8080/v1",
     [string]$Model = "",
     [string]$Pages = "",
+    [string]$GlossaryFiles = "",
     [string]$WrapperPath = "",
     [switch]$UseLlmBatch,
     [switch]$Compatibility,
     [switch]$DisableRichTextTranslate,
     [switch]$DisableTableTextTranslation,
     [switch]$DisableAutoGlossary,
+    [switch]$DisableSameTextFallback,
     [switch]$SkipScannedDetection,
     [switch]$OcrWorkaround,
     [switch]$AutoOcrWorkaround,
@@ -40,7 +42,10 @@ param(
     [switch]$SkipCurveRender,
     [switch]$KeepWatermark,
     [switch]$NonInteractive,
-    [switch]$DryRun
+    [switch]$DryRun,
+    # 明知故犯地接受 golden lock（locks\babeldoc.env.lock.txt）之外的套件版本；
+    # 缺了它，六个必要套件任何版本漂移都会 fail-fast，防的是升级无声改变翻译输出。
+    [switch]$AllowVersionDrift
 )
 
 $ErrorActionPreference = "Stop"
@@ -226,9 +231,36 @@ function Assert-LlamaVisionCapability([string]$Url) {
     return $props
 }
 
-function Assert-BabelDocPythonDependencies([string]$PythonPath) {
+function Assert-BabelDocPythonDependencies([string]$PythonPath, [string]$ExpectedRoot = "", [string]$LockFile = "", [switch]$AllowVersionDrift) {
     if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
         throw "找不到 BabelDOC venv Python：$PythonPath"
+    }
+    # 步驟零：環境自證。錯直譯器要一發入魂地點名，而不是讓三層外的 numpy traceback 代言
+    #（2026-10-31 教訓：PATH 首位 pythonw 落在被更新器 re-sync 到一半的別環境 venv）。
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $identityRaw = @(& $PythonPath -c "import sys; print(sys.prefix); print(sys.version.split()[0])" 2>&1)
+    $identityExit = $LASTEXITCODE
+    $identityLines = @($identityRaw | Where-Object { $_ })
+    $ErrorActionPreference = $previousErrorActionPreference
+    if ($identityExit -ne 0 -or $identityLines.Count -lt 2) {
+        throw "BabelDOC Python 無法自證（exit=$identityExit）：$PythonPath`n$(($identityLines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)"
+    }
+    $actualPrefix = ([string]$identityLines[0]).Trim()
+    $pythonVersion = ([string]$identityLines[1]).Trim()
+    if ($ExpectedRoot -and ($actualPrefix.TrimEnd('\') -ne $ExpectedRoot.TrimEnd('\'))) {
+        throw "錯環境：直譯器自證 sys.prefix = $actualPrefix，預期 $ExpectedRoot（python $pythonVersion；$PythonPath）。請檢查被注入的 BABELDOC_PROJECT_ROOT 或 worker 直譯器設定。"
+    }
+    # golden lock 腳本：版本漂移 fail-fast（六個必要套件），非關鍵套件只提示。
+    $pins = @{}
+    if ($LockFile -and (Test-Path -LiteralPath $LockFile -PathType Leaf)) {
+        foreach ($line in (Get-Content -LiteralPath $LockFile)) {
+            $t = ([string]$line).Trim()
+            if (-not $t -or $t.StartsWith("-") -or $t.Contains("@")) { continue }
+            $ix = $t.IndexOf("==")
+            if ($ix -lt 1) { continue }
+            $pins[(($t.Substring(0, $ix)).Trim() -replace '[-_.]+', '-')] = $t.Substring($ix + 2).Trim()
+        }
     }
     $requirements = @(
         [pscustomobject]@{ Name = "PyMuPDF"; Module = "fitz"; Distribution = "PyMuPDF" },
@@ -248,16 +280,54 @@ function Assert-BabelDocPythonDependencies([string]$PythonPath) {
         $probeExitCode = $LASTEXITCODE
         $ErrorActionPreference = $previousErrorActionPreference
         if ($probeExitCode -eq 0) {
-            $result += [pscustomobject]@{ Name = $requirement.Name; Version = ([string]$rawResult[-1]).Trim() }
+            $gotVersion = ([string]$rawResult[-1]).Trim()
+            $result += [pscustomobject]@{ Name = $requirement.Name; Version = $gotVersion }
+            $pinKey = $requirement.Distribution.ToLowerInvariant() -replace '[-_.]+', '-'
+            if ($pins.ContainsKey($pinKey) -and $gotVersion -ne $pins[$pinKey]) {
+                $driftError = "golden lock 釘住 $($pins[$pinKey])，實際 $gotVersion；確知要換新輸出才用 -AllowVersionDrift"
+                if ($AllowVersionDrift) {
+                    Write-Host "  [warn] $($requirement.Name) 版本漂移（已放行）：$driftError" -ForegroundColor Yellow
+                }
+                else {
+                    $missing += [pscustomobject]@{ Name = "$($requirement.Name) 版本漂移"; Error = $driftError }
+                }
+            }
         }
         else {
             $missing += [pscustomobject]@{ Name = $requirement.Name; Error = ($rawResult -join [Environment]::NewLine) }
         }
     }
+    # 非關鍵套件的漂移只做 DarkYellow 提示：它们不影響 stable profile，但值得在 log 留痕。
+    if ($pins.Count -gt 0) {
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $installedRaw = @(& $PythonPath -c "import importlib.metadata as md; print(chr(10).join(((d.metadata['Name'] or '?').lower().replace('_','-').replace('.','-') + '==' + (d.version or '?')) for d in md.distributions()))" 2>$null)
+        $installedExit = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($installedExit -eq 0) {
+            $installed = @{}
+            foreach ($line in $installedRaw) {
+                $s = ([string]$line).Trim()
+                $ix = $s.IndexOf("==")
+                if ($ix -gt 0) { $installed[$s.Substring(0, $ix)] = $s.Substring($ix + 2) }
+            }
+            $requiredKeys = @($requirements | ForEach-Object { $_.Distribution.ToLowerInvariant() -replace '[-_.]+', '-' })
+            foreach ($pinKey in ($pins.Keys | Sort-Object)) {
+                if ($requiredKeys -contains $pinKey) { continue }
+                if (-not $installed.ContainsKey($pinKey)) {
+                    Write-Host "  [note] golden lock 在、未安裝：$pinKey（釘住 $($pins[$pinKey])）" -ForegroundColor DarkYellow
+                }
+                elseif ($installed[$pinKey] -ne $pins[$pinKey]) {
+                    Write-Host "  [note] 非關鍵套件版本漂移：$pinKey 釘 $($pins[$pinKey]) 實際 $($installed[$pinKey])" -ForegroundColor DarkYellow
+                }
+            }
+        }
+    }
     if ($missing.Count -gt 0) {
         $details = $missing | ForEach-Object { "  - $($_.Name)：$($_.Error)" }
-        throw "BabelDOC venv 缺少或無法載入必要套件：`n$($details -join [Environment]::NewLine)`nPython：$PythonPath"
+        throw "BabelDOC venv 缺少或無法載入必要套件：`n$($details -join [Environment]::NewLine)`nPython：$PythonPath（python $pythonVersion @ $actualPrefix）"
     }
+    $result += [pscustomobject]@{ Name = "環境自證"; Version = "python $pythonVersion, prefix 符合預設 venv" }
     return $result
 }
 
@@ -572,7 +642,9 @@ if ($ResolvedImageTextMode -eq "redraw") {
     $llamaProps = Assert-LlamaVisionCapability $BaseUrl
     $loadedModelLabel = if ($llamaProps.PSObject.Properties["model_alias"]) { [string]$llamaProps.model_alias } else { $models[0] }
     Write-Host "  [OK] llama.cpp 視覺能力：$loadedModelLabel（modalities.vision = true）" -ForegroundColor Green
-    $dependencyStatus = @(Assert-BabelDocPythonDependencies $ImagePython)
+    $translationLockFile = Join-Path (Split-Path -Parent $PSScriptRoot) "locks\babeldoc.env.lock.txt"
+    $babelDocVenvRoot = Split-Path -Parent (Split-Path -Parent $ImagePython)
+    $dependencyStatus = @(Assert-BabelDocPythonDependencies $ImagePython $babelDocVenvRoot $translationLockFile -AllowVersionDrift:$AllowVersionDrift)
     foreach ($dependency in $dependencyStatus) {
         Write-Host "  [OK] $($dependency.name) $($dependency.version)" -ForegroundColor Green
     }
@@ -777,11 +849,13 @@ $arguments = @{
     TimeoutMinutes = 240
 }
 if ($Pages) { $arguments.Pages = $Pages }
+if ($GlossaryFiles) { $arguments.GlossaryFiles = $GlossaryFiles }
 if (-not $ResolvedUseLlmBatch) { $arguments.DisableLlmBatch = $true }
 if ($ResolvedCompatibility) { $arguments.Compatibility = $true }
 if ($ResolvedDisableRichTextTranslate) { $arguments.DisableRichTextTranslate = $true }
 if ($ResolvedTranslateTableText) { $arguments.TranslateTableText = $true }
 if ($ResolvedAutoExtractGlossary) { $arguments.AutoExtractGlossary = $true }
+if ($DisableSameTextFallback) { $arguments.DisableSameTextFallback = $true }
 if ($ResolvedSkipScannedDetection) { $arguments.SkipScannedDetection = $true }
 if ($ResolvedOcrWorkaround) { $arguments.OcrWorkaround = $true }
 if ($ResolvedAutoOcrWorkaround) { $arguments.AutoEnableOcrWorkaround = $true }
